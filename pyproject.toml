@@ -1,7 +1,7 @@
 [project]
 name = "laabh"
 version = "0.1.0"
-description = "Personal paper trading system for Indian stock markets — Phase 1: data collection backbone"
+description = "Personal paper trading system for Indian stock markets — Phases 1-4"
 requires-python = ">=3.12"
 readme = "README.md"
 
@@ -26,6 +26,16 @@ dependencies = [
     "beautifulsoup4>=4.12.3",
     "lxml>=5.2.2",
     "psycopg2-binary>=2.9.9",
+    # Phase 2: Trading engine + API
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "starlette>=0.37.0",
+    "numpy>=1.26.0",
+    # Phase 3: Whisper pipeline
+    "openai-whisper>=20231117",
+    "yt-dlp>=2024.1.0",
+    "youtube-transcript-api>=0.6.2",
+    "openai>=1.30.0",
 ]
 
 [project.optional-dependencies]
