@@ -1,0 +1,28 @@
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y \
+    python3 python3-pip ffmpeg curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir \
+    openai-whisper==20231117 \
+    torch==2.1.2 \
+    torchaudio==2.1.2 \
+    yt-dlp==2024.1.0 \
+    asyncpg==0.29.0 \
+    psycopg2-binary==2.9.9 \
+    sqlalchemy[asyncio]==2.0.30 \
+    loguru==0.7.2 \
+    tenacity==9.0.0 \
+    pydantic-settings==2.4.0 \
+    python-dotenv==1.0.1
+
+WORKDIR /app
+
+COPY src/ /app/src/
+COPY pyproject.toml /app/
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["/app/docker/whisper/entrypoint.sh"]
+CMD ["python3", "-m", "src.whisper_pipeline.pipeline"]

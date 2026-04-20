@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  postgres:
+    build: ./docker/postgres
+    restart: always
+    environment:
+      POSTGRES_DB: laabh
+      POSTGRES_USER: laabh
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U laabh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://laabh:${DB_PASSWORD}@postgres:5432/laabh
+      DB_PASSWORD: ${DB_PASSWORD}
+      ANGEL_ONE_API_KEY: ${ANGEL_ONE_API_KEY}
+      ANGEL_ONE_CLIENT_ID: ${ANGEL_ONE_CLIENT_ID}
+      ANGEL_ONE_PASSWORD: ${ANGEL_ONE_PASSWORD}
+      ANGEL_ONE_TOTP_SECRET: ${ANGEL_ONE_TOTP_SECRET}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - whisper_data:/data/whisper
+
+  whisper-worker:
+    build:
+      context: .
+      dockerfile: docker/whisper/Dockerfile.gpu
+    restart: always
+    depends_on:
+      - postgres
+      - backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://laabh:${DB_PASSWORD}@postgres:5432/laabh
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cuda}
+    volumes:
+      - whisper_data:/data/whisper
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  watchdog:
+    build: ./docker/watchdog
+    restart: always
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      SERVICES: "backend:8000,postgres:5432"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  whisper_data:
