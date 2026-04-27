@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 from src.runday.checks.base import CheckResult, Severity
 from src.runday.cli import app
 
-runner = CliRunner(mix_stderr=False)
+runner = CliRunner()
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +249,8 @@ def test_report_markdown_writes_file(mock_build, mock_settings_fn, tmp_path, mon
         "surprises": [],
     }
 
-    with patch("src.runday.cli.build_report", mock_build):
-        result = runner.invoke(app, ["report", "--date", "2026-04-27", "--markdown"])
+    # build_report is imported inside _report_async; patch at source module
+    result = runner.invoke(app, ["report", "--date", "2026-04-27", "--markdown"])
 
     assert result.exit_code == 0
     report_file = tmp_path / "reports" / "runday-2026-04-27.md"

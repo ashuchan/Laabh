@@ -1,7 +1,6 @@
 """Tests for src/runday/checks/schema.py."""
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -147,42 +146,37 @@ async def test_required_tables_missing(settings, mock_engine_with_tables):
 # SeedDataCheck
 # ---------------------------------------------------------------------------
 
-def _make_session_ctx(execute_results: list):
+def _make_seed_engine(source_rows: list, holiday_count: int):
+    """Mock engine for SeedDataCheck: two sequential execute() calls."""
     call_idx = [0]
 
     async def _execute(*args, **kwargs):
         idx = call_idx[0]
         call_idx[0] += 1
         mock_result = MagicMock()
-        if idx < len(execute_results):
-            mock_result.fetchall.return_value = execute_results[idx]
-            mock_result.scalar.return_value = execute_results[idx] if isinstance(execute_results[idx], int) else len(execute_results[idx])
-            mock_result.scalar_one_or_none.return_value = execute_results[idx][0] if execute_results[idx] else None
+        if idx == 0:
+            mock_result.fetchall.return_value = source_rows
         else:
-            mock_result.fetchall.return_value = []
-            mock_result.scalar.return_value = 0
-            mock_result.scalar_one_or_none.return_value = None
+            mock_result.scalar.return_value = holiday_count
         return mock_result
 
-    mock_session = AsyncMock()
-    mock_session.execute = _execute
+    mock_conn = AsyncMock()
+    mock_conn.execute = _execute
 
-    @asynccontextmanager
-    async def _scope():
-        yield mock_session
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_ctx.__aexit__ = AsyncMock(return_value=False)
 
-    return _scope
+    mock_engine = MagicMock()
+    mock_engine.connect = MagicMock(return_value=mock_ctx)
+    return mock_engine
 
 
 @pytest.mark.asyncio
 async def test_seed_data_pass(settings):
-    # source_health rows, holiday_calendar count
-    session_ctx = _make_session_ctx([
-        [("nse",), ("dhan",), ("angel_one",)],
-        1,
-    ])
+    engine = _make_seed_engine([("nse",), ("dhan",), ("angel_one",)], 1)
 
-    with patch("src.runday.checks.schema.session_scope", session_ctx):
+    with patch("src.runday.checks.schema.get_engine", return_value=engine):
         check = SeedDataCheck(settings)
         result = await check.run()
 
@@ -191,12 +185,9 @@ async def test_seed_data_pass(settings):
 
 @pytest.mark.asyncio
 async def test_seed_data_missing_sources(settings):
-    session_ctx = _make_session_ctx([
-        [("nse",)],  # only nse, missing dhan and angel_one
-        1,
-    ])
+    engine = _make_seed_engine([("nse",)], 1)
 
-    with patch("src.runday.checks.schema.session_scope", session_ctx):
+    with patch("src.runday.checks.schema.get_engine", return_value=engine):
         check = SeedDataCheck(settings)
         result = await check.run()
 
@@ -206,12 +197,9 @@ async def test_seed_data_missing_sources(settings):
 
 @pytest.mark.asyncio
 async def test_seed_data_no_holiday_calendar(settings):
-    session_ctx = _make_session_ctx([
-        [("nse",), ("dhan",), ("angel_one",)],
-        0,
-    ])
+    engine = _make_seed_engine([("nse",), ("dhan",), ("angel_one",)], 0)
 
-    with patch("src.runday.checks.schema.session_scope", session_ctx):
+    with patch("src.runday.checks.schema.get_engine", return_value=engine):
         check = SeedDataCheck(settings)
         result = await check.run()
 

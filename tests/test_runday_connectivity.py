@@ -42,7 +42,8 @@ def settings() -> RundaySettings:
 # EnvCheck
 # ---------------------------------------------------------------------------
 
-def test_env_check_pass(settings, monkeypatch):
+@pytest.mark.asyncio
+async def test_env_check_pass(settings, monkeypatch):
     required = [
         "DATABASE_URL", "ANTHROPIC_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
         "ANGEL_ONE_API_KEY", "ANGEL_ONE_CLIENT_ID", "ANGEL_ONE_PASSWORD",
@@ -51,13 +52,12 @@ def test_env_check_pass(settings, monkeypatch):
     for var in required:
         monkeypatch.setenv(var, "dummy")
     check = EnvCheck(settings)
-
-    import asyncio
-    result = asyncio.get_event_loop().run_until_complete(check.run())
+    result = await check.run()
     assert result.severity == Severity.OK
 
 
-def test_env_check_missing(settings, monkeypatch):
+@pytest.mark.asyncio
+async def test_env_check_missing(settings, monkeypatch):
     for var in ["DATABASE_URL", "ANTHROPIC_API_KEY", "TELEGRAM_BOT_TOKEN",
                 "TELEGRAM_CHAT_ID", "ANGEL_ONE_API_KEY", "ANGEL_ONE_CLIENT_ID",
                 "ANGEL_ONE_PASSWORD", "ANGEL_ONE_TOTP_SECRET",
@@ -65,8 +65,7 @@ def test_env_check_missing(settings, monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
     check = EnvCheck(settings)
-    import asyncio
-    result = asyncio.get_event_loop().run_until_complete(check.run())
+    result = await check.run()
     assert result.severity == Severity.FAIL
     assert "missing" in result.details
 

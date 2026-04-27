@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.runday.checks.base import Severity
+from src.runday.checks.data import BanListCheck
 from src.runday.checks.pipeline import (
-    BanListCheck,
     HardExitCheck,
     MorningBriefCheck,
     Phase1Check,
@@ -132,7 +132,8 @@ async def test_phase1_fail_zero_rows(settings):
         result = await check.run()
 
     assert result.severity == Severity.FAIL
-    assert "expected ≥30 rows, found 0" in result.message
+    assert "0 candidates" in result.message
+    assert "required ≥30" in result.message
 
 
 @pytest.mark.asyncio

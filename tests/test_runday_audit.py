@@ -98,9 +98,10 @@ async def test_llm_summary_empty_day(settings):
 
 @pytest.mark.asyncio
 async def test_llm_summary_with_callers(settings):
+    # 5 columns matching the query: caller, COUNT(*), AVG(latency_ms), SUM(tokens_in), SUM(tokens_out)
     rows = [
-        ("fno.thesis", 10, 1200.0, 15000, 5000, 2500.0),
-        ("signal.extractor", 5, 800.0, 7500, 2500, 1500.0),
+        ("fno.thesis", 10, 1200.0, 15000, 5000),
+        ("signal.extractor", 5, 800.0, 7500, 2500),
     ]
     with patch("src.runday.checks.audit.session_scope", _make_audit_session(rows)):
         check = LLMAuditSummaryCheck(settings, anchor_date=TODAY)
