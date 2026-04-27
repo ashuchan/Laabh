@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from typing import Any
 
@@ -20,12 +21,16 @@ from src.extraction.prompts import (
     SYSTEM_PROMPT,
 )
 from src.models.content import RawContent
+from src.models.llm_audit_log import LLMAuditLog
 from src.models.signal import Signal
 from src.models.source import DataSource
 
 
 class LLMExtractor:
     """Run Claude over unprocessed `raw_content` rows and create `signals` rows."""
+
+    _CALLER = "phase1.extractor"
+    _TEMPERATURE = 0.0
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -71,9 +76,23 @@ class LLMExtractor:
             return 0
 
         prompt = self._build_prompt(content, source, text)
-        extraction, tokens = await self._call_llm(prompt)
+        extraction, tokens_in, tokens_out, latency_ms, raw_response = await self._call_llm(prompt)
+
+        await self._write_audit_log(
+            caller_ref_id=content.id,
+            prompt=prompt,
+            response=raw_response,
+            response_parsed=extraction,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            latency_ms=latency_ms,
+        )
+
         await self._mark_processed(
-            content.id, result=extraction, model=self.model, tokens=tokens
+            content.id,
+            result=extraction,
+            model=self.model,
+            tokens=tokens_in + tokens_out if tokens_in and tokens_out else None,
         )
 
         signals = (extraction or {}).get("signals") or []
@@ -124,26 +143,62 @@ class LLMExtractor:
         )
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=20))
-    async def _call_llm(self, prompt: str) -> tuple[dict[str, Any] | None, int]:
+    async def _call_llm(
+        self, prompt: str
+    ) -> tuple[dict[str, Any] | None, int, int, int, str]:
+        """Call Claude and return (parsed, tokens_in, tokens_out, latency_ms, raw_text)."""
+        t0 = time.monotonic()
         msg = await self.client.messages.create(
             model=self.model,
             max_tokens=2000,
+            temperature=self._TEMPERATURE,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
+        latency_ms = int((time.monotonic() - t0) * 1000)
         raw = "".join(
             block.text for block in msg.content if getattr(block, "type", None) == "text"
         )
-        tokens = (msg.usage.input_tokens or 0) + (msg.usage.output_tokens or 0)
+        tokens_in = msg.usage.input_tokens or 0
+        tokens_out = msg.usage.output_tokens or 0
         try:
-            return json.loads(_strip_code_fence(raw)), tokens
+            parsed = json.loads(_strip_code_fence(raw))
         except json.JSONDecodeError:
             logger.warning(f"LLM returned non-JSON (first 200 chars): {raw[:200]}")
-            return None, tokens
+            parsed = None
+        return parsed, tokens_in, tokens_out, latency_ms, raw
+
+    async def _write_audit_log(
+        self,
+        caller_ref_id: Any,
+        prompt: str,
+        response: str,
+        response_parsed: dict | None,
+        tokens_in: int | None,
+        tokens_out: int | None,
+        latency_ms: int | None,
+    ) -> None:
+        """Persist one row to llm_audit_log (non-blocking — exceptions are logged, not raised)."""
+        try:
+            async with session_scope() as session:
+                session.add(LLMAuditLog(
+                    caller=self._CALLER,
+                    caller_ref_id=caller_ref_id,
+                    model=self.model,
+                    temperature=self._TEMPERATURE,
+                    prompt=prompt,
+                    response=response,
+                    response_parsed=response_parsed,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    latency_ms=latency_ms,
+                ))
+        except Exception as exc:
+            logger.error(f"llm_audit_log write failed: {exc}")
 
     async def _mark_processed(
         self,
-        content_id,
+        content_id: Any,
         result: dict | None,
         model: str | None = None,
         tokens: int | None = None,
