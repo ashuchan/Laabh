@@ -23,6 +23,8 @@ class FNOBanList(Base):
     instrument_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("instruments.id"), nullable=False
     )
+    symbol: Mapped[str] = mapped_column(String(50), nullable=False)
     ban_date: Mapped[date] = mapped_column(Date, nullable=False)
     source: Mapped[str] = mapped_column(String(20), server_default="NSE")
+    is_active: Mapped[bool] = mapped_column(server_default="true", nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(server_default=func.now())
