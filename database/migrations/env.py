@@ -14,8 +14,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Inject DB URL from Settings (sync form for Alembic)
-config.set_main_option("sqlalchemy.url", get_settings().sync_database_url)
+# Inject DB URL from Settings (sync form for Alembic).
+# Escape `%` as `%%` so ConfigParser does not treat URL-encoded characters
+# (e.g. `%40` for `@` in passwords) as interpolation syntax.
+config.set_main_option(
+    "sqlalchemy.url", get_settings().sync_database_url.replace("%", "%%")
+)
 
 target_metadata = Base.metadata
 

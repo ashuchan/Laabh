@@ -1,6 +1,6 @@
 """Add chain ingestion observability tables.
 
-Revision ID: 0005_add_chain_ingestion_observability
+Revision ID: 0005_chain_observability
 Revises: 0004_fno_intelligence_module
 Create Date: 2026-04-27
 
@@ -20,7 +20,7 @@ from typing import Sequence, Union
 
 from alembic import op
 
-revision: str = "0005_add_chain_ingestion_observability"
+revision: str = "0005_chain_observability"
 down_revision: Union[str, None] = "0004_fno_intelligence_module"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

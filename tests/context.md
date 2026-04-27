@@ -195,7 +195,7 @@ changes, the test fails and forces a deliberate decision.
 #### Migration file (2 tests)
 
 ```
-test_migration_0005_revision_id         — revision == '0005_add_chain_ingestion_observability'
+test_migration_0005_revision_id         — revision == '0005_chain_observability'
                                           down_revision == '0004_fno_intelligence_module'
 test_migration_0005_has_upgrade_and_downgrade — both callable
 ```
@@ -208,7 +208,7 @@ such a file using the normal import system:
 def _load_migration_0005():
     import importlib.util, pathlib
     mig_path = pathlib.Path(__file__).parent.parent / \
-        "database/migrations/versions/0005_add_chain_ingestion_observability.py"
+        "database/migrations/versions/0005_chain_observability.py"
     spec = importlib.util.spec_from_file_location("mig_0005", mig_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

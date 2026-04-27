@@ -5,7 +5,7 @@
 Each file in this package maps a PostgreSQL table to a SQLAlchemy declarative
 model.  Models are thin data containers — no business logic lives here.
 
-The four models added in migration `0005_add_chain_ingestion_observability`
+The four models added in migration `0005_chain_observability`
 support the NSE-primary chain ingestion retrofit and are documented in detail
 below.  The pre-existing models (`Instrument`, `OptionsChain`, `price`, etc.)
 are covered by the main schema docs.

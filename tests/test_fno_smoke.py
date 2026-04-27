@@ -309,7 +309,7 @@ def _load_migration_0005():
     import pathlib
     mig_path = (
         pathlib.Path(__file__).parent.parent
-        / "database/migrations/versions/0005_add_chain_ingestion_observability.py"
+        / "database/migrations/versions/0005_chain_observability.py"
     )
     spec = importlib.util.spec_from_file_location("mig_0005", mig_path)
     mod = importlib.util.module_from_spec(spec)
@@ -319,7 +319,7 @@ def _load_migration_0005():
 
 def test_migration_0005_revision_id() -> None:
     mig = _load_migration_0005()
-    assert mig.revision == "0005_add_chain_ingestion_observability"
+    assert mig.revision == "0005_chain_observability"
     assert mig.down_revision == "0004_fno_intelligence_module"
 
 
