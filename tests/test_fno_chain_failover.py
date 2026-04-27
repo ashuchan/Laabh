@@ -8,6 +8,7 @@ Acceptance criteria verified here:
 from __future__ import annotations
 
 import uuid
+import src.fno.chain_collector  # noqa: F401 — must be imported before patches resolve the module
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, call, patch
