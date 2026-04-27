@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 readme = "README.md"
 
 dependencies = [
+    "typer[all]>=0.12.0",
     "smartapi-python>=1.5.0",
     "pyotp>=2.9.0",
     "yfinance>=0.2.40",
@@ -46,6 +47,9 @@ dev = [
     "ruff>=0.6.0",
     "mypy>=1.11.0",
 ]
+
+[project.scripts]
+laabh-runday = "src.runday.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
