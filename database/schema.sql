@@ -1071,3 +1071,74 @@ BEGIN
     RETURN resolved_count;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- Chain ingestion observability (migration 0005)
+-- ============================================================
+
+-- Per-instrument data tier (refreshed daily at 6 AM IST)
+CREATE TABLE IF NOT EXISTS fno_collection_tiers (
+    instrument_id     UUID PRIMARY KEY REFERENCES instruments(id),
+    tier              INT NOT NULL CHECK (tier IN (1, 2)),
+    avg_volume_5d     BIGINT,
+    last_promoted_at  TIMESTAMPTZ,
+    updated_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Per-poll outcome log (one row per underlying per attempted snapshot)
+CREATE TABLE IF NOT EXISTS chain_collection_log (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    instrument_id     UUID NOT NULL REFERENCES instruments(id),
+    attempted_at      TIMESTAMPTZ NOT NULL,
+    primary_source    VARCHAR(20) NOT NULL,
+    fallback_source   VARCHAR(20),
+    final_source      VARCHAR(20),
+    status            VARCHAR(20) NOT NULL CHECK (status IN ('ok','fallback_used','missed')),
+    nse_error         TEXT,
+    dhan_error        TEXT,
+    latency_ms        INT
+);
+CREATE INDEX IF NOT EXISTS idx_chain_log_attempted
+    ON chain_collection_log(attempted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chain_log_status
+    ON chain_collection_log(status);
+
+-- Schema mismatches and sustained failures (drives GitHub issue creation)
+CREATE TABLE IF NOT EXISTS chain_collection_issues (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    source            VARCHAR(20) NOT NULL,
+    instrument_id     UUID REFERENCES instruments(id),
+    issue_type        VARCHAR(30) NOT NULL
+                          CHECK (issue_type IN ('schema_mismatch','sustained_failure','auth_error')),
+    error_message     TEXT NOT NULL,
+    raw_response      TEXT,
+    detected_at       TIMESTAMPTZ DEFAULT NOW(),
+    github_issue_url  TEXT,
+    resolved_at       TIMESTAMPTZ,
+    resolved_by       VARCHAR(50)
+);
+CREATE INDEX IF NOT EXISTS idx_chain_issues_unresolved
+    ON chain_collection_issues(detected_at DESC)
+    WHERE resolved_at IS NULL;
+
+-- Source health for the source-pluggable abstraction
+CREATE TABLE IF NOT EXISTS source_health (
+    source            VARCHAR(20) PRIMARY KEY,
+    status            VARCHAR(20) NOT NULL
+                          CHECK (status IN ('healthy','degraded','failed')),
+    consecutive_errors INT DEFAULT 0,
+    last_success_at   TIMESTAMPTZ,
+    last_error_at     TIMESTAMPTZ,
+    last_error        TEXT,
+    updated_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Seed source health rows
+INSERT INTO source_health (source, status) VALUES
+    ('nse',       'healthy'),
+    ('dhan',      'healthy'),
+    ('angel_one', 'healthy')
+ON CONFLICT (source) DO NOTHING;
+
+-- Add source provenance column to existing options_chain table
+ALTER TABLE options_chain ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'nse';

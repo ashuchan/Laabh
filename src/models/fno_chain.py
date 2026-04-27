@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import BigInteger, CheckConstraint, Date, ForeignKey, Integer, Numeric, String
+from sqlalchemy import BigInteger, CheckConstraint, Date, ForeignKey, Integer, Numeric, String  # noqa: F401
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -42,3 +42,4 @@ class OptionsChain(Base):
     vega: Mapped[float | None] = mapped_column(Numeric(10, 4))
 
     underlying_ltp: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    source: Mapped[str | None] = mapped_column(String(20), default="nse")

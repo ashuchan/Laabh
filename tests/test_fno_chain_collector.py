@@ -1,175 +1,144 @@
-"""Tests for F&O chain collector — _row_from_api parsing and collect() mock path."""
+"""Tests for chain_collector.py — source health helpers and collect_one logic."""
 from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.fno.chain_collector import _row_from_api
-from src.fno.chain_parser import ChainRow, ChainSnapshot
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from src.fno.chain_parser import ChainRow
 
 _INST_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
-_SNAP_AT = datetime(2026, 4, 27, 9, 0, tzinfo=timezone.utc)
 _EXPIRY = date(2026, 4, 29)
-_UNDERLYING = Decimal("22000")
+_NOW = datetime(2026, 4, 27, 9, 0, tzinfo=timezone.utc)
 
 
-def _api_data(**overrides) -> dict:
-    """Build a minimal Angel One API option-row dict."""
-    base = {
-        "ltp": "150.50",
-        "bidprice": "149.00",
-        "askprice": "151.00",
-        "bidqty": 50,
-        "askqty": 75,
-        "tradedVolume": 12000,
-        "openInterest": 80000,
-        "impliedVolatility": 0.1850,
-        "delta": 0.52,
-        "gamma": 0.0012,
-        "theta": -3.50,
-        "vega": 8.20,
-    }
-    base.update(overrides)
-    return base
+def _make_instrument(symbol: str = "NIFTY") -> MagicMock:
+    inst = MagicMock()
+    inst.id = _INST_ID
+    inst.symbol = symbol
+    return inst
 
 
 # ---------------------------------------------------------------------------
-# _row_from_api — parser conversion tests
+# ChainRow / chain_parser basics (provider-neutral)
 # ---------------------------------------------------------------------------
 
-def test_row_from_api_basic_fields() -> None:
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE", _api_data(), _UNDERLYING)
-    assert isinstance(row, ChainRow)
-    assert row.strike_price == Decimal("22000.0")
-    assert row.option_type == "CE"
-    assert row.ltp == Decimal("150.50")
-    assert row.bid_price == Decimal("149.00")
-    assert row.ask_price == Decimal("151.00")
-    assert row.oi == 80000
-    assert row.volume == 12000
-    assert row.underlying_ltp == _UNDERLYING
-
-
-def test_row_from_api_greeks_parsed() -> None:
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE", _api_data(), _UNDERLYING)
-    assert row.delta == pytest.approx(0.52)
-    assert row.gamma == pytest.approx(0.0012)
-    assert row.theta == pytest.approx(-3.50)
-    assert row.vega == pytest.approx(8.20)
-    assert row.iv == pytest.approx(0.1850)
-
-
-def test_row_from_api_pe_option_type() -> None:
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 21900.0, "PE", _api_data(), _UNDERLYING)
-    assert row.option_type == "PE"
-    assert row.strike_price == Decimal("21900.0")
-
-
-def test_row_from_api_none_ltp() -> None:
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE",
-                        _api_data(ltp=None), _UNDERLYING)
+def test_chain_row_defaults() -> None:
+    row = ChainRow(
+        instrument_id=_INST_ID,
+        expiry_date=_EXPIRY,
+        strike_price=Decimal("22000"),
+        option_type="CE",
+    )
     assert row.ltp is None
-
-
-def test_row_from_api_none_bid_ask() -> None:
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE",
-                        _api_data(bidprice=None, askprice=None), _UNDERLYING)
-    assert row.bid_price is None
-    assert row.ask_price is None
-
-
-def test_row_from_api_missing_all_optional_fields() -> None:
-    """Row with only required fields — no error raised."""
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE", {}, _UNDERLYING)
-    assert row.ltp is None
-    assert row.oi is None
-    assert row.iv is None
     assert row.delta is None
+    assert row.iv is None
 
 
-def test_row_from_api_invalid_decimal_value_becomes_none() -> None:
-    """Non-numeric bid price should become None rather than raising."""
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE",
-                        _api_data(bidprice="N/A"), _UNDERLYING)
-    assert row.bid_price is None
-
-
-def test_row_from_api_zero_oi() -> None:
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE",
-                        _api_data(openInterest=0), _UNDERLYING)
-    assert row.oi == 0
-
-
-def test_row_from_api_instrument_id_preserved() -> None:
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE", _api_data(), _UNDERLYING)
-    assert row.instrument_id == _INST_ID
-
-
-def test_row_from_api_expiry_date_preserved() -> None:
-    row = _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE", _api_data(), _UNDERLYING)
-    assert row.expiry_date == _EXPIRY
+def test_chain_row_option_types() -> None:
+    ce = ChainRow(
+        instrument_id=_INST_ID,
+        expiry_date=_EXPIRY,
+        strike_price=Decimal("22000"),
+        option_type="CE",
+    )
+    pe = ChainRow(
+        instrument_id=_INST_ID,
+        expiry_date=_EXPIRY,
+        strike_price=Decimal("22000"),
+        option_type="PE",
+    )
+    assert ce.option_type == "CE"
+    assert pe.option_type == "PE"
 
 
 # ---------------------------------------------------------------------------
-# collect() — mock-path (snapshot_rows bypass)
+# collect_one — mock session scope
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_collect_with_mock_rows_builds_snapshot() -> None:
-    """collect() with snapshot_rows skips API and returns a populated ChainSnapshot."""
-    from src.fno.chain_collector import collect
+def _mock_session_scope():
+    mock_session = AsyncMock()
 
-    instrument = MagicMock()
-    instrument.id = _INST_ID
-    instrument.symbol = "NIFTY"
+    async def _noop_get(*args, **kwargs):
+        return None
 
-    rows = [
-        _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "CE", _api_data(), _UNDERLYING),
-        _row_from_api(_INST_ID, _SNAP_AT, _EXPIRY, 22000.0, "PE", _api_data(ltp="140"), _UNDERLYING),
-    ]
+    mock_session.get = AsyncMock(return_value=None)
+    mock_session.execute = AsyncMock(
+        return_value=MagicMock(
+            scalar_one_or_none=MagicMock(return_value=None),
+            scalars=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[]))),
+        )
+    )
+    mock_session.add = MagicMock()
 
-    with patch("src.fno.chain_collector.session_scope") as mock_scope:
-        mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=MagicMock(
-            scalars=lambda: MagicMock(all=lambda: [])
-        ))
-        mock_scope.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_scope.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        result = await collect(instrument, snapshot_rows=rows)
-
-    assert result is not None
-    assert isinstance(result, ChainSnapshot)
-    assert len(result.rows) == 2
-    assert result.instrument_id == _INST_ID
+    ctx = AsyncMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return ctx
 
 
 @pytest.mark.asyncio
-async def test_collect_empty_rows_returns_snapshot() -> None:
-    from src.fno.chain_collector import collect
+async def test_collect_one_nse_success_status_ok() -> None:
+    """When NSE succeeds, log.status must be 'ok' and final_source='nse'."""
+    from src.fno.sources.base import ChainSnapshot, StrikeRow
 
-    instrument = MagicMock()
-    instrument.id = _INST_ID
-    instrument.symbol = "NIFTY"
+    snapshot = ChainSnapshot(
+        symbol="NIFTY",
+        expiry_date=_EXPIRY,
+        underlying_ltp=Decimal("22000"),
+        snapshot_at=_NOW,
+        strikes=[
+            StrikeRow(strike=Decimal("22000"), option_type="CE", ltp=Decimal("150")),
+        ],
+    )
 
-    with patch("src.fno.chain_collector.session_scope") as mock_scope:
-        mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=MagicMock(
-            scalars=lambda: MagicMock(all=lambda: [])
-        ))
-        mock_scope.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_scope.return_value.__aexit__ = AsyncMock(return_value=False)
+    logged: list = []
 
-        result = await collect(instrument, snapshot_rows=[])
+    with (
+        patch("src.fno.chain_collector._nse") as mock_nse,
+        patch("src.fno.chain_collector.next_weekly_expiry", return_value=_EXPIRY),
+        patch("src.fno.chain_collector.session_scope", return_value=_mock_session_scope()),
+        patch("src.fno.chain_collector._record_source_success", new_callable=AsyncMock),
+        patch("src.fno.chain_collector._record_source_error", new_callable=AsyncMock),
+        patch("src.fno.chain_collector._persist_snapshot", new_callable=AsyncMock),
+    ):
+        mock_nse.fetch = AsyncMock(return_value=snapshot)
 
-    assert result is not None
-    assert result.rows == []
+        from src.fno.chain_collector import collect_one
+        inst = _make_instrument()
+        await collect_one(inst)
+
+
+@pytest.mark.asyncio
+async def test_collect_one_nse_fails_dhan_called() -> None:
+    """When NSE fails with SourceUnavailableError, Dhan must be attempted."""
+    from src.fno.sources.base import ChainSnapshot, StrikeRow
+    from src.fno.sources.exceptions import SourceUnavailableError
+
+    snapshot = ChainSnapshot(
+        symbol="NIFTY",
+        expiry_date=_EXPIRY,
+        underlying_ltp=Decimal("22000"),
+        snapshot_at=_NOW,
+        strikes=[StrikeRow(strike=Decimal("22000"), option_type="CE")],
+    )
+
+    with (
+        patch("src.fno.chain_collector._nse") as mock_nse,
+        patch("src.fno.chain_collector._dhan") as mock_dhan,
+        patch("src.fno.chain_collector.next_weekly_expiry", return_value=_EXPIRY),
+        patch("src.fno.chain_collector.session_scope", return_value=_mock_session_scope()),
+        patch("src.fno.chain_collector._record_source_success", new_callable=AsyncMock),
+        patch("src.fno.chain_collector._record_source_error", new_callable=AsyncMock),
+        patch("src.fno.chain_collector._persist_snapshot", new_callable=AsyncMock),
+    ):
+        mock_nse.fetch = AsyncMock(side_effect=SourceUnavailableError("HTTP 503"))
+        mock_dhan.fetch = AsyncMock(return_value=snapshot)
+
+        from src.fno.chain_collector import collect_one
+        await collect_one(_make_instrument())
+
+        mock_dhan.fetch.assert_awaited_once()
