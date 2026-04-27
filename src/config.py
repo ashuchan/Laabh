@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     market_open_time: str = Field(default="09:15", alias="MARKET_OPEN_TIME")
     market_close_time: str = Field(default="15:30", alias="MARKET_CLOSE_TIME")
 
+    # --- Whisper Pipeline (Phase 3) ---
+    # WHISPER_MODEL acts as the feature flag for the whisper module:
+    # empty string => pipeline disabled, no jobs registered, no errors.
+    whisper_model: str = Field(default="", alias="WHISPER_MODEL")
+    whisper_device: str = Field(default="cuda", alias="WHISPER_DEVICE")
+
     @property
     def sync_database_url(self) -> str:
         """Sync URL for Alembic (replace asyncpg driver with psycopg2)."""

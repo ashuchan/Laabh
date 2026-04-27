@@ -18,9 +18,11 @@ class Transcriber:
     Prefers local GPU; falls back to OpenAI API; falls back to CPU.
     """
 
-    def __init__(self, model_name: str = "large-v3", device: str = "cuda") -> None:
-        self._model_name = model_name
-        self._device = device
+    def __init__(self, model_name: str | None = None, device: str | None = None) -> None:
+        from src.config import get_settings
+        settings = get_settings()
+        self._model_name = model_name or settings.whisper_model
+        self._device = device or settings.whisper_device
         self._model = None  # loaded lazily
 
     def _load_model(self):

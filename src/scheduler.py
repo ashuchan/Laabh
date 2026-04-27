@@ -227,37 +227,41 @@ def build_scheduler() -> AsyncIOScheduler:
     )
 
     # --- Phase 3: Whisper pipeline ---
-    # 9:10 IST — start live recorders before market open
-    sched.add_job(
-        _start_live_recorders,
-        CronTrigger(hour=9, minute=10, day_of_week="mon-fri", timezone=ist),
-        id="start_recorders",
-    )
-    # 15:35 IST — stop live recorders
-    sched.add_job(
-        _stop_live_recorders,
-        CronTrigger(hour=15, minute=35, day_of_week="mon-fri", timezone=ist),
-        id="stop_recorders",
-    )
-    sched.add_job(
-        _process_whisper_chunks,
-        IntervalTrigger(minutes=2),
-        id="process_whisper",
-        max_instances=1,
-        coalesce=True,
-    )
-    # 16:00 IST — batch VOD transcription after market close
-    sched.add_job(
-        _batch_vod_transcription,
-        CronTrigger(hour=16, minute=0, day_of_week="mon-fri", timezone=ist),
-        id="batch_vod",
-    )
-    sched.add_job(
-        _run_convergence_check,
-        IntervalTrigger(minutes=15),
-        id="convergence",
-        max_instances=1,
-        coalesce=True,
-    )
+    # WHISPER_MODEL is the feature flag — when unset, skip the entire pipeline.
+    if settings.whisper_model:
+        # 9:10 IST — start live recorders before market open
+        sched.add_job(
+            _start_live_recorders,
+            CronTrigger(hour=9, minute=10, day_of_week="mon-fri", timezone=ist),
+            id="start_recorders",
+        )
+        # 15:35 IST — stop live recorders
+        sched.add_job(
+            _stop_live_recorders,
+            CronTrigger(hour=15, minute=35, day_of_week="mon-fri", timezone=ist),
+            id="stop_recorders",
+        )
+        sched.add_job(
+            _process_whisper_chunks,
+            IntervalTrigger(minutes=2),
+            id="process_whisper",
+            max_instances=1,
+            coalesce=True,
+        )
+        # 16:00 IST — batch VOD transcription after market close
+        sched.add_job(
+            _batch_vod_transcription,
+            CronTrigger(hour=16, minute=0, day_of_week="mon-fri", timezone=ist),
+            id="batch_vod",
+        )
+        sched.add_job(
+            _run_convergence_check,
+            IntervalTrigger(minutes=15),
+            id="convergence",
+            max_instances=1,
+            coalesce=True,
+        )
+    else:
+        logger.info("whisper pipeline disabled (WHISPER_MODEL unset)")
 
     return sched
