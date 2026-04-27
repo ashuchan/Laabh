@@ -142,9 +142,25 @@ async def _run_convergence_check() -> None:
 
 # --- F&O jobs ---
 
-async def _fno_chain_refresh() -> None:
-    from src.fno.orchestrator import run_chain_refresh
-    await run_chain_refresh()
+async def _fno_chain_collect_tier1() -> None:
+    from src.fno.chain_collector import collect_tier
+    await collect_tier(1)
+
+
+async def _fno_chain_collect_tier2() -> None:
+    from src.fno.chain_collector import collect_tier
+    await collect_tier(2)
+
+
+async def _fno_tier_refresh() -> None:
+    from src.fno.tier_manager import refresh
+    counts = await refresh()
+    logger.info(f"fno tier refresh: {counts}")
+
+
+async def _fno_issue_review_loop() -> None:
+    from src.fno.issue_filer import run
+    await run()
 
 
 async def _fno_vix_refresh() -> None:
@@ -312,11 +328,11 @@ def build_scheduler() -> AsyncIOScheduler:
         CronTrigger(hour=7, minute=0, day_of_week="mon-fri", timezone=ist),
         id="fno_premarket",
     )
-    # 09:00 IST — chain snapshot refresh
+    # 06:00 IST — daily tier assignment refresh (must run before market open)
     sched.add_job(
-        _fno_chain_refresh,
-        CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ist),
-        id="fno_chain_premarket",
+        _fno_tier_refresh,
+        CronTrigger(hour=6, minute=0, day_of_week="mon-fri", timezone=ist),
+        id="fno_tier_refresh",
     )
     # 09:05 IST — VIX + ban list
     sched.add_job(
@@ -324,13 +340,27 @@ def build_scheduler() -> AsyncIOScheduler:
         CronTrigger(hour=9, minute=5, day_of_week="mon-fri", timezone=ist),
         id="fno_vix_premarket",
     )
-    # Every 30 min during market hours — chain refresh for intraday monitoring
+    # Tier 1: every 5 min during market hours (09:00–15:30)
     sched.add_job(
-        _fno_chain_refresh,
-        CronTrigger(minute="0,30", hour="9-15", day_of_week="mon-fri", timezone=ist),
-        id="fno_chain_intraday",
+        _fno_chain_collect_tier1,
+        CronTrigger(minute="*/5", hour="9-15", day_of_week="mon-fri", timezone=ist),
+        id="fno_chain_collect_tier1",
         max_instances=1,
         coalesce=True,
+    )
+    # Tier 2: every 15 min during market hours (09:00–15:30)
+    sched.add_job(
+        _fno_chain_collect_tier2,
+        CronTrigger(minute="0,15,30,45", hour="9-15", day_of_week="mon-fri", timezone=ist),
+        id="fno_chain_collect_tier2",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 18:30 IST — daily review loop (issues + Telegram summary)
+    sched.add_job(
+        _fno_issue_review_loop,
+        CronTrigger(hour=18, minute=30, day_of_week="mon-fri", timezone=ist),
+        id="fno_issue_review_loop",
     )
     # Every 5 min during market hours — VIX recheck
     sched.add_job(

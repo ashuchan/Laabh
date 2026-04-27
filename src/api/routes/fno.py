@@ -2,22 +2,27 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from src.api.schemas.fno import (
+    ChainIssueResponse,
     FNOBanListResponse,
     FNOCandidateResponse,
     IVHistoryResponse,
     PipelineTriggerResponse,
+    ResolveIssueResponse,
+    SourceHealthResponse,
     VIXTickResponse,
 )
 from src.db import session_scope
 from src.models.fno_ban import FNOBanList
 from src.models.fno_candidate import FNOCandidate
+from src.models.fno_chain_issue import ChainCollectionIssue
 from src.models.fno_iv import IVHistory
+from src.models.fno_source_health import SourceHealth
 from src.models.fno_vix import VIXTick
 from src.models.instrument import Instrument
 
@@ -137,3 +142,86 @@ async def trigger_pipeline(run_date: date | None = None):
         phase2_passed=result["phase2_passed"],
         phase3_proceed=result["phase3_proceed"],
     )
+
+
+@router.get("/chain-issues", response_model=list[ChainIssueResponse])
+async def list_chain_issues(
+    status: str = Query("open", pattern="^(open|resolved)$"),
+    source: str | None = Query(None, pattern="^(nse|dhan)$"),
+    limit: int = Query(50, le=200),
+    offset: int = 0,
+):
+    """Paginated list of chain collection issues (default: today's open issues)."""
+    from datetime import timedelta
+    async with session_scope() as session:
+        q = (
+            select(ChainCollectionIssue)
+            .order_by(ChainCollectionIssue.detected_at.desc())
+        )
+        if status == "open":
+            q = q.where(ChainCollectionIssue.resolved_at.is_(None))
+        else:
+            q = q.where(ChainCollectionIssue.resolved_at.isnot(None))
+        if source:
+            q = q.where(ChainCollectionIssue.source == source)
+        q = q.limit(limit).offset(offset)
+        result = await session.execute(q)
+        rows = result.scalars().all()
+    return [ChainIssueResponse.model_validate(r) for r in rows]
+
+
+@router.post("/chain-issues/{issue_id}/resolve", response_model=ResolveIssueResponse)
+async def resolve_chain_issue(
+    issue_id: uuid.UUID,
+    resolved_by: str = Query("api"),
+):
+    """Mark a chain collection issue as resolved.
+
+    If no other open issues exist for the same source, flips source_health
+    status from 'degraded' back to 'healthy'.
+    """
+    now = datetime.now(tz=timezone.utc)
+
+    async with session_scope() as session:
+        issue = await session.get(ChainCollectionIssue, issue_id)
+        if issue is None:
+            raise HTTPException(status_code=404, detail="Issue not found")
+        if issue.resolved_at is not None:
+            raise HTTPException(status_code=409, detail="Issue already resolved")
+
+        issue.resolved_at = now
+        issue.resolved_by = resolved_by
+
+        # Check remaining open issues for this source
+        result = await session.execute(
+            select(ChainCollectionIssue).where(
+                ChainCollectionIssue.source == issue.source,
+                ChainCollectionIssue.resolved_at.is_(None),
+                ChainCollectionIssue.id != issue_id,
+            )
+        )
+        remaining = result.scalars().all()
+
+        health_row = await session.get(SourceHealth, issue.source)
+        new_health_status = health_row.status if health_row else "healthy"
+
+        if not remaining and health_row and health_row.status == "degraded":
+            health_row.status = "healthy"
+            health_row.consecutive_errors = 0
+            health_row.updated_at = now
+            new_health_status = "healthy"
+
+    return ResolveIssueResponse(
+        id=issue_id,
+        resolved=True,
+        source_health_status=new_health_status,
+    )
+
+
+@router.get("/source-health", response_model=list[SourceHealthResponse])
+async def get_source_health():
+    """Current health status for all chain data sources (NSE, Dhan, Angel One)."""
+    async with session_scope() as session:
+        result = await session.execute(select(SourceHealth))
+        rows = result.scalars().all()
+    return [SourceHealthResponse.model_validate(r) for r in rows]

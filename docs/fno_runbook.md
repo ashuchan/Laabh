@@ -231,3 +231,118 @@ that the Angel One WebSocket is connected and the token is in the subscription l
 **F&O ban list fetch fails**: NSE archive URL format is
 `fo_secban_{DDMMYYYY}.csv`. Check date formatting. Non-market days return 404
 (handled gracefully — previous day's ban list remains active).
+
+---
+
+## Chain Ingestion — NSE Primary, Dhan Fallback
+
+### Architecture
+
+| Tier | Underlyings | Cadence | Composition |
+|---|---|---|---|
+| Tier 1 | ~35 | every 5 min | 5 indices + top 30 by 5-day option volume |
+| Tier 2 | ~170 | every 15 min | Remaining F&O-eligible stocks |
+
+**Source priority (non-negotiable)**:
+1. **NSE** — free public JSON API, no auth, requires browser-like headers + cookie warmup.
+2. **Dhan** — free with a Dhan account, used when NSE fails.
+3. **Angel One** — no longer used for option chains (no chain endpoint; WebSocket cap 3,000 vs. ~24,000 needed). Still used for underlying ticks, India VIX, and Greeks API.
+
+**Failover per poll**:
+```
+NSE fetch → success: write source='nse', done.
+          → failure: try Dhan fetch
+                      → success: write source='dhan', status='fallback_used'
+                      → failure: log status='missed', both errors saved
+```
+
+Schema mismatches (`SchemaError`) are recorded in `chain_collection_issues` and
+after 3 consecutive mismatches from the same source the source is marked `degraded`
+in `source_health`.
+
+---
+
+### How to triage a chain-collector GitHub issue
+
+1. Open the issue URL stored in `chain_collection_issues.github_issue_url`.
+2. Read the **Most recent error** field and expand the **Raw response** details block.
+3. Decide the root cause:
+   - **Schema changed**: the NSE JSON structure changed (e.g. key rename, field removal).
+     Update `NSESource._parse_response()` in `src/fno/sources/nse_source.py` to match
+     the new shape, then redeploy.
+   - **Banned / blocked by NSE**: rotate `NSE_USER_AGENT` in `.env` to a current
+     browser UA string and restart. Consider increasing `NSE_REQUEST_INTERVAL_SEC`.
+   - **Transient outage**: NSE or Dhan was temporarily unavailable. If no new issues
+     appear after 30 minutes, mark the existing issue resolved (see below).
+
+---
+
+### How to recover a degraded source
+
+A source is marked `degraded` in `source_health` after accumulating enough schema
+mismatches or consecutive errors (configured by `FNO_SOURCE_DEGRADE_AFTER_SCHEMA_ERRORS`
+and `FNO_SOURCE_DEGRADE_AFTER_CONSECUTIVE_ERRORS`).
+
+**Recovery steps**:
+
+1. Identify the open issues for the degraded source:
+   ```
+   GET /fno/chain-issues?status=open&source=nse
+   ```
+2. For each issue, resolve it once the root cause is fixed:
+   ```
+   POST /fno/chain-issues/{id}/resolve?resolved_by=yourname
+   ```
+3. When the last open issue for a source is resolved, the API handler
+   automatically flips `source_health.status` from `degraded` → `healthy`.
+4. Verify with:
+   ```
+   GET /fno/source-health
+   ```
+
+---
+
+### How to manually retire NSE (emergency)
+
+Set `FNO_CHAIN_NSE_PRIMARY=false` in `.env` and restart.
+
+**Caution**: Dhan's 1-req/3s-per-underlying rate limit means a full Tier-1
+sweep takes ~2 minutes vs ~90 seconds on NSE. Use sparingly.
+
+---
+
+### Scheduler jobs (chain ingestion)
+
+| Job ID | Trigger | Function |
+|---|---|---|
+| `fno_tier_refresh` | 06:00 IST daily | `tier_manager.refresh()` |
+| `fno_chain_collect_tier1` | every 5 min, 09:00–15:00 | `chain_collector.collect_tier(1)` |
+| `fno_chain_collect_tier2` | every 15 min, 09:00–15:00 | `chain_collector.collect_tier(2)` |
+| `fno_issue_review_loop` | 18:30 IST daily | `issue_filer.run()` |
+
+All four jobs respect the NSE-holiday guard from `system_config`.
+
+---
+
+### API endpoints (chain ingestion observability)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/fno/chain-issues` | Paginated list of issues (`?status=open&source=nse`) |
+| `POST` | `/fno/chain-issues/{id}/resolve` | Mark an issue resolved; heals degraded source |
+| `GET` | `/fno/source-health` | Current health rows for NSE, Dhan, Angel One |
+
+---
+
+### New database tables (migration 0005)
+
+| Table | Purpose |
+|---|---|
+| `fno_collection_tiers` | Per-instrument tier assignment (refreshed at 06:00) |
+| `chain_collection_log` | One row per poll attempt per underlying |
+| `chain_collection_issues` | Schema mismatches and sustained failures |
+| `source_health` | Per-source health status and consecutive-error counter |
+
+**Rollback**: `alembic downgrade -1` drops the four new tables and removes
+`options_chain.source`. Existing chain data is unaffected (the `source` column
+defaults to `'nse'` and is dropped on downgrade).

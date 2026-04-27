@@ -119,6 +119,51 @@ class Settings(BaseSettings):
     fno_ranker_w_liquidity: float = Field(default=0.10, alias="FNO_RANKER_W_LIQUIDITY")
     fno_ranker_min_entry_score: float = Field(default=60.0, alias="FNO_RANKER_MIN_ENTRY_SCORE")
 
+    # --- NSE chain source ---
+    nse_user_agent: str = Field(
+        default=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        alias="NSE_USER_AGENT",
+    )
+    nse_request_interval_sec: float = Field(default=2.5, alias="NSE_REQUEST_INTERVAL_SEC")
+    nse_cookie_refresh_interval_min: int = Field(
+        default=5, alias="NSE_COOKIE_REFRESH_INTERVAL_MIN"
+    )
+    nse_max_retries: int = Field(default=3, alias="NSE_MAX_RETRIES")
+
+    # --- Dhan chain source ---
+    dhan_client_id: str = Field(default="", alias="DHAN_CLIENT_ID")
+    dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
+    dhan_request_interval_sec: float = Field(default=3.0, alias="DHAN_REQUEST_INTERVAL_SEC")
+
+    # --- GitHub review-loop issue filer ---
+    github_repo: str = Field(default="ashuchan/Laabh", alias="GITHUB_REPO")
+    github_token: str = Field(default="", alias="GITHUB_TOKEN")
+    github_issue_labels: str = Field(
+        default="bug,chain-collector,auto-filed", alias="GITHUB_ISSUE_LABELS"
+    )
+
+    # --- Tier policy ---
+    fno_tier1_size: int = Field(default=35, alias="FNO_TIER1_SIZE")
+    fno_tier2_cadence_min: int = Field(default=15, alias="FNO_TIER2_CADENCE_MIN")
+    fno_tier1_cadence_min: int = Field(default=5, alias="FNO_TIER1_CADENCE_MIN")
+
+    # --- Source health policy ---
+    fno_source_degrade_after_schema_errors: int = Field(
+        default=3, alias="FNO_SOURCE_DEGRADE_AFTER_SCHEMA_ERRORS"
+    )
+    fno_source_degrade_after_consecutive_errors: int = Field(
+        default=10, alias="FNO_SOURCE_DEGRADE_AFTER_CONSECUTIVE_ERRORS"
+    )
+
+    # --- NSE-primary feature flag ---
+    fno_chain_nse_primary: bool = Field(default=True, alias="FNO_CHAIN_NSE_PRIMARY")
+
+    # --- Risk-free rate for Black-Scholes Greeks ---
+    fno_risk_free_rate_pct: float = Field(default=6.5, alias="FNO_RISK_FREE_RATE_PCT")
+
     @property
     def sync_database_url(self) -> str:
         """Sync URL for Alembic (replace asyncpg driver with psycopg2)."""

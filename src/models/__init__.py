@@ -4,10 +4,14 @@ from src.models.content import RawContent
 from src.models.fno_ban import FNOBanList
 from src.models.fno_candidate import FNOCandidate
 from src.models.fno_chain import OptionsChain
+from src.models.fno_chain_issue import ChainCollectionIssue
+from src.models.fno_chain_log import ChainCollectionLog
+from src.models.fno_collection_tier import FNOCollectionTier
 from src.models.fno_cooldown import FNOCooldown
 from src.models.fno_iv import IVHistory
 from src.models.fno_ranker_config import RankerConfig
 from src.models.fno_signal import FNOSignal, FNOSignalEvent
+from src.models.fno_source_health import SourceHealth
 from src.models.fno_vix import VIXTick
 from src.models.instrument import Instrument
 from src.models.llm_audit_log import LLMAuditLog
@@ -27,9 +31,12 @@ def register_all_models() -> None:
 
 __all__ = [
     "Analyst",
+    "ChainCollectionIssue",
+    "ChainCollectionLog",
     "DataSource",
     "FNOBanList",
     "FNOCandidate",
+    "FNOCollectionTier",
     "FNOCooldown",
     "FNOSignal",
     "FNOSignalEvent",
@@ -49,6 +56,7 @@ __all__ = [
     "RawContent",
     "Signal",
     "SignalAutoTrade",
+    "SourceHealth",
     "SystemConfig",
     "Trade",
     "VIXTick",

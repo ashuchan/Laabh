@@ -68,3 +68,36 @@ class PipelineTriggerResponse(BaseModel):
     phase1_passed: int = 0
     phase2_passed: int = 0
     phase3_proceed: int = 0
+
+
+class ChainIssueResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    source: str
+    instrument_id: uuid.UUID | None = None
+    issue_type: str
+    error_message: str
+    raw_response: str | None = None
+    detected_at: datetime | None = None
+    github_issue_url: str | None = None
+    resolved_at: datetime | None = None
+    resolved_by: str | None = None
+
+
+class ResolveIssueResponse(BaseModel):
+    id: uuid.UUID
+    resolved: bool
+    source_health_status: str
+
+
+class SourceHealthResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    source: str
+    status: str
+    consecutive_errors: int
+    last_success_at: datetime | None = None
+    last_error_at: datetime | None = None
+    last_error: str | None = None
+    updated_at: datetime | None = None
