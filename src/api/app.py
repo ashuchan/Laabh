@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from src.api.middleware import RateLimitMiddleware, http_exception_handler
-from src.api.routes import analysts, instruments, portfolio, signals, trades, watchlist
+from src.api.routes import analysts, fno, instruments, portfolio, signals, trades, watchlist
 from src.config import get_settings
 from src.db import dispose_engine
 from src.scheduler import build_scheduler
@@ -58,6 +58,7 @@ def create_app() -> FastAPI:
     app.include_router(watchlist.router)
     app.include_router(analysts.router)
     app.include_router(instruments.router)
+    app.include_router(fno.router)
 
     app.add_exception_handler(Exception, http_exception_handler)
 

@@ -140,6 +140,40 @@ async def _run_convergence_check() -> None:
     logger.info(f"convergence check: {n} instruments updated")
 
 
+# --- F&O jobs ---
+
+async def _fno_chain_refresh() -> None:
+    from src.fno.orchestrator import run_chain_refresh
+    await run_chain_refresh()
+
+
+async def _fno_vix_refresh() -> None:
+    from src.fno.orchestrator import run_vix_refresh
+    await run_vix_refresh()
+
+
+async def _fno_premarket_pipeline() -> None:
+    from src.fno.orchestrator import run_premarket_pipeline
+    result = await run_premarket_pipeline()
+    logger.info(f"fno premarket pipeline: {result}")
+
+
+async def _fno_eod_tasks() -> None:
+    from src.fno.orchestrator import run_eod_tasks
+    await run_eod_tasks()
+
+
+async def _fno_macro_collect() -> None:
+    from src.collectors.macro_collector import collect
+    n = await collect()
+    logger.info(f"macro collector: {n} records stored")
+
+
+async def _fno_fii_dii_collect() -> None:
+    from src.collectors.fii_dii_collector import fetch_yesterday
+    await fetch_yesterday()
+
+
 def build_scheduler() -> AsyncIOScheduler:
     """Create and configure the full APScheduler instance (not yet started)."""
     settings = get_settings()
@@ -258,6 +292,61 @@ def build_scheduler() -> AsyncIOScheduler:
         id="convergence",
         max_instances=1,
         coalesce=True,
+    )
+
+    # --- F&O: pre-market macro data (06:00-09:15 IST, every 15 min) ---
+    sched.add_job(
+        _fno_macro_collect,
+        CronTrigger(minute="0,15,30,45", hour="6-9", day_of_week="mon-fri", timezone=ist),
+        id="fno_macro",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 07:00 IST — Phase 1: liquidity filter
+    sched.add_job(
+        _fno_premarket_pipeline,
+        CronTrigger(hour=7, minute=0, day_of_week="mon-fri", timezone=ist),
+        id="fno_premarket",
+    )
+    # 09:00 IST — chain snapshot refresh
+    sched.add_job(
+        _fno_chain_refresh,
+        CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ist),
+        id="fno_chain_premarket",
+    )
+    # 09:05 IST — VIX + ban list
+    sched.add_job(
+        _fno_vix_refresh,
+        CronTrigger(hour=9, minute=5, day_of_week="mon-fri", timezone=ist),
+        id="fno_vix_premarket",
+    )
+    # Every 30 min during market hours — chain refresh for intraday monitoring
+    sched.add_job(
+        _fno_chain_refresh,
+        CronTrigger(minute="0,30", hour="9-15", day_of_week="mon-fri", timezone=ist),
+        id="fno_chain_intraday",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Every 5 min during market hours — VIX recheck
+    sched.add_job(
+        _fno_vix_refresh,
+        CronTrigger(minute="*/5", hour="9-15", day_of_week="mon-fri", timezone=ist),
+        id="fno_vix_intraday",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 15:40 IST — EOD IV history + daily summary
+    sched.add_job(
+        _fno_eod_tasks,
+        CronTrigger(hour=15, minute=40, day_of_week="mon-fri", timezone=ist),
+        id="fno_eod",
+    )
+    # 18:00 IST — FII/DII data (published after market close)
+    sched.add_job(
+        _fno_fii_dii_collect,
+        CronTrigger(hour=18, minute=0, day_of_week="mon-fri", timezone=ist),
+        id="fno_fii_dii",
     )
 
     return sched

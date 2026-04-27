@@ -15,7 +15,7 @@ def test_calc_charges_buy():
     brokerage, stt, other = engine._calc_charges("BUY", qty, price)
 
     # Turnover = 10000; brokerage = min(10000 * 0.0003, 20) = 3
-    assert brokerage == pytest.approx(float(_round(Decimal("3") * Decimal("1.18"))), abs=0.01)
+    assert float(brokerage) == pytest.approx(float(_round(Decimal("3") * Decimal("1.18"))), abs=0.01)
     assert float(stt) == 0.0  # No STT on BUY for delivery
 
 
