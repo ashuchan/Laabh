@@ -79,6 +79,13 @@ class NotificationService:
             sent += 1
         return sent
 
+    async def send_text(self, text: str) -> None:
+        """Send a raw text message directly to Telegram (bypasses DB)."""
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            logger.debug("send_text: no Telegram credentials configured")
+            return
+        await self._send_telegram(text)
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     async def _send_telegram(self, text: str) -> None:
         url = TELEGRAM_API.format(token=self.settings.telegram_bot_token)

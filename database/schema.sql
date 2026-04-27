@@ -6,7 +6,15 @@
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";        -- fuzzy text search
-CREATE EXTENSION IF NOT EXISTS "timescaledb";     -- time-series for price data
+
+-- TimescaleDB is optional — gracefully degrade to plain PostgreSQL when absent
+DO $$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS "timescaledb";
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'TimescaleDB not available — time-series hypertables will be skipped';
+END;
+$$;
 
 -- ============================================================================
 -- 1. ENUMS
@@ -126,11 +134,17 @@ CREATE TABLE price_ticks (
     PRIMARY KEY (instrument_id, timestamp)
 );
 
--- Convert to TimescaleDB hypertable for efficient time-series queries
-SELECT create_hypertable('price_ticks', 'timestamp',
-    chunk_time_interval => INTERVAL '1 day',
-    if_not_exists => TRUE
-);
+-- Convert to TimescaleDB hypertable (skipped silently if TimescaleDB is absent)
+DO $$
+BEGIN
+    PERFORM create_hypertable('price_ticks', 'timestamp',
+        chunk_time_interval => INTERVAL '1 day',
+        if_not_exists => TRUE
+    );
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'TimescaleDB unavailable — price_ticks is a plain table';
+END;
+$$;
 
 -- Daily OHLCV summary (materialized for fast portfolio queries)
 CREATE TABLE price_daily (
@@ -257,7 +271,50 @@ CREATE INDEX idx_raw_content_simhash ON raw_content(simhash);
 CREATE INDEX idx_raw_content_external ON raw_content(external_id);
 
 -- ============================================================================
--- 6. SIGNALS — Extracted buy/sell/hold recommendations
+-- 6. ANALYSTS — defined before signals because signals.analyst_id FKs here
+-- ============================================================================
+
+CREATE TABLE analysts (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name                VARCHAR(200) NOT NULL,
+    normalized_name     VARCHAR(200) NOT NULL,       -- lowercase, trimmed
+
+    -- Affiliations
+    organization        VARCHAR(200),               -- "CNBC-TV18", "ICICI Securities"
+    designation         VARCHAR(200),               -- "Market Analyst", "Fund Manager"
+
+    -- Sources where this analyst appears
+    primary_source_ids  UUID[],
+
+    -- Performance scoreboard (updated nightly by cron)
+    total_signals       INT DEFAULT 0,
+    signals_hit_target  INT DEFAULT 0,
+    signals_hit_sl      INT DEFAULT 0,
+    signals_expired     INT DEFAULT 0,
+    hit_rate            NUMERIC(5,4) DEFAULT 0,
+    avg_return_pct      NUMERIC(8,4) DEFAULT 0,
+    avg_days_to_target  NUMERIC(6,1),
+    best_sector         VARCHAR(100),
+
+    -- Credibility score (composite)
+    credibility_score   NUMERIC(5,3) DEFAULT 0.5,
+
+    -- Metadata
+    notes               TEXT,
+    metadata            JSONB DEFAULT '{}',
+    is_active           BOOLEAN DEFAULT TRUE,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE(normalized_name, organization)
+);
+
+CREATE INDEX idx_analysts_name ON analysts USING gin(normalized_name gin_trgm_ops);
+CREATE INDEX idx_analysts_credibility ON analysts(credibility_score DESC);
+CREATE INDEX idx_analysts_hit_rate ON analysts(hit_rate DESC);
+
+-- ============================================================================
+-- 7. SIGNALS — Extracted buy/sell/hold recommendations
 -- ============================================================================
 
 CREATE TABLE signals (
@@ -308,49 +365,6 @@ CREATE INDEX idx_signals_status ON signals(status);
 CREATE INDEX idx_signals_date ON signals(signal_date DESC);
 CREATE INDEX idx_signals_analyst ON signals(analyst_id);
 CREATE INDEX idx_signals_convergence ON signals(convergence_score DESC);
-
--- ============================================================================
--- 7. ANALYSTS — Track every person/source giving stock tips
--- ============================================================================
-
-CREATE TABLE analysts (
-    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name                VARCHAR(200) NOT NULL,
-    normalized_name     VARCHAR(200) NOT NULL,       -- lowercase, trimmed
-    
-    -- Affiliations
-    organization        VARCHAR(200),               -- "CNBC-TV18", "ICICI Securities"
-    designation         VARCHAR(200),               -- "Market Analyst", "Fund Manager"
-    
-    -- Sources where this analyst appears
-    primary_source_ids  UUID[],
-    
-    -- Performance scoreboard (updated nightly by cron)
-    total_signals       INT DEFAULT 0,
-    signals_hit_target  INT DEFAULT 0,
-    signals_hit_sl      INT DEFAULT 0,
-    signals_expired     INT DEFAULT 0,
-    hit_rate            NUMERIC(5,4) DEFAULT 0,     -- target_hits / total_resolved
-    avg_return_pct      NUMERIC(8,4) DEFAULT 0,     -- average return of all signals
-    avg_days_to_target  NUMERIC(6,1),
-    best_sector         VARCHAR(100),               -- sector with highest hit rate
-    
-    -- Credibility score (composite)
-    credibility_score   NUMERIC(5,3) DEFAULT 0.5,   -- 0-1, updated by scoring algo
-    
-    -- Metadata
-    notes               TEXT,
-    metadata            JSONB DEFAULT '{}',
-    is_active           BOOLEAN DEFAULT TRUE,
-    created_at          TIMESTAMPTZ DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ DEFAULT NOW(),
-    
-    UNIQUE(normalized_name, organization)
-);
-
-CREATE INDEX idx_analysts_name ON analysts USING gin(normalized_name gin_trgm_ops);
-CREATE INDEX idx_analysts_credibility ON analysts(credibility_score DESC);
-CREATE INDEX idx_analysts_hit_rate ON analysts(hit_rate DESC);
 
 -- ============================================================================
 -- 8. WATCHLISTS — User's focused stock lists
@@ -494,6 +508,30 @@ CREATE TABLE holdings (
 );
 
 CREATE INDEX idx_holdings_portfolio ON holdings(portfolio_id);
+
+-- ============================================================================
+-- 9b. PENDING ORDERS — Limit and stop-loss orders waiting for price triggers
+-- ============================================================================
+
+CREATE TABLE pending_orders (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    portfolio_id    UUID NOT NULL REFERENCES portfolios(id),
+    instrument_id   UUID NOT NULL REFERENCES instruments(id),
+    signal_id       UUID REFERENCES signals(id),
+    trade_type      trade_type NOT NULL,
+    order_type      order_type NOT NULL,
+    quantity        INT NOT NULL,
+    limit_price     NUMERIC(12,2),
+    trigger_price   NUMERIC(12,2),
+    status          VARCHAR(20) DEFAULT 'pending',  -- pending, executed, cancelled, expired
+    valid_till      TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    executed_at     TIMESTAMPTZ,
+    cancelled_at    TIMESTAMPTZ
+);
+
+CREATE INDEX idx_pending_orders_portfolio ON pending_orders(portfolio_id);
+CREATE INDEX idx_pending_orders_status ON pending_orders(status);
 
 -- ============================================================================
 -- 10. PORTFOLIO SNAPSHOTS — Daily NAV history for charting
@@ -692,6 +730,24 @@ CREATE TABLE job_log (
 CREATE INDEX idx_job_log_name ON job_log(job_name);
 CREATE INDEX idx_job_log_created ON job_log(created_at DESC);
 
+-- LLM audit log — every Claude API call across the system writes one row here
+CREATE TABLE llm_audit_log (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    caller          VARCHAR(50) NOT NULL,       -- "phase1.extractor" / "fno.thesis" / etc.
+    caller_ref_id   UUID,                       -- FK to caller's row (raw_content.id, etc.)
+    model           VARCHAR(50) NOT NULL,
+    temperature     NUMERIC(4,2) NOT NULL,
+    prompt          TEXT NOT NULL,
+    response        TEXT NOT NULL,
+    response_parsed JSONB,
+    tokens_in       INT,
+    tokens_out      INT,
+    latency_ms      INT,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_llm_audit_caller ON llm_audit_log(caller, created_at DESC);
+CREATE INDEX idx_llm_audit_caller_ref ON llm_audit_log(caller_ref_id);
+
 -- ============================================================================
 -- 15. META-PAPER-TRADING — Auto-trade every signal to evaluate source quality
 -- ============================================================================
@@ -722,6 +778,165 @@ CREATE TABLE signal_auto_trades (
 CREATE INDEX idx_auto_trades_source ON signal_auto_trades(source_id);
 CREATE INDEX idx_auto_trades_analyst ON signal_auto_trades(analyst_id);
 CREATE INDEX idx_auto_trades_status ON signal_auto_trades(status);
+
+-- ============================================================================
+-- F&O INTELLIGENCE MODULE — Tables added in Phase F&O
+-- ============================================================================
+
+-- Daily F&O ban list (SEBI MWPL>95%)
+CREATE TABLE fno_ban_list (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    instrument_id   UUID NOT NULL REFERENCES instruments(id),
+    ban_date        DATE NOT NULL,
+    source          VARCHAR(20) DEFAULT 'NSE',
+    fetched_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (instrument_id, ban_date, source)
+);
+CREATE INDEX idx_fno_ban_date ON fno_ban_list(ban_date);
+
+-- Options chain snapshots
+CREATE TABLE options_chain (
+    instrument_id     UUID NOT NULL REFERENCES instruments(id),
+    snapshot_at       TIMESTAMPTZ NOT NULL,
+    expiry_date       DATE NOT NULL,
+    strike_price      NUMERIC(12,2) NOT NULL,
+    option_type       CHAR(2) NOT NULL CHECK (option_type IN ('CE','PE')),
+    ltp               NUMERIC(12,2),
+    bid_price         NUMERIC(12,2),
+    ask_price         NUMERIC(12,2),
+    bid_qty           INT,
+    ask_qty           INT,
+    volume            BIGINT,
+    oi                BIGINT,
+    oi_change         BIGINT,
+    iv                NUMERIC(8,4),
+    delta             NUMERIC(8,4),
+    gamma             NUMERIC(10,6),
+    theta             NUMERIC(10,4),
+    vega              NUMERIC(10,4),
+    underlying_ltp    NUMERIC(12,2),
+    PRIMARY KEY (instrument_id, snapshot_at, expiry_date, strike_price, option_type)
+);
+DO $$
+BEGIN
+    PERFORM create_hypertable('options_chain', 'snapshot_at',
+        chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'TimescaleDB unavailable — options_chain is a plain table';
+END;
+$$;
+CREATE INDEX idx_options_chain_underlying_expiry
+    ON options_chain(instrument_id, expiry_date, snapshot_at DESC);
+
+-- Daily IV percentile per instrument
+CREATE TABLE iv_history (
+    instrument_id     UUID NOT NULL REFERENCES instruments(id),
+    date              DATE NOT NULL,
+    atm_iv            NUMERIC(8,4) NOT NULL,
+    iv_rank_52w       NUMERIC(6,2),
+    iv_percentile_52w NUMERIC(6,2),
+    PRIMARY KEY (instrument_id, date)
+);
+
+-- India VIX time series
+CREATE TABLE vix_ticks (
+    timestamp         TIMESTAMPTZ NOT NULL,
+    vix_value         NUMERIC(8,4) NOT NULL,
+    regime            VARCHAR(10) NOT NULL CHECK (regime IN ('low','neutral','high')),
+    PRIMARY KEY (timestamp)
+);
+DO $$
+BEGIN
+    PERFORM create_hypertable('vix_ticks', 'timestamp',
+        chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE);
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'TimescaleDB unavailable — vix_ticks is a plain table';
+END;
+$$;
+
+-- Phase 1/2/3 candidate snapshots
+CREATE TABLE fno_candidates (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    instrument_id     UUID NOT NULL REFERENCES instruments(id),
+    run_date          DATE NOT NULL,
+    phase             INT NOT NULL CHECK (phase IN (1,2,3)),
+    passed_liquidity  BOOLEAN,
+    atm_oi            BIGINT,
+    atm_spread_pct    NUMERIC(6,4),
+    avg_volume_5d     BIGINT,
+    news_score        NUMERIC(4,2),
+    sentiment_score   NUMERIC(4,2),
+    fii_dii_score     NUMERIC(4,2),
+    macro_align_score NUMERIC(4,2),
+    convergence_score NUMERIC(4,2),
+    composite_score   NUMERIC(6,2),
+    technical_pass    BOOLEAN,
+    iv_regime         VARCHAR(15),
+    oi_structure      VARCHAR(20),
+    llm_thesis        TEXT,
+    llm_decision      VARCHAR(10),
+    config_version    VARCHAR(20),
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (instrument_id, run_date, phase)
+);
+CREATE INDEX idx_fno_candidates_run ON fno_candidates(run_date, phase, composite_score DESC);
+
+-- F&O signals — strike-level recommendations
+CREATE TABLE fno_signals (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    underlying_id       UUID NOT NULL REFERENCES instruments(id),
+    candidate_id        UUID REFERENCES fno_candidates(id),
+    strategy_type       VARCHAR(20) NOT NULL,
+    expiry_date         DATE NOT NULL,
+    legs                JSONB NOT NULL,
+    entry_premium_net   NUMERIC(12,2),
+    target_premium_net  NUMERIC(12,2),
+    stop_premium_net    NUMERIC(12,2),
+    max_loss            NUMERIC(12,2),
+    max_profit          NUMERIC(12,2),
+    breakeven_price     NUMERIC(12,2),
+    ranker_score        NUMERIC(6,2),
+    ranker_breakdown    JSONB,
+    ranker_version      VARCHAR(20),
+    iv_regime_at_entry  VARCHAR(15),
+    vix_at_entry        NUMERIC(8,4),
+    status              VARCHAR(15) DEFAULT 'proposed',
+    proposed_at         TIMESTAMPTZ DEFAULT NOW(),
+    filled_at           TIMESTAMPTZ,
+    closed_at           TIMESTAMPTZ,
+    final_pnl           NUMERIC(12,2),
+    notes               TEXT
+);
+CREATE INDEX idx_fno_signals_status ON fno_signals(status);
+CREATE INDEX idx_fno_signals_underlying ON fno_signals(underlying_id, proposed_at DESC);
+
+-- F&O signal state-change events (append-only audit trail)
+CREATE TABLE fno_signal_events (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    signal_id       UUID NOT NULL REFERENCES fno_signals(id),
+    from_status     VARCHAR(15),
+    to_status       VARCHAR(15) NOT NULL,
+    reason          TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_fno_signal_events_signal ON fno_signal_events(signal_id, created_at DESC);
+
+-- Strike ranker config history
+CREATE TABLE ranker_configs (
+    version           VARCHAR(20) PRIMARY KEY,
+    weights           JSONB NOT NULL,
+    activated_at      TIMESTAMPTZ DEFAULT NOW(),
+    deactivated_at    TIMESTAMPTZ,
+    notes             TEXT
+);
+
+-- F&O cooldown tracker (revenge-trade prevention)
+CREATE TABLE fno_cooldowns (
+    underlying_id     UUID NOT NULL REFERENCES instruments(id),
+    cooldown_until    TIMESTAMPTZ NOT NULL,
+    reason            VARCHAR(50),
+    PRIMARY KEY (underlying_id, cooldown_until)
+);
 
 -- ============================================================================
 -- 16. VIEWS — Useful pre-built queries
