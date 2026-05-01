@@ -10,9 +10,11 @@ import os
 try:
     import zmq
     import zmq.asyncio as zmq_asyncio
+    import zmq.error as zmq_error
 except ImportError:  # pragma: no cover
     zmq = None  # type: ignore[assignment]
     zmq_asyncio = None  # type: ignore[assignment]
+    zmq_error = None  # type: ignore[assignment]
 
 try:
     from openalgo import api as OpenAlgoAPI  # type: ignore[import-not-found]
@@ -82,9 +84,11 @@ class ZMQTickSubscriber:
     def __init__(self, zmq_url: str = "tcp://openalgo:5556") -> None:
         if zmq is None:
             raise RuntimeError("pyzmq is not installed — run: pip install pyzmq")
+        self._zmq_url = zmq_url
         self._ctx = zmq_asyncio.Context()
         self._sock = self._ctx.socket(zmq.SUB)
         self._sock.connect(zmq_url)
+        self._sock.setsockopt(zmq.RCVTIMEO, 10_000)
 
     def subscribe(self, *symbols: str) -> None:
         """Subscribe to tick stream for one or more symbols."""
@@ -93,9 +97,20 @@ class ZMQTickSubscriber:
 
     async def stream(self):
         """Yield normalized tick dicts: {symbol, ltp, volume, timestamp}"""
+        import asyncio
+        from loguru import logger
+
         while True:
-            msg = await self._sock.recv_json()
-            yield msg
+            try:
+                msg = await self._sock.recv_json()
+                yield msg
+            except zmq_error.Again:
+                logger.debug("ZMQTickSubscriber: recv timeout, reconnecting")
+                self._sock.close()
+                self._sock = self._ctx.socket(zmq.SUB)
+                self._sock.connect(self._zmq_url)
+                self._sock.setsockopt(zmq.RCVTIMEO, 10_000)
+                await asyncio.sleep(1)
 
     def close(self) -> None:
         """Shut down ZMQ socket and context."""
