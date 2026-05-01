@@ -52,7 +52,7 @@ def test_all_regimes_classified():
 
 def test_empty_dataframe_blocks_trading():
     """Empty DataFrame must block trading — never raise."""
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         is_regime_tradeable(pd.DataFrame(), float("nan"), 1.0)
     )
     assert result == (False, "high_vol"), f"Expected fail-safe, got {result}"
@@ -64,7 +64,7 @@ def test_nan_vix_blocks_trading():
         {c: [float(100 + i) for i in range(35)] for c in ["open", "high", "low", "close"]}
         | {"volume": [1_000_000.0] * 35}
     )
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         is_regime_tradeable(df, float("nan"), 1.0)
     )
     assert result[0] is False, f"NaN VIX should block trade, got {result}"
@@ -77,7 +77,7 @@ def test_high_vix_blocks_trading():
         {c: [float(100 + i) for i in range(35)] for c in ["open", "high", "low", "close"]}
         | {"volume": [1_000_000.0] * 35}
     )
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         is_regime_tradeable(df, 25.0, 1.0)
     )
     assert result[0] is False
