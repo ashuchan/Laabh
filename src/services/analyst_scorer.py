@@ -59,22 +59,18 @@ async def compute_analyst_backtest_score(
                 )
                 continue  # skip this signal, keep scoring others
 
-        avg_return = (
-            sum(
-                r["total_return_pct"]
-                for r in results
-                if r.get("total_return_pct") is not None
-            )
-            / len(results)
-            if results
-            else None
-        )
-        win_rate = (
-            sum(r["win_rate"] for r in results if r.get("win_rate") is not None)
-            / len(results)
-            if results
-            else None
-        )
+        valid_returns = [
+            r["total_return_pct"]
+            for r in results
+            if r.get("total_return_pct") is not None
+        ]
+        valid_win_rates = [
+            r["win_rate"]
+            for r in results
+            if r.get("win_rate") is not None
+        ]
+        avg_return = sum(valid_returns) / len(valid_returns) if valid_returns else None
+        win_rate = sum(valid_win_rates) / len(valid_win_rates) if valid_win_rates else None
 
         await _update_analyst_score(
             analyst_id,
