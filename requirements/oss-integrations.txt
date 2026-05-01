@@ -1,7 +1,7 @@
 # Tier 1 — MIT/Apache (import freely)
 openalgo>=1.0,<2.0             # MIT SDK (OpenAlgo server is AGPL sidecar)
 tradingagents>=0.2.4,<0.3      # Apache 2.0
-langgraph>=0.1,<0.2            # MIT (TradingAgents dependency)
+langgraph>=0.2,<1.0            # MIT (TradingAgents dependency)
 nautilus_trader>=1.200,<2.0    # LGPL-3.0 (library use)
 pyzmq>=25.0,<27.0              # ZMQ async bindings for OpenAlgo tick feed
 
