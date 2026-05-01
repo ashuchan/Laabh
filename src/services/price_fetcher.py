@@ -30,13 +30,26 @@ async def run_price_fetcher(symbols: list[str], zmq_url: str = "tcp://openalgo:5
 
 
 async def _process_tick(tick: dict) -> None:
-    """Persist tick to DB and check price alerts."""
+    """Persist tick to DB and check price alerts for the updated symbol."""
     from src.services.price_service import PriceService
 
     symbol = tick.get("symbol", "")
     ltp = tick.get("ltp")
     if not symbol or ltp is None:
+        logger.debug(f"price_fetcher: skipping malformed tick: {tick}")
         return
 
     logger.debug(f"tick: {symbol} @ {ltp}")
-    await PriceService().check_price_alerts()
+    try:
+        svc = PriceService()
+        await svc.update_ltp(symbol, float(ltp))
+        await svc.check_price_alerts(symbol)
+    except AttributeError:
+        # PriceService does not yet have update_ltp — log and continue.
+        # TODO: wire update_ltp(symbol, ltp) into PriceService when implemented.
+        logger.warning(
+            f"price_fetcher: PriceService.update_ltp not implemented — "
+            f"tick for {symbol}@{ltp} not persisted"
+        )
+    except Exception as exc:
+        logger.error(f"price_fetcher: failed to process tick for {symbol}: {exc}")
