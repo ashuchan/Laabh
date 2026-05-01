@@ -4,6 +4,7 @@ Wires together: Nifty500Universe, MultiAgentAlpha, EqualWeightPortfolio, OpenAlg
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 
 from src.paperbull.alpha_framework import (
@@ -53,7 +54,7 @@ class MultiAgentAlpha(AlphaModel):
         }
         insights: list[Insight] = []
         for ticker in tickers[:10]:
-            result = debate_signal(ticker, date.today().isoformat())
+            result = await asyncio.to_thread(debate_signal, ticker, date.today().isoformat())
             insights.append(
                 Insight(
                     ticker=ticker,
@@ -92,6 +93,6 @@ class OpenAlgoExecution(ExecutionModel):
         results = []
         for t in targets:
             action = "BUY" if t["direction"] == "UP" else "SELL"
-            result = place_paper_order(t["ticker"], "NSE", action, t["size"])
+            result = await asyncio.to_thread(place_paper_order, t["ticker"], "NSE", action, t["size"])
             results.append(result)
         return results
