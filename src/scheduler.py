@@ -190,6 +190,12 @@ async def _fno_fii_dii_collect() -> None:
     await fetch_yesterday()
 
 
+async def _run_analyst_backtest_scoring() -> None:
+    from src.services.analyst_scorer import compute_analyst_backtest_score_all
+    results = await compute_analyst_backtest_score_all(lookback_days=90)
+    logger.info(f"analyst backtest scoring: {len(results)} analysts scored")
+
+
 def build_scheduler() -> AsyncIOScheduler:
     """Create and configure the full APScheduler instance (not yet started)."""
     settings = get_settings()
@@ -381,6 +387,14 @@ def build_scheduler() -> AsyncIOScheduler:
         _fno_fii_dii_collect,
         CronTrigger(hour=18, minute=0, day_of_week="mon-fri", timezone=ist),
         id="fno_fii_dii",
+    )
+
+    # --- OSS integrations: analyst backtest scoring ---
+    # Sunday 10:00 IST (04:30 UTC) — backtests all analyst signals from the past 90 days
+    sched.add_job(
+        _run_analyst_backtest_scoring,
+        CronTrigger(hour=10, minute=0, day_of_week="sun", timezone=ist),
+        id="analyst_backtest_scoring",
     )
 
     return sched
