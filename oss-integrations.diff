@@ -1,0 +1,2344 @@
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..2b915be
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,40 @@
++.PHONY: test test-unit test-integration \
++        test-integration-openalgo test-integration-tradingagents \
++        test-integration-nautilus test-unit-strategies \
++        test-unit-features test-integration-all
++
++# ── unit tests (no external services needed) ────────────────────────────────
++
++test-unit-strategies:
++	pytest tests/test_iron_fly.py tests/test_short_straddle.py -v --tb=short
++
++test-unit-features:
++	pytest tests/test_feature_pipeline.py tests/test_regime_gate.py -v --tb=short
++
++test-unit:
++	pytest tests/ -m "not integration" -v --tb=short
++
++# ── integration tests (require live services / credentials) ─────────────────
++
++test-integration-openalgo:
++	pytest tests/test_integration_openalgo.py -m integration -v --tb=short
++
++test-integration-tradingagents:
++	pytest tests/test_integration_tradingagents.py -m integration -v --tb=short
++
++test-integration-nautilus:
++	pytest tests/test_integration_nautilus.py -m integration -v --tb=short
++
++test-integration-all:
++	pytest tests/ -m "not integration" -v --tb=short
++	pytest tests/ -m integration -v --tb=short
++
++# ── convenience targets ──────────────────────────────────────────────────────
++
++test: test-unit
++
++lint:
++	ruff check src/ tests/
++
++typecheck:
++	mypy src/ --ignore-missing-imports
+diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+index c30b10c..33c6186 100644
+--- a/docker/docker-compose.yml
++++ b/docker/docker-compose.yml
+@@ -74,6 +74,37 @@ services:
+     depends_on:
+       - backend
+ 
++  openalgo:
++    image: marketcalls/openalgo:latest
++    container_name: paperbull-openalgo
++    restart: unless-stopped
++    ports:
++      - "127.0.0.1:5000:5000"                 # REST API
++      - "127.0.0.1:8765:8765"                 # WebSocket proxy (ZMQ pub)
++    env_file: ../.env
++    environment:
++      BROKER_API_KEY: ${ANGELONE_API_KEY}
++      BROKER_API_SECRET: ${ANGELONE_API_SECRET}
++      BROKER_TOTP_SECRET: ${ANGELONE_TOTP_SECRET}
++      REDIRECT_URL: http://127.0.0.1:5000/angel/callback
++      DATABASE_URL: sqlite:////app/db/openalgo.db
++      FLASK_ENV: production
++    volumes:
++      - openalgo_data:/app/db
++    healthcheck:
++      test: ["CMD", "curl", "-f", "http://localhost:5000/api/v1/health"]
++      interval: 30s
++      timeout: 10s
++      retries: 3
++      start_period: 60s
++    networks:
++      - paperbull-net
++
++networks:
++  paperbull-net:
++    driver: bridge
++
+ volumes:
+   pgdata:
+   whisper_data:
++  openalgo_data:
+diff --git a/requirements/oss-integrations.txt b/requirements/oss-integrations.txt
+new file mode 100644
+index 0000000..4e22f42
+--- /dev/null
++++ b/requirements/oss-integrations.txt
+@@ -0,0 +1,11 @@
++# Tier 1 — MIT/Apache (import freely)
++openalgo>=1.0,<2.0             # MIT SDK (OpenAlgo server is AGPL sidecar)
++tradingagents>=0.2.4,<0.3      # Apache 2.0
++langgraph>=0.2,<1.0            # MIT (TradingAgents dependency)
++nautilus_trader>=1.200,<2.0    # LGPL-3.0 (library use)
++pyzmq>=25.0,<27.0              # ZMQ async bindings for OpenAlgo tick feed
++
++# Tier 3 — GPL (patterns only, no source copied)
++# Freqtrade: NOT a pip dependency. Patterns reimplemented in feature_pipeline.py.
++# QuantConnect LEAN: NOT a pip dependency. Alpha Framework pattern implemented in
++#                    alpha_framework.py from scratch (Apache 2.0 concept).
+diff --git a/src/integrations/freqai_inspired/feature_pipeline.py b/src/integrations/freqai_inspired/feature_pipeline.py
+new file mode 100644
+index 0000000..a48d2d7
+--- /dev/null
++++ b/src/integrations/freqai_inspired/feature_pipeline.py
+@@ -0,0 +1,178 @@
++"""
++ML Feature Pipeline — inspired by Freqtrade FreqAI architecture.
++This is an ORIGINAL implementation of the concept. No Freqtrade source copied.
++GPL-3.0 does not apply here — this is fresh code.
++
++Pattern: extract structured features from market data →
++         train a lightweight classifier → predict regime.
++"""
++from __future__ import annotations
++
++import logging
++import math
++from dataclasses import dataclass
++from typing import Literal
++
++import numpy as np
++import pandas as pd
++
++logger = logging.getLogger(__name__)
++
++MIN_ROWS = 26  # MACD(12,26) needs 26 bars; signal(9) needs 9 more — use 26 minimum
++REQUIRED_COLS = frozenset({"open", "high", "low", "close", "volume"})
++
++Regime = Literal["trending_bullish", "trending_bearish", "sideways", "high_vol"]
++
++
++@dataclass
++class FeatureSet:
++    """Structured feature vector for regime classification."""
++
++    rsi_14: float
++    atr_14_pct: float           # ATR as % of price
++    vwap_deviation_pct: float   # (close - VWAP) / VWAP * 100
++    volume_ratio: float         # today's volume / 20-day avg volume
++    india_vix: float
++    oi_pcr: float               # Nifty Put-Call Ratio
++    bb_position: float          # (close - lower_band) / (upper - lower) → 0–1
++    macd_signal_gap: float      # MACD line - signal line
++
++
++def extract_features(ohlcv: pd.DataFrame, vix: float, pcr: float) -> FeatureSet:
++    """
++    Compute feature vector from OHLCV + market-level data.
++
++    Args:
++        ohlcv: DataFrame with columns: open, high, low, close, volume.
++               Must have at least MIN_ROWS rows of clean data.
++        vix: India VIX value. Pass math.nan if unavailable — triggers high_vol.
++        pcr: Nifty Put-Call Ratio.
++
++    Returns:
++        FeatureSet with all computed indicators.
++
++    Raises:
++        ValueError: If ohlcv has insufficient rows or missing required columns.
++    """
++    # ── Input validation ──────────────────────────────────────────────────────
++    missing_cols = REQUIRED_COLS - set(ohlcv.columns)
++    if missing_cols:
++        raise ValueError(
++            f"extract_features: OHLCV DataFrame missing required columns: {missing_cols}. "
++            f"Got: {list(ohlcv.columns)}"
++        )
++    if len(ohlcv) < MIN_ROWS:
++        raise ValueError(
++            f"extract_features: requires at least {MIN_ROWS} rows, got {len(ohlcv)}. "
++            "Provide more historical data before calling."
++        )
++    null_counts = ohlcv[list(REQUIRED_COLS)].isnull().sum()
++    if null_counts.any():
++        raise ValueError(
++            f"extract_features: OHLCV contains NaN values: "
++            f"{null_counts[null_counts > 0].to_dict()}. "
++            "Clean data before calling."
++        )
++    # ── Feature extraction ────────────────────────────────────────────────────
++    close = ohlcv["close"]
++    high = ohlcv["high"]
++    low = ohlcv["low"]
++    volume = ohlcv["volume"]
++
++    # RSI(14)
++    delta = close.diff()
++    gain = delta.where(delta > 0, 0).rolling(14).mean()
++    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
++    rs = gain / loss.replace(0, np.nan)
++    rsi = 100 - (100 / (1 + rs))
++
++    # ATR(14) as % of price
++    tr = pd.concat(
++        [
++            high - low,
++            (high - close.shift()).abs(),
++            (low - close.shift()).abs(),
++        ],
++        axis=1,
++    ).max(axis=1)
++    atr = tr.rolling(14).mean()
++    atr_pct = (atr.iloc[-1] / close.iloc[-1]) * 100
++
++    # Rolling 20-day VWAP deviation
++    # Using rolling window, not session cumsum, because ohlcv is daily data.
++    # Session cumsum on 90 days computes a 90-day cost-basis average (misleading).
++    typical = (high + low + close) / 3
++    _rolling_window = 20
++    vwap = (
++        (typical * volume).rolling(_rolling_window).sum()
++        / volume.rolling(_rolling_window).sum().replace(0, np.nan)
++    )
++    vwap_dev = ((close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1]) * 100
++
++    # Volume ratio
++    vol_ratio = volume.iloc[-1] / volume.rolling(20).mean().iloc[-1]
++
++    # Bollinger Bands
++    sma20 = close.rolling(20).mean()
++    std20 = close.rolling(20).std()
++    upper = sma20 + 2 * std20
++    lower = sma20 - 2 * std20
++    bb_pos = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1] + 1e-9)
++
++    # MACD
++    ema12 = close.ewm(span=12).mean()
++    ema26 = close.ewm(span=26).mean()
++    macd = ema12 - ema26
++    signal = macd.ewm(span=9).mean()
++    macd_gap = macd.iloc[-1] - signal.iloc[-1]
++
++    return FeatureSet(
++        rsi_14=float(rsi.iloc[-1]),
++        atr_14_pct=float(atr_pct),
++        vwap_deviation_pct=float(vwap_dev),
++        volume_ratio=float(vol_ratio),
++        india_vix=vix,
++        oi_pcr=pcr,
++        bb_position=float(bb_pos),
++        macd_signal_gap=float(macd_gap),
++    )
++
++
++def classify_regime(features: FeatureSet) -> Regime:
++    """
++    Rule-based regime classifier.
++
++    Fail-safe: any NaN feature field returns "high_vol" (blocks trading).
++    Phase 1: rules. Phase 2: replace with XGBoost trained on historical regimes.
++    """
++    vix  = features.india_vix
++    rsi  = features.rsi_14
++    pcr  = features.oi_pcr
++    macd = features.macd_signal_gap
++
++    # ── Fail-safe: NaN on any key field → block trading ───────────────────────
++    # NaN comparisons in Python always return False, which would silently
++    # fall through to "sideways" (allowed). We must check explicitly.
++    if math.isnan(vix) or math.isnan(rsi) or math.isnan(macd):
++        logger.warning(
++            "classify_regime: NaN feature detected "
++            f"(vix={vix}, rsi={rsi}, macd={macd}) — returning high_vol (fail-safe)"
++        )
++        return "high_vol"
++
++    # ── Normal classification ─────────────────────────────────────────────────
++    if vix > 20:
++        return "high_vol"
++
++    if rsi > 60 and macd > 0 and pcr < 1.0:
++        return "trending_bullish"
++
++    if rsi < 40 and macd < 0 and pcr > 1.2:
++        return "trending_bearish"
++
++    return "sideways"
++
++
++async def health() -> dict:
++    """Return integration health status."""
++    return {"status": "ok", "backend": "freqai_inspired_feature_pipeline"}
+diff --git a/src/integrations/nautilus/backtester.py b/src/integrations/nautilus/backtester.py
+new file mode 100644
+index 0000000..2b6e9e6
+--- /dev/null
++++ b/src/integrations/nautilus/backtester.py
+@@ -0,0 +1,232 @@
++"""
++NautilusTrader backtesting adapter.
++LGPL-3.0 — imported as library, strategies stay private.
++"""
++from __future__ import annotations
++
++import logging
++from decimal import Decimal
++
++import pandas as pd
++
++logger = logging.getLogger(__name__)
++
++try:
++    from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig  # type: ignore[import-not-found]
++    from nautilus_trader.model.data import Bar, BarSpecification, BarType  # type: ignore[import-not-found]
++    from nautilus_trader.model.enums import BarAggregation, PriceType  # type: ignore[import-not-found]
++    from nautilus_trader.model.identifiers import InstrumentId, TraderId, Venue  # type: ignore[import-not-found]
++    from nautilus_trader.model.instruments import Equity  # type: ignore[import-not-found]
++    from nautilus_trader.model.objects import Money, Price, Quantity  # type: ignore[import-not-found]
++    from nautilus_trader.model.currencies import INR  # type: ignore[import-not-found]
++    _NAUTILUS_AVAILABLE = True
++except ImportError:  # pragma: no cover
++    _NAUTILUS_AVAILABLE = False
++
++
++if _NAUTILUS_AVAILABLE:
++    from nautilus_trader.trading.actor import Actor  # type: ignore[import-not-found]
++    from nautilus_trader.model.enums import OrderSide  # type: ignore[import-not-found]
++
++    class _SignalReplayActor(Actor):
++        """
++        Replays a list of signals as market orders.
++        Each signal {date, direction} becomes a BUY or SELL market order
++        at the bar closest to that date.
++        """
++
++        def __init__(self, signal_history: list[dict], instrument_id) -> None:
++            super().__init__()
++            self._signals = signal_history
++            self._instrument_id = instrument_id
++
++        def on_start(self) -> None:
++            self.subscribe_bars(
++                BarType(
++                    instrument_id=self._instrument_id,
++                    bar_spec=BarSpecification(1, BarAggregation.DAY, PriceType.LAST),
++                )
++            )
++
++        def on_bar(self, bar: Bar) -> None:
++            bar_date = pd.Timestamp(bar.ts_event, unit="ns").date().isoformat()
++            for sig in self._signals:
++                if sig.get("date") == bar_date:
++                    side = (
++                        OrderSide.BUY
++                        if str(sig.get("direction", "")).upper() == "BUY"
++                        else OrderSide.SELL
++                    )
++                    order = self.order_factory.market(
++                        instrument_id=self._instrument_id,
++                        order_side=side,
++                        quantity=Quantity(1, precision=0),
++                    )
++                    self.submit_order(order)
++
++else:
++    class _SignalReplayActor:  # type: ignore[no-redef]
++        """Stub class so the module imports cleanly when nautilus is absent."""
++
++        def __init__(self, *args, **kwargs) -> None:
++            pass
++
++
++async def health() -> dict:
++    """Return integration health status."""
++    return {
++        "status": "ok" if _NAUTILUS_AVAILABLE else "down",
++        "backend": "nautilustrader",
++        "available": _NAUTILUS_AVAILABLE,
++    }
++
++
++_NULL_BACKTEST_RESULT: dict = {
++    "total_return_pct": None,
++    "sharpe_ratio": None,
++    "max_drawdown_pct": None,
++    "win_rate": None,
++    "total_trades": 0,
++    "profit_factor": None,
++}
++
++
++def run_signal_backtest(
++    signal_history: list[dict],
++    ohlcv_df: pd.DataFrame,
++    ticker: str,
++    initial_capital: float = 1_000_000.0,
++) -> dict:
++    """
++    Backtest a signal series against historical OHLCV.
++    Used to score analyst accuracy with realistic slippage.
++
++    Args:
++        signal_history: list of {date, ticker, direction, entry, target, stop}.
++                        Each signal becomes a market order at its signal date.
++        ohlcv_df:       DataFrame with columns: date, open, high, low, close, volume.
++        ticker:         NSE symbol e.g. "RELIANCE"
++        initial_capital: starting capital in INR (default ₹10L)
++
++    Returns:
++        Performance metrics dict. On any failure, returns _NULL_BACKTEST_RESULT
++        with an "error" key — never raises.
++    """
++    if not _NAUTILUS_AVAILABLE:
++        logger.warning(
++            "run_signal_backtest: nautilus_trader not installed — "
++            "returning null result. Run: pip install nautilus_trader"
++        )
++        return {**_NULL_BACKTEST_RESULT, "ticker": ticker,
++                "error": "nautilus_trader not installed"}
++
++    if not signal_history:
++        logger.warning(f"run_signal_backtest: empty signal_history for {ticker}")
++        return {**_NULL_BACKTEST_RESULT, "ticker": ticker,
++                "error": "empty signal_history"}
++
++    if ohlcv_df.empty:
++        logger.warning(f"run_signal_backtest: empty ohlcv_df for {ticker}")
++        return {**_NULL_BACKTEST_RESULT, "ticker": ticker,
++                "error": "empty ohlcv_df"}
++
++    try:
++        return _run_backtest_impl(signal_history, ohlcv_df, ticker, initial_capital)
++    except Exception as exc:
++        logger.error(
++            f"run_signal_backtest: engine failed for {ticker}: {exc}",
++            exc_info=True,
++        )
++        return {**_NULL_BACKTEST_RESULT, "ticker": ticker, "error": str(exc)}
++
++
++def _run_backtest_impl(
++    signal_history: list[dict],
++    ohlcv_df: pd.DataFrame,
++    ticker: str,
++    initial_capital: float,
++) -> dict:
++    """Internal implementation — called only when nautilus is available."""
++    engine = BacktestEngine(
++        config=BacktestEngineConfig(
++            trader_id=TraderId("PAPERBULL-BACKTESTER-001"),
++        )
++    )
++
++    venue = Venue("NSE")
++    instrument = Equity(
++        instrument_id=InstrumentId.from_str(f"{ticker}.NSE"),
++        raw_symbol=ticker,
++        currency=INR,
++        price_precision=2,
++        price_increment=Price(Decimal("0.05"), precision=2),
++        lot_size=Quantity(1, precision=0),
++        ts_event=0,
++        ts_init=0,
++    )
++    engine.add_venue(
++        venue=venue,
++        oms_type="HEDGING",
++        account_type="CASH",
++        starting_balances=[Money(initial_capital, INR)],
++    )
++    engine.add_instrument(instrument)
++
++    bars = _df_to_bars(ohlcv_df, instrument.id)
++    if not bars:
++        return {**_NULL_BACKTEST_RESULT, "ticker": ticker,
++                "error": "no valid bars after filtering NaT rows"}
++    engine.add_data(bars)
++
++    # Add signal replay actor so the engine actually trades
++    # Without this, the engine runs empty and all stats are zero.
++    actor = _SignalReplayActor(signal_history, instrument.id)
++    engine.add_actor(actor)
++
++    engine.run()
++    stats = engine.get_stats_pnls_formatted()
++
++    return {
++        "ticker": ticker,
++        "total_return_pct": stats.get("Total Return [%]", None),
++        "sharpe_ratio": stats.get("Sharpe Ratio (Ann.)", None),
++        "max_drawdown_pct": stats.get("Max. Drawdown [%]", None),
++        "win_rate": stats.get("Win Rate [%]", None),
++        "total_trades": stats.get("Total Orders", 0),
++        "profit_factor": stats.get("Profit Factor", None),
++    }
++
++
++def _df_to_bars(df: pd.DataFrame, instrument_id) -> list:
++    """
++    Convert PaperBull OHLCV DataFrame to NautilusTrader Bar objects.
++
++    Uses Decimal for price values (required by NautilusTrader 1.200+).
++    Skips rows with NaT dates or zero/negative prices with a warning log.
++    """
++    bars = []
++    bar_type = BarType(
++        instrument_id=instrument_id,
++        bar_spec=BarSpecification(1, BarAggregation.DAY, PriceType.LAST),
++    )
++    for idx, row in df.iterrows():
++        ts = pd.Timestamp(row["date"]) if "date" in row.index else pd.Timestamp(idx)
++        if pd.isna(ts):
++            logger.warning(f"_df_to_bars: skipping NaT row at index {idx}")
++            continue
++        try:
++            bar = Bar(
++                bar_type=bar_type,
++                open=Price(Decimal(str(round(float(row["open"]), 2))), precision=2),
++                high=Price(Decimal(str(round(float(row["high"]), 2))), precision=2),
++                low=Price(Decimal(str(round(float(row["low"]), 2))), precision=2),
++                close=Price(Decimal(str(round(float(row["close"]), 2))), precision=2),
++                volume=Quantity(max(int(row["volume"]), 1), precision=0),
++                ts_event=int(ts.timestamp() * 1e9),
++                ts_init=int(ts.timestamp() * 1e9),
++            )
++            bars.append(bar)
++        except Exception as exc:
++            logger.warning(f"_df_to_bars: skipping row {idx} — {exc}")
++            continue
++    return bars
+diff --git a/src/integrations/openalgo/client.py b/src/integrations/openalgo/client.py
+new file mode 100644
+index 0000000..5c452d1
+--- /dev/null
++++ b/src/integrations/openalgo/client.py
+@@ -0,0 +1,103 @@
++"""
++OpenAlgo adapter — wraps the official MIT-licensed openalgo pip SDK.
++The OpenAlgo *server* is AGPL (runs as Docker sidecar).
++The *client SDK* (pip install openalgo) is MIT — safe to import here.
++"""
++from __future__ import annotations
++
++import os
++
++try:
++    import zmq
++    import zmq.asyncio as zmq_asyncio
++except ImportError:  # pragma: no cover
++    zmq = None  # type: ignore[assignment]
++    zmq_asyncio = None  # type: ignore[assignment]
++
++try:
++    from openalgo import api as OpenAlgoAPI  # type: ignore[import-not-found]
++except ImportError:  # pragma: no cover
++    OpenAlgoAPI = None  # type: ignore[assignment]
++
++OPENALGO_API_KEY = os.environ.get("OPENALGO_API_KEY", "")
++OPENALGO_HOST = os.environ.get("OPENALGO_HOST", "http://localhost:5000")
++OPENALGO_WS_URL = os.environ.get("OPENALGO_WS_URL", "ws://localhost:8765")
++
++_client = None
++
++
++def _get_client():
++    global _client
++    if _client is None:
++        if OpenAlgoAPI is None:
++            raise RuntimeError("openalgo package is not installed — run: pip install openalgo")
++        _client = OpenAlgoAPI(api_key=OPENALGO_API_KEY, host=OPENALGO_HOST)
++    return _client
++
++
++async def health() -> dict:
++    """Return integration health status."""
++    try:
++        resp = _get_client().funds()
++        if resp.get("status") == "success":
++            return {"status": "ok", "broker": resp.get("data", {}).get("broker")}
++    except Exception as e:
++        return {"status": "down", "error": str(e)}
++    return {"status": "degraded"}
++
++
++def get_ltp(symbol: str, exchange: str = "NSE") -> float:
++    """Get last traded price via OpenAlgo unified quote API."""
++    resp = _get_client().quotes(symbol=symbol, exchange=exchange)
++    return float(resp["data"]["ltp"])
++
++
++def place_paper_order(
++    symbol: str,
++    exchange: str,
++    action: str,
++    quantity: int,
++    price_type: str = "MARKET",
++) -> dict:
++    """
++    Route paper trade through OpenAlgo sandbox.
++    OpenAlgo sandbox is activated when BROKER=sandbox in its .env.
++    """
++    return _get_client().placeorder(
++        symbol=symbol,
++        exchange=exchange,
++        action=action,
++        quantity=quantity,
++        price_type=price_type,
++        product="MIS",
++    )
++
++
++class ZMQTickSubscriber:
++    """
++    Subscribe to OpenAlgo's normalized ZMQ tick feed.
++    Replaces direct Angel One WebSocket in price-fetcher service.
++    """
++
++    def __init__(self, zmq_url: str = "tcp://openalgo:5556") -> None:
++        if zmq is None:
++            raise RuntimeError("pyzmq is not installed — run: pip install pyzmq")
++        self._ctx = zmq_asyncio.Context()
++        self._sock = self._ctx.socket(zmq.SUB)
++        self._sock.connect(zmq_url)
++
++    def subscribe(self, *symbols: str) -> None:
++        """Subscribe to tick stream for one or more symbols."""
++        for sym in symbols:
++            self._sock.setsockopt_string(zmq.SUBSCRIBE, sym)
++
++    async def stream(self):
++        """Yield normalized tick dicts: {symbol, ltp, volume, timestamp}"""
++        while True:
++            msg = await self._sock.recv_json()
++            yield msg
++
++    def close(self) -> None:
++        """Shut down ZMQ socket and context."""
++        self._sock.close()
++        self._ctx.term()
+diff --git a/src/integrations/tradingagents/debate.py b/src/integrations/tradingagents/debate.py
+new file mode 100644
+index 0000000..1267468
+--- /dev/null
++++ b/src/integrations/tradingagents/debate.py
+@@ -0,0 +1,120 @@
++"""
++Multi-agent signal debate adapter.
++TradingAgents is Apache 2.0 — freely importable.
++
++Usage: call debate_signal(ticker) to get a structured verdict dict
++       from the 5-agent debate pipeline.
++"""
++from __future__ import annotations
++
++try:
++    from tradingagents.graph.trading_graph import TradingAgentsGraph  # type: ignore[import-not-found]
++    from tradingagents.default_config import DEFAULT_CONFIG  # type: ignore[import-not-found]
++    _TRADINGAGENTS_AVAILABLE = True
++except ImportError:  # pragma: no cover
++    TradingAgentsGraph = None  # type: ignore[assignment]
++    DEFAULT_CONFIG = {}  # type: ignore[assignment]
++    _TRADINGAGENTS_AVAILABLE = False
++
++
++def _build_config() -> dict:
++    cfg = DEFAULT_CONFIG.copy() if isinstance(DEFAULT_CONFIG, dict) else {}
++    cfg["llm_provider"] = "anthropic"
++    cfg["deep_think_llm"] = "claude-sonnet-4-6"
++    cfg["quick_think_llm"] = "claude-haiku-4-5-20251001"
++    cfg["max_debate_rounds"] = 1
++    cfg["online_tools"] = False
++
++    # India-specific analyst prompts (imported lazily to avoid circular deps)
++    try:
++        from src.integrations.vibetrade.prompts import (
++            FUNDAMENTALS_ANALYST_INDIA,
++            SENTIMENT_ANALYST_INDIA,
++            TECHNICAL_ANALYST_INDIA,
++        )
++        cfg["analyst_system_prompts"] = {
++            "fundamentals": FUNDAMENTALS_ANALYST_INDIA,
++            "sentiment": SENTIMENT_ANALYST_INDIA,
++            "technical": TECHNICAL_ANALYST_INDIA,
++        }
++    except ImportError:
++        pass
++
++    return cfg
++
++
++_graph: "TradingAgentsGraph | None" = None
++
++
++def _get_graph() -> "TradingAgentsGraph":
++    global _graph
++    if _graph is None:
++        if not _TRADINGAGENTS_AVAILABLE:
++            raise RuntimeError(
++                "tradingagents package is not installed — run: pip install tradingagents"
++            )
++        _graph = TradingAgentsGraph(debug=False, config=_build_config())
++    return _graph
++
++
++def debate_signal(ticker_nse: str, analysis_date: str) -> dict:
++    """
++    Run the 5-agent debate for an NSE ticker.
++
++    Args:
++        ticker_nse: NSE symbol e.g. "RELIANCE" (not RELIANCE.NS)
++        analysis_date: ISO date string e.g. "2026-05-01"
++
++    Returns:
++        {
++          "ticker": str,
++          "date": str,
++          "decision": "Buy"|"Overweight"|"Hold"|"Underweight"|"Sell",
++          "confidence": float,   # 0.0–1.0
++          "bull_thesis": str,
++          "bear_thesis": str,
++          "risk_assessment": str,
++          "agent_verdicts": dict  # per-agent raw output
++        }
++    """
++    graph = _get_graph()
++    state, decision = graph.propagate(ticker_nse, analysis_date)
++
++    return {
++        "ticker": ticker_nse,
++        "date": analysis_date,
++        "decision": state.get("final_trade_decision", "Hold"),
++        "confidence": _parse_confidence(state),
++        "bull_thesis": state.get("bull_researcher_report", ""),
++        "bear_thesis": state.get("bear_researcher_report", ""),
++        "risk_assessment": state.get("risk_debate_state", ""),
++        "agent_verdicts": {
++            "fundamentals": state.get("fundamentals_report", ""),
++            "sentiment": state.get("sentiment_report", ""),
++            "news": state.get("news_report", ""),
++            "technicals": state.get("market_report", ""),
++        },
++    }
++
++
++def _parse_confidence(state: dict) -> float:
++    """Extract numeric confidence from the trader decision string."""
++    decision = state.get("final_trade_decision", "Hold")
++    mapping = {
++        "Buy": 0.85,
++        "Overweight": 0.70,
++        "Hold": 0.50,
++        "Underweight": 0.35,
++        "Sell": 0.15,
++    }
++    return mapping.get(decision, 0.50)
++
++
++async def health() -> dict:
++    """Return integration health status."""
++    return {
++        "status": "ok" if _TRADINGAGENTS_AVAILABLE else "down",
++        "backend": "tradingagents",
++        "version": "0.2.4+",
++        "available": _TRADINGAGENTS_AVAILABLE,
++    }
+diff --git a/src/integrations/vibetrade/prompts.py b/src/integrations/vibetrade/prompts.py
+new file mode 100644
+index 0000000..45a7957
+--- /dev/null
++++ b/src/integrations/vibetrade/prompts.py
+@@ -0,0 +1,87 @@
++"""
++Indian market agent system prompts — adapted from VibeTrade (MIT).
++Tailored for NSE/BSE equity + NFO derivatives context.
++"""
++
++FUNDAMENTALS_ANALYST_INDIA = """
++You are a fundamental analyst specialising in NSE/BSE-listed Indian equities.
++
++When analyzing a stock, assess:
++1. Quarterly results vs Dalal Street estimates (PAT, EBITDA margin, revenue growth)
++2. Promoter holding changes and FII/DII flows from exchange disclosures
++3. Debt-to-equity and interest coverage (critical for rate-sensitive sectors)
++4. Sectoral tailwinds: PLI scheme beneficiaries, import substitution plays
++5. Management commentary from BSE/NSE earnings call transcripts
++6. Any SEBI orders, exchange notices, or circuit breaker history
++
++Output a structured JSON:
++{
++  "intrinsic_value_view": "undervalued|fairly_valued|overvalued",
++  "earnings_quality": "high|medium|low",
++  "balance_sheet_risk": "low|medium|high",
++  "fundamental_thesis": "<2–3 sentence bull or bear case>",
++  "key_risks": ["<risk1>", "<risk2>"]
++}
++"""
++
++SENTIMENT_ANALYST_INDIA = """
++You are a sentiment analyst for Indian markets, tracking:
++1. Moneycontrol, Economic Times Markets, LiveMint retail sentiment
++2. Reddit r/DalalStreetBets and r/IndiaAlgoTrading community sentiment
++3. Zee Business / CNBC TV18 / NDTV Profit anchor commentary tone
++4. Telegram trading group chatter (if available via signal pipeline)
++5. Twitter/X sentiment from key Indian market handles
++
++Output:
++{
++  "sentiment_score": <-1.0 to +1.0>,
++  "retail_sentiment": "bullish|neutral|bearish",
++  "smart_money_cues": "<any institutional cue visible in news>",
++  "sentiment_thesis": "<2-sentence summary>"
++}
++"""
++
++TECHNICAL_ANALYST_INDIA = """
++You are a technical analyst for NSE/BSE instruments.
++
++Analyse using:
++1. Daily/Weekly price action: S/R levels, trend structure, swing highs/lows
++2. RSI(14), MACD(12,26,9), Bollinger Bands(20,2)
++3. VWAP position and volume profile context
++4. F&O OI data: support/resistance from max pain and OI build-up
++5. India VIX: below 14 = low fear, 14–20 = neutral, above 20 = elevated risk
++6. Nifty/Sector index correlation for beta-adjusted view
++
++Output:
++{
++  "trend": "uptrend|downtrend|sideways",
++  "momentum": "strong_bullish|bullish|neutral|bearish|strong_bearish",
++  "key_support": <price>,
++  "key_resistance": <price>,
++  "technical_thesis": "<2-sentence summary>",
++  "suggested_entry_zone": "<price range>",
++  "invalidation_level": <price>
++}
++"""
++
++FNO_ANALYST_INDIA = """
++You are an F&O specialist for NSE derivatives (Nifty, BankNifty, stock options).
++
++Assess:
++1. IV rank/percentile vs 90-day realized vol
++2. PCR (Put-Call Ratio): >1.2 = bullish bias, <0.8 = bearish bias
++3. OI build-up: call OI at resistance, put OI at support
++4. Max pain level and its distance from spot
++5. Expiry calendar: weekly (Thursday) vs monthly
++6. F&O ban list: avoid banned instruments
++
++Output:
++{
++  "iv_environment": "cheap|fair|expensive",
++  "pcr": <float>,
++  "max_pain": <price>,
++  "recommended_strategy": "long_call|long_put|bull_call_spread|iron_fly|straddle|...",
++  "strike_rationale": "<why this strike>",
++  "fno_thesis": "<2-sentence summary>"
++}
++"""
+diff --git a/src/laabh/regime_gate.py b/src/laabh/regime_gate.py
+new file mode 100644
+index 0000000..6dbb272
+--- /dev/null
++++ b/src/laabh/regime_gate.py
+@@ -0,0 +1,60 @@
++"""
++Replace hardcoded VIX threshold with feature-based regime classifier.
++"""
++from __future__ import annotations
++
++import logging
++
++import pandas as pd
++
++from src.integrations.freqai_inspired.feature_pipeline import (
++    Regime,
++    classify_regime,
++    extract_features,
++)
++
++logger = logging.getLogger(__name__)
++
++ALLOWED_REGIMES: frozenset[Regime] = frozenset(
++    {"trending_bullish", "trending_bearish", "sideways"}
++)
++BLOCKED_REGIMES: frozenset[Regime] = frozenset({"high_vol"})
++
++
++async def is_regime_tradeable(
++    ohlcv: pd.DataFrame,
++    vix: float,
++    pcr: float,
++) -> tuple[bool, Regime]:
++    """
++    Returns (tradeable: bool, regime: Regime).
++
++    Fail-safe: any exception in feature extraction → (False, "high_vol").
++    This ensures a data pipeline failure blocks trading rather than permitting it.
++
++    Args:
++        ohlcv: Daily OHLCV DataFrame (need ≥26 rows).
++        vix:   India VIX. Pass float('nan') if unavailable — will block trading.
++        pcr:   Nifty Put-Call Ratio.
++    """
++    try:
++        features = extract_features(ohlcv, vix, pcr)
++        regime = classify_regime(features)
++        tradeable = regime not in BLOCKED_REGIMES
++        logger.debug(f"is_regime_tradeable: regime={regime}, tradeable={tradeable}")
++        return tradeable, regime
++    except ValueError as exc:
++        # Bad data (missing columns, too few rows, NaN values)
++        logger.warning(
++            f"is_regime_tradeable: feature extraction failed ({exc}) "
++            "— blocking trade (fail-safe high_vol)"
++        )
++        return False, "high_vol"
++    except Exception as exc:
++        # Unexpected failure — never let it propagate into strategy logic
++        logger.error(
++            f"is_regime_tradeable: unexpected error ({exc}) "
++            "— blocking trade (fail-safe high_vol)",
++            exc_info=True,
++        )
++        return False, "high_vol"
+diff --git a/src/laabh/strategies/iron_fly.py b/src/laabh/strategies/iron_fly.py
+new file mode 100644
+index 0000000..6dc54a2
+--- /dev/null
++++ b/src/laabh/strategies/iron_fly.py
+@@ -0,0 +1,84 @@
++"""
++Iron Fly strategy for Laabh — adapted from algo_trading_strategies_india (MIT).
++Adapted for: Laabh's signal pipeline, OpenAlgo order routing, Kafka alerts.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++from src.integrations.openalgo.client import place_paper_order
++
++
++@dataclass
++class IronFlyConfig:
++    underlying: str          # e.g. "NIFTY"
++    expiry: str              # e.g. "26JUN25"
++    atm_strike: int          # resolved by strike ranker
++    lot_size: int            # from OpenAlgo symbol master
++    target_pct: float = 0.40  # 40% of max profit
++    stop_pct: float = 1.00    # 100% of premium received (1:1)
++    mtm_check_interval: int = 300  # seconds
++    wing_width: int = 100         # OTM wing distance (points)
++
++
++class IronFly:
++    """
++    Structure: Sell ATM CE + Sell ATM PE + Buy OTM CE + Buy OTM PE
++    Net credit position. Profit if underlying stays near ATM at expiry.
++    """
++
++    def __init__(self, cfg: IronFlyConfig) -> None:
++        self.cfg = cfg
++        self.legs: list[dict] = []
++        self.entry_premium: float = 0.0
++        self.position_id: str = ""
++
++    def enter(self) -> dict:
++        """Place 4 legs via OpenAlgo paper trading sandbox."""
++        c = self.cfg
++
++        legs_params = [
++            dict(
++                symbol=f"{c.underlying}{c.expiry}{c.atm_strike}CE",
++                exchange="NFO",
++                action="SELL",
++                quantity=c.lot_size,
++            ),
++            dict(
++                symbol=f"{c.underlying}{c.expiry}{c.atm_strike}PE",
++                exchange="NFO",
++                action="SELL",
++                quantity=c.lot_size,
++            ),
++            dict(
++                symbol=f"{c.underlying}{c.expiry}{c.atm_strike + c.wing_width}CE",
++                exchange="NFO",
++                action="BUY",
++                quantity=c.lot_size,
++            ),
++            dict(
++                symbol=f"{c.underlying}{c.expiry}{c.atm_strike - c.wing_width}PE",
++                exchange="NFO",
++                action="BUY",
++                quantity=c.lot_size,
++            ),
++        ]
++
++        results = [place_paper_order(**leg) for leg in legs_params]
++        self.legs = results
++        return {"status": "entered", "legs": results}
++
++    def check_mtm_exit(self, current_pnl: float) -> str | None:
++        """
++        Returns "TARGET"|"STOP"|None.
++        MTM-based exit logic from algo_trading_strategies_india.
++        """
++        max_profit = self.entry_premium * self.cfg.lot_size
++        target_pnl = max_profit * self.cfg.target_pct
++        stop_pnl = -max_profit * self.cfg.stop_pct
++
++        if current_pnl >= target_pnl:
++            return "TARGET"
++        if current_pnl <= stop_pnl:
++            return "STOP"
++        return None
+diff --git a/src/laabh/strategies/short_straddle.py b/src/laabh/strategies/short_straddle.py
+new file mode 100644
+index 0000000..3aef5e0
+--- /dev/null
++++ b/src/laabh/strategies/short_straddle.py
+@@ -0,0 +1,63 @@
++"""
++Short Straddle for Laabh — adapted from algo_trading_strategies_india (MIT).
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from src.integrations.openalgo.client import place_paper_order
++
++
++@dataclass
++class ShortStraddleConfig:
++    underlying: str
++    expiry: str
++    atm_strike: int
++    lot_size: int
++    trailing_stop_pct: float = 0.25   # trail at 25% from peak P&L
++    daily_target_pct: float = 0.30    # exit at 30% of max credit
++    discipline_mode: bool = True      # block re-entry after stop hit
++
++
++class ShortStraddle:
++    """
++    Structure: Sell ATM CE + Sell ATM PE.
++    High-premium strategy. Managed with trailing stop on combined premium.
++    """
++
++    def __init__(self, cfg: ShortStraddleConfig) -> None:
++        self.cfg = cfg
++        self.peak_pnl: float = 0.0
++        self.stop_triggered: bool = False
++        self.cooldown_until: str | None = None
++
++    def enter(self) -> dict:
++        """Place both legs via OpenAlgo paper trading sandbox."""
++        c = self.cfg
++        results = [
++            place_paper_order(
++                symbol=f"{c.underlying}{c.expiry}{c.atm_strike}CE",
++                exchange="NFO",
++                action="SELL",
++                quantity=c.lot_size,
++            ),
++            place_paper_order(
++                symbol=f"{c.underlying}{c.expiry}{c.atm_strike}PE",
++                exchange="NFO",
++                action="SELL",
++                quantity=c.lot_size,
++            ),
++        ]
++        return {"status": "entered", "legs": results}
++
++    def update_trailing_stop(self, current_pnl: float) -> str | None:
++        """Track peak P&L and trigger trailing stop when drawdown exceeds threshold."""
++        if current_pnl > self.peak_pnl:
++            self.peak_pnl = current_pnl
++
++        trailing_stop_level = self.peak_pnl * (1 - self.cfg.trailing_stop_pct)
++        if current_pnl < trailing_stop_level and self.peak_pnl > 0:
++            if self.cfg.discipline_mode:
++                self.stop_triggered = True
++            return "TRAILING_STOP"
++        return None
+diff --git a/src/paperbull/alpha_framework.py b/src/paperbull/alpha_framework.py
+new file mode 100644
+index 0000000..3000529
+--- /dev/null
++++ b/src/paperbull/alpha_framework.py
+@@ -0,0 +1,88 @@
++"""
++LEAN-inspired Alpha Framework for PaperBull.
++Apache 2.0 pattern — implemented from scratch.
++
++Mirrors QuantConnect LEAN's:
++  UniverseSelection → AlphaModel → PortfolioConstruction → ExecutionModel
++"""
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from dataclasses import dataclass, field
++from datetime import date
++from typing import Literal
++
++
++@dataclass
++class Insight:
++    """A directional prediction from an alpha source. Mirrors LEAN's Insight."""
++
++    ticker: str
++    direction: Literal["UP", "DOWN", "FLAT"]
++    confidence: float          # 0.0–1.0
++    magnitude: float | None    # expected % move
++    period_days: int           # holding period
++    source: str                # which alpha model generated this
++    generated_at: date = field(default_factory=date.today)
++
++
++class UniverseModel(ABC):
++    """Selects which instruments to analyse each day."""
++
++    @abstractmethod
++    async def select(self) -> list[str]:
++        """Return list of NSE tickers in today's universe."""
++        ...
++
++
++class AlphaModel(ABC):
++    """Generates Insights for tickers in the universe."""
++
++    @abstractmethod
++    async def generate(self, tickers: list[str]) -> list[Insight]:
++        """Return Insight list for the provided tickers."""
++        ...
++
++
++class PortfolioConstructionModel(ABC):
++    """Converts Insights into target paper positions."""
++
++    @abstractmethod
++    async def construct(self, insights: list[Insight]) -> list[dict]:
++        """Return list of paper trade targets: {ticker, direction, size}"""
++        ...
++
++
++class ExecutionModel(ABC):
++    """Executes paper trades via OpenAlgo sandbox."""
++
++    @abstractmethod
++    async def execute(self, targets: list[dict]) -> list[dict]:
++        """Submit orders and return execution results."""
++        ...
++
++
++class PaperBullAlphaFramework:
++    """
++    Orchestrator. Run daily after market open or pre-market.
++    """
++
++    def __init__(
++        self,
++        universe: UniverseModel,
++        alpha: AlphaModel,
++        portfolio: PortfolioConstructionModel,
++        execution: ExecutionModel,
++    ) -> None:
++        self.universe = universe
++        self.alpha = alpha
++        self.portfolio = portfolio
++        self.execution = execution
++
++    async def run_daily_cycle(self) -> dict:
++        """Execute one full cycle: select → generate → construct → execute."""
++        tickers = await self.universe.select()
++        insights = await self.alpha.generate(tickers)
++        targets = await self.portfolio.construct(insights)
++        trades = await self.execution.execute(targets)
++        return {"insights": len(insights), "trades": len(trades)}
+diff --git a/src/paperbull/implementations.py b/src/paperbull/implementations.py
+new file mode 100644
+index 0000000..d32d83c
+--- /dev/null
++++ b/src/paperbull/implementations.py
+@@ -0,0 +1,97 @@
++"""
++Concrete implementations of the Alpha Framework components.
++Wires together: Nifty500Universe, MultiAgentAlpha, EqualWeightPortfolio, OpenAlgoExecution.
++"""
++from __future__ import annotations
++
++from datetime import date
++
++from src.paperbull.alpha_framework import (
++    AlphaModel,
++    ExecutionModel,
++    Insight,
++    PortfolioConstructionModel,
++    UniverseModel,
++)
++
++
++class Nifty500Universe(UniverseModel):
++    """Select from Nifty 500 filtered by signals in last 24h."""
++
++    async def select(self) -> list[str]:
++        """Return tickers that have received signals in the past 24 hours."""
++        from src.db import session_scope
++        from sqlalchemy import text
++
++        async with session_scope() as session:
++            rows = await session.execute(
++                text("""
++                    SELECT DISTINCT i.symbol
++                    FROM signals s
++                    JOIN instruments i ON i.id = s.instrument_id
++                    WHERE s.created_at >= NOW() - INTERVAL '24 hours'
++                      AND i.symbol IS NOT NULL
++                    LIMIT 50
++                """)
++            )
++            return [r[0] for r in rows.fetchall()]
++
++
++class MultiAgentAlpha(AlphaModel):
++    """Uses TradingAgents debate as the alpha source."""
++
++    async def generate(self, tickers: list[str]) -> list[Insight]:
++        """Run debate for each ticker (capped at 10 to manage LLM cost)."""
++        from src.integrations.tradingagents.debate import debate_signal
++
++        direction_map = {
++            "Buy": "UP",
++            "Overweight": "UP",
++            "Sell": "DOWN",
++            "Underweight": "DOWN",
++            "Hold": "FLAT",
++        }
++        insights: list[Insight] = []
++        for ticker in tickers[:10]:
++            result = debate_signal(ticker, date.today().isoformat())
++            insights.append(
++                Insight(
++                    ticker=ticker,
++                    direction=direction_map.get(result["decision"], "FLAT"),
++                    confidence=result["confidence"],
++                    magnitude=None,
++                    period_days=5,
++                    source="multi_agent_debate",
++                )
++            )
++        return insights
++
++
++class EqualWeightPortfolio(PortfolioConstructionModel):
++    """Simple equal-weight, long-only, max 5 positions."""
++
++    async def construct(self, insights: list[Insight]) -> list[dict]:
++        """Filter actionable insights and return top-5 by confidence."""
++        actionable = [
++            i for i in insights if i.direction != "FLAT" and i.confidence >= 0.65
++        ]
++        actionable = sorted(actionable, key=lambda x: x.confidence, reverse=True)[:5]
++        return [
++            {"ticker": i.ticker, "direction": i.direction, "size": 1}
++            for i in actionable
++        ]
++
++
++class OpenAlgoExecution(ExecutionModel):
++    """Routes paper trades through OpenAlgo sandbox."""
++
++    async def execute(self, targets: list[dict]) -> list[dict]:
++        """Submit each target as a paper order via OpenAlgo."""
++        from src.integrations.openalgo.client import place_paper_order
++
++        results = []
++        for t in targets:
++            action = "BUY" if t["direction"] == "UP" else "SELL"
++            result = place_paper_order(t["ticker"], "NSE", action, t["size"])
++            results.append(result)
++        return results
+diff --git a/src/scheduler.py b/src/scheduler.py
+index f592b23..9d9811e 100644
+--- a/src/scheduler.py
++++ b/src/scheduler.py
+@@ -142,9 +142,25 @@ async def _run_convergence_check() -> None:
+ 
+ # --- F&O jobs ---
+ 
+-async def _fno_chain_refresh() -> None:
+-    from src.fno.orchestrator import run_chain_refresh
+-    await run_chain_refresh()
++async def _fno_chain_collect_tier1() -> None:
++    from src.fno.chain_collector import collect_tier
++    await collect_tier(1)
++
++
++async def _fno_chain_collect_tier2() -> None:
++    from src.fno.chain_collector import collect_tier
++    await collect_tier(2)
++
++
++async def _fno_tier_refresh() -> None:
++    from src.fno.tier_manager import refresh
++    counts = await refresh()
++    logger.info(f"fno tier refresh: {counts}")
++
++
++async def _fno_issue_review_loop() -> None:
++    from src.fno.issue_filer import run
++    await run()
+ 
+ 
+ async def _fno_vix_refresh() -> None:
+@@ -174,6 +190,12 @@ async def _fno_fii_dii_collect() -> None:
+     await fetch_yesterday()
+ 
+ 
++async def _run_analyst_backtest_scoring() -> None:
++    from src.services.analyst_scorer import compute_analyst_backtest_score_all
++    results = await compute_analyst_backtest_score_all(lookback_days=90)
++    logger.info(f"analyst backtest scoring: {len(results)} analysts scored")
++
++
+ def build_scheduler() -> AsyncIOScheduler:
+     """Create and configure the full APScheduler instance (not yet started)."""
+     settings = get_settings()
+@@ -312,11 +334,11 @@ def build_scheduler() -> AsyncIOScheduler:
+         CronTrigger(hour=7, minute=0, day_of_week="mon-fri", timezone=ist),
+         id="fno_premarket",
+     )
+-    # 09:00 IST — chain snapshot refresh
++    # 06:00 IST — daily tier assignment refresh (must run before market open)
+     sched.add_job(
+-        _fno_chain_refresh,
+-        CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ist),
+-        id="fno_chain_premarket",
++        _fno_tier_refresh,
++        CronTrigger(hour=6, minute=0, day_of_week="mon-fri", timezone=ist),
++        id="fno_tier_refresh",
+     )
+     # 09:05 IST — VIX + ban list
+     sched.add_job(
+@@ -324,14 +346,28 @@ def build_scheduler() -> AsyncIOScheduler:
+         CronTrigger(hour=9, minute=5, day_of_week="mon-fri", timezone=ist),
+         id="fno_vix_premarket",
+     )
+-    # Every 30 min during market hours — chain refresh for intraday monitoring
++    # Tier 1: every 5 min during market hours (09:00–15:30)
+     sched.add_job(
+-        _fno_chain_refresh,
+-        CronTrigger(minute="0,30", hour="9-15", day_of_week="mon-fri", timezone=ist),
+-        id="fno_chain_intraday",
++        _fno_chain_collect_tier1,
++        CronTrigger(minute="*/5", hour="9-15", day_of_week="mon-fri", timezone=ist),
++        id="fno_chain_collect_tier1",
+         max_instances=1,
+         coalesce=True,
+     )
++    # Tier 2: every 15 min during market hours (09:00–15:30)
++    sched.add_job(
++        _fno_chain_collect_tier2,
++        CronTrigger(minute="0,15,30,45", hour="9-15", day_of_week="mon-fri", timezone=ist),
++        id="fno_chain_collect_tier2",
++        max_instances=1,
++        coalesce=True,
++    )
++    # 18:30 IST — daily review loop (issues + Telegram summary)
++    sched.add_job(
++        _fno_issue_review_loop,
++        CronTrigger(hour=18, minute=30, day_of_week="mon-fri", timezone=ist),
++        id="fno_issue_review_loop",
++    )
+     # Every 5 min during market hours — VIX recheck
+     sched.add_job(
+         _fno_vix_refresh,
+@@ -353,4 +389,12 @@ def build_scheduler() -> AsyncIOScheduler:
+         id="fno_fii_dii",
+     )
+ 
++    # --- OSS integrations: analyst backtest scoring ---
++    # Sunday 10:00 IST (04:30 UTC) — backtests all analyst signals from the past 90 days
++    sched.add_job(
++        _run_analyst_backtest_scoring,
++        CronTrigger(hour=10, minute=0, day_of_week="sun", timezone=ist),
++        id="analyst_backtest_scoring",
++    )
++
+     return sched
+diff --git a/src/services/analyst_scorer.py b/src/services/analyst_scorer.py
+new file mode 100644
+index 0000000..c468f89
+--- /dev/null
++++ b/src/services/analyst_scorer.py
+@@ -0,0 +1,230 @@
++"""
++Analyst scorer service — backtests analyst signals via NautilusTrader
++and updates the analyst_scoreboard table.
++"""
++from __future__ import annotations
++
++import logging
++from datetime import datetime, timezone
++
++import pandas as pd
++from sqlalchemy import text
++
++from src.db import session_scope
++from src.integrations.nautilus.backtester import run_signal_backtest
++
++logger = logging.getLogger(__name__)
++
++
++async def compute_analyst_backtest_score(
++    analyst_id: str, lookback_days: int = 90
++) -> dict:
++    """
++    Backtests all signals from an analyst over the last N days.
++    Updates analyst_scoreboard table with backtested accuracy.
++
++    Fails gracefully per-analyst: one bad signal does not abort the batch,
++    and outer DB/unexpected errors are caught and reported via Telegram.
++
++    Args:
++        analyst_id: UUID string of the analyst
++        lookback_days: number of days of signal history to backtest
++
++    Returns:
++        Summary dict with avg_return and win_rate (or error key on failure).
++    """
++    try:
++        signals = await _fetch_analyst_signals(analyst_id, lookback_days)
++
++        if not signals:
++            logger.info(f"analyst_scorer: no signals for {analyst_id} in last {lookback_days}d")
++            return {"analyst_id": analyst_id, "signal_count": 0,
++                    "avg_return": None, "win_rate": None}
++
++        results = []
++        for sig in signals:
++            try:
++                ohlcv = await _fetch_ohlcv(sig["ticker"], sig["date"], days_forward=30)
++                backtest = run_signal_backtest([sig], ohlcv, sig["ticker"])
++                if "error" not in backtest:
++                    results.append(backtest)
++                else:
++                    logger.warning(
++                        f"analyst_scorer: backtest error for {sig['ticker']}: "
++                        f"{backtest['error']}"
++                    )
++            except Exception as exc:
++                logger.error(
++                    f"analyst_scorer: signal backtest failed for {sig['ticker']}: {exc}"
++                )
++                continue  # skip this signal, keep scoring others
++
++        avg_return = (
++            sum(
++                r["total_return_pct"]
++                for r in results
++                if r.get("total_return_pct") is not None
++            )
++            / len(results)
++            if results
++            else None
++        )
++        win_rate = (
++            sum(r["win_rate"] for r in results if r.get("win_rate") is not None)
++            / len(results)
++            if results
++            else None
++        )
++
++        await _update_analyst_score(
++            analyst_id,
++            {
++                "backtested_return_pct": avg_return,
++                "backtested_win_rate": win_rate,
++                "signal_count": len(results),
++                "scored_at": datetime.now(timezone.utc).isoformat(),
++            },
++        )
++
++        logger.info(
++            f"analyst_scorer: {analyst_id} — {len(results)} signals, "
++            f"avg_return={avg_return}, win_rate={win_rate}"
++        )
++        return {
++            "analyst_id": analyst_id,
++            "avg_return": avg_return,
++            "win_rate": win_rate,
++            "signal_count": len(results),
++        }
++
++    except Exception as exc:
++        logger.error(
++            f"analyst_scorer: compute_analyst_backtest_score failed for {analyst_id}: {exc}",
++            exc_info=True,
++        )
++        try:
++            from src.services.notification_service import NotificationService
++            await NotificationService().send_text(
++                f"⚠️ Sunday scorer failed for analyst `{analyst_id}`\n"
++                f"Error: {exc}\n"
++                "Scores not updated this week."
++            )
++        except Exception:
++            pass  # Telegram failure must not cascade
++        return {"analyst_id": analyst_id, "error": str(exc),
++                "avg_return": None, "win_rate": None}
++
++
++async def compute_analyst_backtest_score_all(lookback_days: int = 90) -> list[dict]:
++    """
++    Score all analysts. Runs per-analyst scoring independently so one failure
++    does not abort the batch. Sends a summary Telegram message on completion.
++    """
++    analyst_ids = await _fetch_active_analyst_ids(lookback_days)
++    results = []
++    for analyst_id in analyst_ids:
++        result = await compute_analyst_backtest_score(analyst_id, lookback_days)
++        results.append(result)
++
++    successes = [r for r in results if "error" not in r]
++    failures = [r for r in results if "error" in r]
++
++    summary = (
++        f"📊 Sunday Analyst Scoring Complete\n"
++        f"✅ Scored: {len(successes)} analysts\n"
++        f"❌ Failed: {len(failures)} analysts"
++    )
++    if failures:
++        summary += "\n\nFailed analysts:\n" + "\n".join(
++            f"  • {r['analyst_id']}: {r.get('error', 'unknown')}"
++            for r in failures
++        )
++
++    try:
++        from src.services.notification_service import NotificationService
++        await NotificationService().send_text(summary)
++    except Exception:
++        pass
++
++    logger.info(f"analyst_scorer: processed {len(results)} analysts")
++    return results
++
++
++async def _fetch_analyst_signals(analyst_id: str, lookback_days: int) -> list[dict]:
++    """Fetch signals attributed to the given analyst."""
++    async with session_scope() as session:
++        rows = await session.execute(
++            text("""
++                SELECT s.id, i.symbol AS ticker, s.created_at::date AS date,
++                       s.action AS direction, s.target_price, s.stop_loss
++                FROM signals s
++                JOIN instruments i ON i.id = s.instrument_id
++                WHERE s.analyst_id = :analyst_id
++                  AND s.created_at >= NOW() - make_interval(days => :days)
++                ORDER BY s.created_at
++            """),
++            {"analyst_id": analyst_id, "days": lookback_days},
++        )
++        return [dict(r._mapping) for r in rows.fetchall()]
++
++
++async def _fetch_ohlcv(ticker: str, start_date, days_forward: int) -> pd.DataFrame:
++    """Fetch OHLCV data for backtesting from the price_daily table."""
++    async with session_scope() as session:
++        rows = await session.execute(
++            text("""
++                SELECT date, open, high, low, close, volume
++                FROM price_daily
++                JOIN instruments i ON i.id = price_daily.instrument_id
++                WHERE i.symbol = :symbol
++                  AND date >= :start_date
++                  AND date <= :start_date + make_interval(days => :days)
++                ORDER BY date
++            """),
++            {"symbol": ticker, "start_date": str(start_date), "days": days_forward},
++        )
++        records = rows.fetchall()
++    return pd.DataFrame(records, columns=["date", "open", "high", "low", "close", "volume"])
++
++
++async def _update_analyst_score(analyst_id: str, scores: dict) -> None:
++    """Upsert analyst backtest scores into analyst_scoreboard."""
++    async with session_scope() as session:
++        await session.execute(
++            text("""
++                INSERT INTO analyst_scoreboard
++                    (analyst_id, backtested_return_pct, backtested_win_rate,
++                     signal_count, scored_at)
++                VALUES
++                    (:analyst_id, :backtested_return_pct, :backtested_win_rate,
++                     :signal_count, :scored_at)
++                ON CONFLICT (analyst_id) DO UPDATE SET
++                    backtested_return_pct = EXCLUDED.backtested_return_pct,
++                    backtested_win_rate   = EXCLUDED.backtested_win_rate,
++                    signal_count          = EXCLUDED.signal_count,
++                    scored_at             = EXCLUDED.scored_at
++            """),
++            {
++                "analyst_id": analyst_id,
++                "backtested_return_pct": scores["backtested_return_pct"],
++                "backtested_win_rate": scores["backtested_win_rate"],
++                "signal_count": scores["signal_count"],
++                "scored_at": scores["scored_at"],
++            },
++        )
++        await session.commit()
++
++
++async def _fetch_active_analyst_ids(lookback_days: int) -> list[str]:
++    """Return IDs of analysts who have signals in the lookback window."""
++    async with session_scope() as session:
++        rows = await session.execute(
++            text("""
++                SELECT DISTINCT analyst_id::text
++                FROM signals
++                WHERE analyst_id IS NOT NULL
++                  AND created_at >= NOW() - make_interval(days => :days)
++            """),
++            {"days": lookback_days},
++        )
++        return [r[0] for r in rows.fetchall()]
+diff --git a/src/services/price_fetcher.py b/src/services/price_fetcher.py
+new file mode 100644
+index 0000000..6d894b9
+--- /dev/null
++++ b/src/services/price_fetcher.py
+@@ -0,0 +1,42 @@
++"""
++Price fetcher service — routes tick stream through OpenAlgo ZMQ feed.
++Replaces direct Angel One WebSocket subscription.
++"""
++from __future__ import annotations
++
++from loguru import logger
++
++from src.integrations.openalgo.client import ZMQTickSubscriber
++
++
++async def run_price_fetcher(symbols: list[str], zmq_url: str = "tcp://openalgo:5556") -> None:
++    """
++    Subscribe to OpenAlgo's normalized ZMQ tick feed and process each tick.
++
++    Args:
++        symbols: NSE symbols to subscribe to
++        zmq_url: ZMQ publisher URL from OpenAlgo container
++    """
++    sub = ZMQTickSubscriber(zmq_url=zmq_url)
++    sub.subscribe(*symbols)
++    logger.info(f"price_fetcher: subscribed to {len(symbols)} symbols via ZMQ")
++
++    try:
++        async for tick in sub.stream():
++            await _process_tick(tick)
++    finally:
++        sub.close()
++        logger.info("price_fetcher: ZMQ subscriber closed")
++
++
++async def _process_tick(tick: dict) -> None:
++    """Persist tick to DB and check price alerts."""
++    from src.services.price_service import PriceService
++
++    symbol = tick.get("symbol", "")
++    ltp = tick.get("ltp")
++    if not symbol or ltp is None:
++        return
++
++    logger.debug(f"tick: {symbol} @ {ltp}")
++    await PriceService().check_price_alerts()
+diff --git a/src/services/signal_extractor.py b/src/services/signal_extractor.py
+new file mode 100644
+index 0000000..c487ddd
+--- /dev/null
++++ b/src/services/signal_extractor.py
+@@ -0,0 +1,56 @@
++"""
++Signal extractor service — enriches extracted signals with multi-agent debate verdict.
++Wraps TradingAgents debate pipeline into the existing signal flow.
++"""
++from __future__ import annotations
++
++from datetime import date
++
++from loguru import logger
++
++from src.integrations.tradingagents.debate import debate_signal
++
++
++async def enrich_with_debate(ticker: str, existing_signal: dict) -> dict:
++    """
++    After RSS/news extraction, run the multi-agent debate.
++    Only called for signals that cleared the convergence_score >= 2 threshold.
++
++    Args:
++        ticker: NSE symbol e.g. "RELIANCE"
++        existing_signal: signal dict from the LLM extractor pipeline
++
++    Returns:
++        Updated signal dict with debate fields added.
++    """
++    try:
++        verdict = debate_signal(ticker, date.today().isoformat())
++    except Exception as exc:
++        logger.warning(f"debate_signal failed for {ticker}: {exc}")
++        return existing_signal
++
++    existing_signal["debate_decision"] = verdict["decision"]
++    existing_signal["debate_confidence"] = verdict["confidence"]
++    existing_signal["bull_thesis"] = verdict["bull_thesis"]
++    existing_signal["bear_thesis"] = verdict["bear_thesis"]
++    existing_signal["risk_assessment"] = verdict["risk_assessment"]
++
++    if _aligns(existing_signal.get("direction", ""), verdict["decision"]):
++        existing_signal["convergence_score"] = (
++            existing_signal.get("convergence_score", 0) + 1.5
++        )
++        logger.debug(
++            f"debate aligned for {ticker}: {verdict['decision']}, "
++            f"convergence boosted to {existing_signal['convergence_score']}"
++        )
++
++    return existing_signal
++
++
++def _aligns(direction: str, decision: str) -> bool:
++    """Return True when debate decision aligns with signal direction."""
++    bullish = {"Buy", "Overweight"}
++    bearish = {"Sell", "Underweight"}
++    return (direction == "BUY" and decision in bullish) or (
++        direction == "SELL" and decision in bearish
++    )
+diff --git a/tests/test_feature_pipeline.py b/tests/test_feature_pipeline.py
+new file mode 100644
+index 0000000..9af283c
+--- /dev/null
++++ b/tests/test_feature_pipeline.py
+@@ -0,0 +1,199 @@
++"""Unit tests for FreqAI-inspired feature pipeline."""
++from __future__ import annotations
++
++import math
++
++import numpy as np
++import pandas as pd
++import pytest
++
++from src.integrations.freqai_inspired.feature_pipeline import (
++    FeatureSet,
++    MIN_ROWS,
++    classify_regime,
++    extract_features,
++)
++
++
++def _make_ohlcv(n: int = 50, trend: float = 0.0) -> pd.DataFrame:
++    """Build synthetic OHLCV DataFrame for testing."""
++    base = 1000.0
++    closes = [base + i * trend + np.random.uniform(-5, 5) for i in range(n)]
++    return pd.DataFrame(
++        {
++            "open": [c - 2 for c in closes],
++            "high": [c + 5 for c in closes],
++            "low": [c - 5 for c in closes],
++            "close": closes,
++            "volume": [500_000 + i * 1000 for i in range(n)],
++        }
++    )
++
++
++def _make_valid_ohlcv(rows: int = MIN_ROWS + 5) -> pd.DataFrame:
++    """Helper: generate a valid OHLCV DataFrame with enough rows."""
++    rng = np.random.default_rng(42)
++    prices = 100 + np.cumsum(rng.normal(0, 1, rows))
++    return pd.DataFrame(
++        {
++            "open": prices * 0.999,
++            "high": prices * 1.002,
++            "low": prices * 0.997,
++            "close": prices,
++            "volume": rng.integers(500_000, 2_000_000, rows).astype(float),
++        }
++    )
++
++
++# ── Happy-path tests ──────────────────────────────────────────────────────────
++
++def test_extract_features_returns_featureset():
++    ohlcv = _make_ohlcv(50, trend=2.0)
++    fs = extract_features(ohlcv, vix=15.0, pcr=0.9)
++    assert isinstance(fs, FeatureSet)
++    assert 0 <= fs.rsi_14 <= 100
++    assert fs.india_vix == 15.0
++    assert fs.oi_pcr == 0.9
++    assert 0.0 <= fs.bb_position <= 1.5  # can exceed 1 in strong trends
++
++
++def test_extract_features_volume_ratio():
++    ohlcv = _make_ohlcv(50)
++    fs = extract_features(ohlcv, vix=14.0, pcr=1.0)
++    assert fs.volume_ratio > 0
++
++
++def test_classify_regime_high_vol():
++    fs = FeatureSet(
++        rsi_14=55.0, atr_14_pct=1.5, vwap_deviation_pct=0.5,
++        volume_ratio=1.2, india_vix=22.0, oi_pcr=1.0,
++        bb_position=0.6, macd_signal_gap=5.0
++    )
++    assert classify_regime(fs) == "high_vol"
++
++
++def test_classify_regime_trending_bullish():
++    fs = FeatureSet(
++        rsi_14=65.0, atr_14_pct=1.0, vwap_deviation_pct=1.2,
++        volume_ratio=1.5, india_vix=13.0, oi_pcr=0.8,
++        bb_position=0.8, macd_signal_gap=10.0
++    )
++    assert classify_regime(fs) == "trending_bullish"
++
++
++def test_classify_regime_trending_bearish():
++    fs = FeatureSet(
++        rsi_14=35.0, atr_14_pct=1.0, vwap_deviation_pct=-1.5,
++        volume_ratio=1.2, india_vix=18.0, oi_pcr=1.4,
++        bb_position=0.2, macd_signal_gap=-8.0
++    )
++    assert classify_regime(fs) == "trending_bearish"
++
++
++def test_classify_regime_sideways():
++    fs = FeatureSet(
++        rsi_14=50.0, atr_14_pct=0.8, vwap_deviation_pct=0.1,
++        volume_ratio=0.9, india_vix=15.0, oi_pcr=1.0,
++        bb_position=0.5, macd_signal_gap=0.5
++    )
++    assert classify_regime(fs) == "sideways"
++
++
++async def test_feature_pipeline_health():
++    from src.integrations.freqai_inspired.feature_pipeline import health
++
++    result = await health()
++    assert result["status"] == "ok"
++
++
++# ── Fail-safe / input validation tests ───────────────────────────────────────
++
++def test_nan_vix_returns_high_vol():
++    """NaN VIX must block trading (fail-safe)."""
++    fs = FeatureSet(
++        rsi_14=65.0, atr_14_pct=1.5, vwap_deviation_pct=0.5,
++        volume_ratio=1.2, india_vix=float("nan"),
++        oi_pcr=0.9, bb_position=0.7, macd_signal_gap=0.5,
++    )
++    assert classify_regime(fs) == "high_vol", "NaN VIX must return high_vol"
++
++
++def test_nan_rsi_returns_high_vol():
++    """NaN RSI must block trading (fail-safe)."""
++    fs = FeatureSet(
++        rsi_14=float("nan"), atr_14_pct=1.5, vwap_deviation_pct=0.5,
++        volume_ratio=1.2, india_vix=14.0,
++        oi_pcr=0.9, bb_position=0.7, macd_signal_gap=0.5,
++    )
++    assert classify_regime(fs) == "high_vol"
++
++
++def test_nan_macd_returns_high_vol():
++    """NaN MACD must block trading (fail-safe)."""
++    fs = FeatureSet(
++        rsi_14=65.0, atr_14_pct=1.5, vwap_deviation_pct=0.5,
++        volume_ratio=1.2, india_vix=14.0,
++        oi_pcr=0.9, bb_position=0.7, macd_signal_gap=float("nan"),
++    )
++    assert classify_regime(fs) == "high_vol"
++
++
++def test_too_few_rows_raises():
++    """DataFrame with fewer than MIN_ROWS rows must raise ValueError."""
++    small_df = pd.DataFrame(
++        {c: [100.0] * (MIN_ROWS - 1) for c in ["open", "high", "low", "close", "volume"]}
++    )
++    with pytest.raises(ValueError, match="requires at least"):
++        extract_features(small_df, 14.0, 1.0)
++
++
++def test_missing_column_raises():
++    """DataFrame missing required columns must raise ValueError."""
++    bad_df = pd.DataFrame({"close": [100.0] * MIN_ROWS, "open": [99.0] * MIN_ROWS})
++    with pytest.raises(ValueError, match="missing required columns"):
++        extract_features(bad_df, 14.0, 1.0)
++
++
++def test_nan_values_in_ohlcv_raises():
++    """DataFrame with NaN OHLCV values must raise ValueError."""
++    df = _make_valid_ohlcv()
++    df = df.copy()
++    df.loc[5, "close"] = float("nan")
++    with pytest.raises(ValueError, match="NaN values"):
++        extract_features(df, 14.0, 1.0)
++
++
++def test_valid_data_returns_feature_set():
++    """Happy path: valid data returns a FeatureSet with no NaN."""
++    df = _make_valid_ohlcv()
++    fs = extract_features(df, 14.0, 1.0)
++    assert not math.isnan(fs.rsi_14), "RSI should not be NaN with valid data"
++    assert not math.isnan(fs.india_vix)
++    assert fs.india_vix == 14.0
++
++
++def test_classify_regime_bullish():
++    fs = FeatureSet(
++        rsi_14=65.0, atr_14_pct=1.0, vwap_deviation_pct=0.3,
++        volume_ratio=1.5, india_vix=13.0,
++        oi_pcr=0.85, bb_position=0.75, macd_signal_gap=0.8,
++    )
++    assert classify_regime(fs) == "trending_bullish"
++
++
++def test_classify_regime_bearish():
++    fs = FeatureSet(
++        rsi_14=35.0, atr_14_pct=1.0, vwap_deviation_pct=-0.3,
++        volume_ratio=1.5, india_vix=16.0,
++        oi_pcr=1.4, bb_position=0.2, macd_signal_gap=-0.8,
++    )
++    assert classify_regime(fs) == "trending_bearish"
++
++
++def test_classify_regime_high_vol_from_vix():
++    fs = FeatureSet(
++        rsi_14=50.0, atr_14_pct=2.5, vwap_deviation_pct=0.0,
++        volume_ratio=2.0, india_vix=25.0,
++        oi_pcr=1.1, bb_position=0.5, macd_signal_gap=0.1,
++    )
++    assert classify_regime(fs) == "high_vol"
+diff --git a/tests/test_integration_nautilus.py b/tests/test_integration_nautilus.py
+new file mode 100644
+index 0000000..b086c59
+--- /dev/null
++++ b/tests/test_integration_nautilus.py
+@@ -0,0 +1,44 @@
++"""Integration tests for NautilusTrader backtesting adapter."""
++from __future__ import annotations
++
++import pandas as pd
++import pytest
++
++
++@pytest.mark.integration
++def test_run_signal_backtest():
++    from src.integrations.nautilus.backtester import run_signal_backtest
++
++    signal_history = [
++        {
++            "date": "2026-01-02",
++            "ticker": "RELIANCE",
++            "direction": "BUY",
++            "entry": 2800.0,
++            "target": 2900.0,
++            "stop": 2750.0,
++        }
++    ]
++    ohlcv = pd.DataFrame(
++        {
++            "date": pd.date_range("2026-01-02", periods=20, freq="B"),
++            "open": [2800 + i * 5 for i in range(20)],
++            "high": [2820 + i * 5 for i in range(20)],
++            "low": [2790 + i * 5 for i in range(20)],
++            "close": [2810 + i * 5 for i in range(20)],
++            "volume": [1_000_000] * 20,
++        }
++    )
++    result = run_signal_backtest(signal_history, ohlcv, "RELIANCE")
++    assert result["ticker"] == "RELIANCE"
++    assert "total_return_pct" in result
++    assert "sharpe_ratio" in result
++    assert "win_rate" in result
++
++
++async def test_nautilus_health():
++    from src.integrations.nautilus.backtester import health
++
++    result = await health()
++    assert result["status"] in ("ok", "down")
++    assert "backend" in result
+diff --git a/tests/test_integration_openalgo.py b/tests/test_integration_openalgo.py
+new file mode 100644
+index 0000000..9e3030f
+--- /dev/null
++++ b/tests/test_integration_openalgo.py
+@@ -0,0 +1,36 @@
++"""Integration tests for OpenAlgo adapter."""
++from __future__ import annotations
++
++import pytest
++
++
++@pytest.mark.integration
++async def test_openalgo_health():
++    from src.integrations.openalgo.client import health
++
++    result = await health()
++    assert result["status"] in ("ok", "degraded", "down")
++
++
++@pytest.mark.integration
++async def test_get_ltp():
++    from src.integrations.openalgo.client import get_ltp
++
++    price = get_ltp("RELIANCE", "NSE")
++    assert isinstance(price, float)
++    assert price > 0
++
++
++def test_openalgo_client_missing_key(monkeypatch):
++    """Client should raise when OPENALGO_API_KEY is empty and package is absent."""
++    import src.integrations.openalgo.client as mod
++
++    original = mod.OpenAlgoAPI
++    mod.OpenAlgoAPI = None  # simulate missing package
++    mod._client = None
++    try:
++        with pytest.raises(RuntimeError, match="openalgo package is not installed"):
++            mod._get_client()
++    finally:
++        mod.OpenAlgoAPI = original
++        mod._client = None
+diff --git a/tests/test_integration_tradingagents.py b/tests/test_integration_tradingagents.py
+new file mode 100644
+index 0000000..9a8c157
+--- /dev/null
++++ b/tests/test_integration_tradingagents.py
+@@ -0,0 +1,44 @@
++"""Integration tests for TradingAgents debate adapter."""
++from __future__ import annotations
++
++import pytest
++
++
++@pytest.mark.integration
++def test_debate_returns_structure():
++    from src.integrations.tradingagents.debate import debate_signal
++
++    result = debate_signal("RELIANCE", "2026-05-01")
++    assert "decision" in result
++    assert result["decision"] in ("Buy", "Overweight", "Hold", "Underweight", "Sell")
++    assert 0.0 <= result["confidence"] <= 1.0
++    assert isinstance(result["bull_thesis"], str)
++    assert isinstance(result["bear_thesis"], str)
++    assert isinstance(result["risk_assessment"], str)
++    assert "agent_verdicts" in result
++
++
++@pytest.mark.integration
++def test_debate_with_nifty50_stock():
++    from src.integrations.tradingagents.debate import debate_signal
++
++    result = debate_signal("INFY", "2026-05-01")
++    assert result["ticker"] == "INFY"
++    assert result["date"] == "2026-05-01"
++
++
++async def test_debate_health():
++    from src.integrations.tradingagents.debate import health
++
++    result = await health()
++    assert result["status"] in ("ok", "down")
++    assert "backend" in result
++
++
++def test_parse_confidence_mapping():
++    from src.integrations.tradingagents.debate import _parse_confidence
++
++    assert _parse_confidence({"final_trade_decision": "Buy"}) == 0.85
++    assert _parse_confidence({"final_trade_decision": "Sell"}) == 0.15
++    assert _parse_confidence({"final_trade_decision": "Hold"}) == 0.50
++    assert _parse_confidence({}) == 0.50
+diff --git a/tests/test_iron_fly.py b/tests/test_iron_fly.py
+new file mode 100644
+index 0000000..d75fc27
+--- /dev/null
++++ b/tests/test_iron_fly.py
+@@ -0,0 +1,81 @@
++"""Unit tests for IronFly strategy — MTM exit logic."""
++from __future__ import annotations
++
++from unittest.mock import patch
++
++import pytest
++
++from src.laabh.strategies.iron_fly import IronFly, IronFlyConfig
++
++
++@pytest.fixture
++def cfg() -> IronFlyConfig:
++    return IronFlyConfig(
++        underlying="NIFTY",
++        expiry="26JUN25",
++        atm_strike=24000,
++        lot_size=50,
++        target_pct=0.40,
++        stop_pct=1.00,
++    )
++
++
++def test_check_mtm_no_exit_within_range(cfg):
++    fly = IronFly(cfg)
++    fly.entry_premium = 200.0
++    # P&L well within target and stop
++    assert fly.check_mtm_exit(1000.0) is None
++
++
++def test_check_mtm_target_hit(cfg):
++    fly = IronFly(cfg)
++    fly.entry_premium = 200.0
++    # max_profit = 200 * 50 = 10_000; target = 10_000 * 0.40 = 4_000
++    assert fly.check_mtm_exit(4000.0) == "TARGET"
++    assert fly.check_mtm_exit(5000.0) == "TARGET"
++
++
++def test_check_mtm_stop_hit(cfg):
++    fly = IronFly(cfg)
++    fly.entry_premium = 200.0
++    # stop = -10_000 * 1.00 = -10_000
++    assert fly.check_mtm_exit(-10000.0) == "STOP"
++    assert fly.check_mtm_exit(-15000.0) == "STOP"
++
++
++def test_check_mtm_boundary_not_triggered(cfg):
++    fly = IronFly(cfg)
++    fly.entry_premium = 200.0
++    # Exactly at target boundary — should trigger
++    assert fly.check_mtm_exit(4000.0) == "TARGET"
++    # Just below stop — should not trigger
++    assert fly.check_mtm_exit(-9999.0) is None
++
++
++def test_enter_calls_place_paper_order(cfg):
++    with patch("src.laabh.strategies.iron_fly.place_paper_order") as mock_order:
++        mock_order.return_value = {"status": "ok"}
++        fly = IronFly(cfg)
++        result = fly.enter()
++
++    assert result["status"] == "entered"
++    assert len(result["legs"]) == 4
++    assert mock_order.call_count == 4
++
++
++def test_enter_places_correct_legs(cfg):
++    """Verify the 4 legs use correct strikes and actions."""
++    calls = []
++    with patch("src.laabh.strategies.iron_fly.place_paper_order") as mock_order:
++        mock_order.side_effect = lambda **kw: calls.append(kw) or {"status": "ok"}
++        IronFly(cfg).enter()
++
++    symbols = [c["symbol"] for c in calls]
++    actions = [c["action"] for c in calls]
++
++    assert "NIFTY26JUN2524000CE" in symbols
++    assert "NIFTY26JUN2524000PE" in symbols
++    assert "NIFTY26JUN2524100CE" in symbols  # ATM + 100 wing
++    assert "NIFTY26JUN2523900PE" in symbols  # ATM - 100 wing
++    assert actions.count("SELL") == 2
++    assert actions.count("BUY") == 2
+diff --git a/tests/test_regime_gate.py b/tests/test_regime_gate.py
+new file mode 100644
+index 0000000..430d712
+--- /dev/null
++++ b/tests/test_regime_gate.py
+@@ -0,0 +1,84 @@
++"""Unit tests for regime gate."""
++from __future__ import annotations
++
++import asyncio
++
++import numpy as np
++import pandas as pd
++import pytest
++
++from src.laabh.regime_gate import ALLOWED_REGIMES, BLOCKED_REGIMES, is_regime_tradeable
++
++
++def _make_ohlcv(n: int = 50, trend: float = 0.0) -> pd.DataFrame:
++    closes = [1000.0 + i * trend + np.random.uniform(-3, 3) for i in range(n)]
++    return pd.DataFrame(
++        {
++            "open": [c - 1 for c in closes],
++            "high": [c + 4 for c in closes],
++            "low": [c - 4 for c in closes],
++            "close": closes,
++            "volume": [600_000] * n,
++        }
++    )
++
++
++async def test_high_vix_is_blocked():
++    ohlcv = _make_ohlcv(50, trend=1.0)
++    tradeable, regime = await is_regime_tradeable(ohlcv, vix=25.0, pcr=1.1)
++    assert regime == "high_vol"
++    assert tradeable is False
++    assert regime in BLOCKED_REGIMES
++
++
++async def test_normal_vix_is_tradeable():
++    ohlcv = _make_ohlcv(50, trend=0.0)
++    tradeable, regime = await is_regime_tradeable(ohlcv, vix=14.0, pcr=1.0)
++    assert tradeable is True
++    assert regime in ALLOWED_REGIMES
++
++
++def test_blocked_and_allowed_sets_are_disjoint():
++    assert ALLOWED_REGIMES.isdisjoint(BLOCKED_REGIMES)
++
++
++def test_all_regimes_classified():
++    """Every possible Regime is in either ALLOWED or BLOCKED."""
++    all_regimes = {"trending_bullish", "trending_bearish", "sideways", "high_vol"}
++    assert all_regimes == ALLOWED_REGIMES | BLOCKED_REGIMES
++
++
++# ── Fail-safe tests ───────────────────────────────────────────────────────────
++
++def test_empty_dataframe_blocks_trading():
++    """Empty DataFrame must block trading — never raise."""
++    result = asyncio.get_event_loop().run_until_complete(
++        is_regime_tradeable(pd.DataFrame(), float("nan"), 1.0)
++    )
++    assert result == (False, "high_vol"), f"Expected fail-safe, got {result}"
++
++
++def test_nan_vix_blocks_trading():
++    """NaN VIX must block trading even with otherwise valid data."""
++    df = pd.DataFrame(
++        {c: [float(100 + i) for i in range(35)] for c in ["open", "high", "low", "close"]}
++        | {"volume": [1_000_000.0] * 35}
++    )
++    result = asyncio.get_event_loop().run_until_complete(
++        is_regime_tradeable(df, float("nan"), 1.0)
++    )
++    assert result[0] is False, f"NaN VIX should block trade, got {result}"
++    assert result[1] == "high_vol"
++
++
++def test_high_vix_blocks_trading():
++    """VIX > 20 must block trading."""
++    df = pd.DataFrame(
++        {c: [float(100 + i) for i in range(35)] for c in ["open", "high", "low", "close"]}
++        | {"volume": [1_000_000.0] * 35}
++    )
++    result = asyncio.get_event_loop().run_until_complete(
++        is_regime_tradeable(df, 25.0, 1.0)
++    )
++    assert result[0] is False
++    assert result[1] == "high_vol"
+diff --git a/tests/test_short_straddle.py b/tests/test_short_straddle.py
+new file mode 100644
+index 0000000..66155e4
+--- /dev/null
++++ b/tests/test_short_straddle.py
+@@ -0,0 +1,83 @@
++"""Unit tests for ShortStraddle strategy — trailing stop logic."""
++from __future__ import annotations
++
++from unittest.mock import patch
++
++import pytest
++
++from src.laabh.strategies.short_straddle import ShortStraddle, ShortStraddleConfig
++
++
++@pytest.fixture
++def cfg() -> ShortStraddleConfig:
++    return ShortStraddleConfig(
++        underlying="BANKNIFTY",
++        expiry="27JUN25",
++        atm_strike=50000,
++        lot_size=15,
++        trailing_stop_pct=0.25,
++        daily_target_pct=0.30,
++        discipline_mode=True,
++    )
++
++
++def test_no_trailing_stop_before_peak(cfg):
++    straddle = ShortStraddle(cfg)
++    # peak_pnl starts at 0 — no stop should fire on positive P&L
++    assert straddle.update_trailing_stop(500.0) is None
++    assert straddle.peak_pnl == 500.0
++
++
++def test_trailing_stop_triggered_after_pullback(cfg):
++    straddle = ShortStraddle(cfg)
++    straddle.update_trailing_stop(1000.0)   # peak set to 1000
++    # trailing stop level = 1000 * (1 - 0.25) = 750
++    assert straddle.update_trailing_stop(700.0) == "TRAILING_STOP"
++    assert straddle.stop_triggered is True
++
++
++def test_trailing_stop_not_triggered_within_band(cfg):
++    straddle = ShortStraddle(cfg)
++    straddle.update_trailing_stop(1000.0)
++    # 800 > 750 — should not trigger
++    assert straddle.update_trailing_stop(800.0) is None
++    assert straddle.stop_triggered is False
++
++
++def test_discipline_mode_sets_flag(cfg):
++    straddle = ShortStraddle(cfg)
++    straddle.update_trailing_stop(500.0)
++    straddle.update_trailing_stop(100.0)  # below 500*0.75=375
++    assert straddle.stop_triggered is True
++
++
++def test_discipline_mode_off_does_not_set_flag():
++    cfg = ShortStraddleConfig(
++        underlying="NIFTY", expiry="27JUN25", atm_strike=24000,
++        lot_size=50, discipline_mode=False
++    )
++    straddle = ShortStraddle(cfg)
++    straddle.update_trailing_stop(1000.0)
++    straddle.update_trailing_stop(100.0)
++    assert straddle.stop_triggered is False
++
++
++def test_enter_places_two_legs(cfg):
++    with patch("src.laabh.strategies.short_straddle.place_paper_order") as mock_order:
++        mock_order.return_value = {"status": "ok"}
++        result = ShortStraddle(cfg).enter()
++
++    assert result["status"] == "entered"
++    assert len(result["legs"]) == 2
++    assert mock_order.call_count == 2
++
++
++def test_enter_leg_symbols(cfg):
++    calls = []
++    with patch("src.laabh.strategies.short_straddle.place_paper_order") as mock_order:
++        mock_order.side_effect = lambda **kw: calls.append(kw) or {"status": "ok"}
++        ShortStraddle(cfg).enter()
++
++    symbols = {c["symbol"] for c in calls}
++    assert "BANKNIFTY27JUN2550000CE" in symbols
++    assert "BANKNIFTY27JUN2550000PE" in symbols
