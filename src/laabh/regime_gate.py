@@ -3,6 +3,8 @@ Replace hardcoded VIX threshold with feature-based regime classifier.
 """
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 from src.integrations.freqai_inspired.feature_pipeline import (
@@ -10,6 +12,8 @@ from src.integrations.freqai_inspired.feature_pipeline import (
     classify_regime,
     extract_features,
 )
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_REGIMES: frozenset[Regime] = frozenset(
     {"trending_bullish", "trending_bearish", "sideways"}
@@ -24,16 +28,33 @@ async def is_regime_tradeable(
 ) -> tuple[bool, Regime]:
     """
     Returns (tradeable: bool, regime: Regime).
-    Replaces the old `if vix > 20: block_all` hardcoded gate.
+
+    Fail-safe: any exception in feature extraction → (False, "high_vol").
+    This ensures a data pipeline failure blocks trading rather than permitting it.
 
     Args:
-        ohlcv: DataFrame with columns: open, high, low, close, volume
-        vix: India VIX value
-        pcr: Nifty Put-Call Ratio
-
-    Returns:
-        Tuple of (is_tradeable, detected_regime).
+        ohlcv: Daily OHLCV DataFrame (need ≥26 rows).
+        vix:   India VIX. Pass float('nan') if unavailable — will block trading.
+        pcr:   Nifty Put-Call Ratio.
     """
-    features = extract_features(ohlcv, vix, pcr)
-    regime = classify_regime(features)
-    return regime not in BLOCKED_REGIMES, regime
+    try:
+        features = extract_features(ohlcv, vix, pcr)
+        regime = classify_regime(features)
+        tradeable = regime not in BLOCKED_REGIMES
+        logger.debug(f"is_regime_tradeable: regime={regime}, tradeable={tradeable}")
+        return tradeable, regime
+    except ValueError as exc:
+        # Bad data (missing columns, too few rows, NaN values)
+        logger.warning(
+            f"is_regime_tradeable: feature extraction failed ({exc}) "
+            "— blocking trade (fail-safe high_vol)"
+        )
+        return False, "high_vol"
+    except Exception as exc:
+        # Unexpected failure — never let it propagate into strategy logic
+        logger.error(
+            f"is_regime_tradeable: unexpected error ({exc}) "
+            "— blocking trade (fail-safe high_vol)",
+            exc_info=True,
+        )
+        return False, "high_vol"
