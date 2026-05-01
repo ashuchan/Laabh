@@ -25,10 +25,12 @@ except ImportError:  # pragma: no cover
 
 
 if _NAUTILUS_AVAILABLE:
-    from nautilus_trader.trading.actor import Actor  # type: ignore[import-not-found]
+    from nautilus_trader.common.actor import Actor  # type: ignore[import-not-found]
+    from nautilus_trader.trading.strategy import Strategy  # type: ignore[import-not-found]
+    from nautilus_trader.config import StrategyConfig  # type: ignore[import-not-found]
     from nautilus_trader.model.enums import OrderSide  # type: ignore[import-not-found]
 
-    class _SignalReplayActor(Actor):
+    class _SignalReplayActor(Strategy):
         """
         Replays a list of signals as market orders.
         Each signal {date, direction} becomes a BUY or SELL market order
@@ -36,7 +38,7 @@ if _NAUTILUS_AVAILABLE:
         """
 
         def __init__(self, signal_history: list[dict], instrument_id) -> None:
-            super().__init__()
+            super().__init__(config=StrategyConfig())
             self._signals = signal_history
             self._instrument_id = instrument_id
 
@@ -181,7 +183,7 @@ def _run_backtest_impl(
     # Add signal replay actor so the engine actually trades
     # Without this, the engine runs empty and all stats are zero.
     actor = _SignalReplayActor(signal_history, instrument.id)
-    engine.add_actor(actor)
+    engine.add_strategy(actor)
 
     engine.run()
     stats = engine.get_stats_pnls_formatted()
