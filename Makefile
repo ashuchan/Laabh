@@ -26,8 +26,8 @@ test-integration-nautilus:
 	pytest tests/test_integration_nautilus.py -m integration -v --tb=short
 
 test-integration-all:
-	pytest tests/ -m integration -v --tb=short
 	pytest tests/ -m "not integration" -v --tb=short
+	pytest tests/ -m integration -v --tb=short
 
 # ── convenience targets ──────────────────────────────────────────────────────
 
