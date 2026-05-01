@@ -21,3 +21,4 @@ class FNOCooldown(Base):
     )
     cooldown_until: Mapped[datetime] = mapped_column(primary_key=True)
     reason: Mapped[str | None] = mapped_column(String(50))
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, default=None)

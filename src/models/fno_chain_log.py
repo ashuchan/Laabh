@@ -33,3 +33,4 @@ class ChainCollectionLog(Base):
     nse_error: Mapped[str | None] = mapped_column(Text)
     dhan_error: Mapped[str | None] = mapped_column(Text)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, default=None)

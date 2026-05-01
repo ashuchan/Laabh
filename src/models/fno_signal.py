@@ -50,6 +50,7 @@ class FNOSignal(Base):
     closed_at: Mapped[datetime | None] = mapped_column()
     final_pnl: Mapped[float | None] = mapped_column(Numeric(12, 2))
     notes: Mapped[str | None] = mapped_column(Text)
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, default=None)
 
 
 class FNOSignalEvent(Base):
@@ -67,3 +68,4 @@ class FNOSignalEvent(Base):
     to_status: Mapped[str] = mapped_column(String(15), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, default=None)

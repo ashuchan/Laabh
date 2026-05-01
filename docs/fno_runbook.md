@@ -346,3 +346,30 @@ All four jobs respect the NSE-holiday guard from `system_config`.
 **Rollback**: `alembic downgrade -1` drops the four new tables and removes
 `options_chain.source`. Existing chain data is unaffected (the `source` column
 defaults to `'nse'` and is dropped on downgrade).
+
+---
+
+## Dry-run isolation
+
+Migration `0006_add_dryrun_run_id` adds a nullable `dryrun_run_id UUID` column
+to every table the F&O pipeline writes to: `fno_candidates`, `fno_signals`,
+`fno_signal_events`, `fno_cooldowns`, `iv_history`, `vix_ticks`,
+`notifications`, `llm_audit_log`, `chain_collection_log`, `options_chain`, and
+`job_log`.
+
+**Live writes** leave the column `NULL` — no application code needs to change
+for the live path.
+
+**Replay writes** stamp every inserted row with a UUID that is unique to the
+replay invocation (`dryrun_run_id`).  This lets multiple replays of the same
+trading date coexist in the same database alongside live data and alongside each
+other.  The report builder and any ad-hoc queries filter by this UUID to isolate
+a single replay's view.
+
+A **partial index** `WHERE dryrun_run_id IS NOT NULL` is created on each table,
+so the live-path query planner never sees the index and existing query
+performance is unchanged.
+
+**Rollback**: `alembic downgrade -1` drops all 11 partial indexes and then
+drops the 11 columns.  The live path is unaffected at every point during the
+rollback.
