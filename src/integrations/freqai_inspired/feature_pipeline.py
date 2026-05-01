@@ -8,11 +8,18 @@ Pattern: extract structured features from market data →
 """
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+MIN_ROWS = 26  # MACD(12,26) needs 26 bars; signal(9) needs 9 more — use 26 minimum
+REQUIRED_COLS = frozenset({"open", "high", "low", "close", "volume"})
 
 Regime = Literal["trending_bullish", "trending_bearish", "sideways", "high_vol"]
 
@@ -36,13 +43,37 @@ def extract_features(ohlcv: pd.DataFrame, vix: float, pcr: float) -> FeatureSet:
     Compute feature vector from OHLCV + market-level data.
 
     Args:
-        ohlcv: DataFrame with columns: open, high, low, close, volume
-        vix: India VIX value
-        pcr: Nifty Put-Call Ratio
+        ohlcv: DataFrame with columns: open, high, low, close, volume.
+               Must have at least MIN_ROWS rows of clean data.
+        vix: India VIX value. Pass math.nan if unavailable — triggers high_vol.
+        pcr: Nifty Put-Call Ratio.
 
     Returns:
         FeatureSet with all computed indicators.
+
+    Raises:
+        ValueError: If ohlcv has insufficient rows or missing required columns.
     """
+    # ── Input validation ──────────────────────────────────────────────────────
+    missing_cols = REQUIRED_COLS - set(ohlcv.columns)
+    if missing_cols:
+        raise ValueError(
+            f"extract_features: OHLCV DataFrame missing required columns: {missing_cols}. "
+            f"Got: {list(ohlcv.columns)}"
+        )
+    if len(ohlcv) < MIN_ROWS:
+        raise ValueError(
+            f"extract_features: requires at least {MIN_ROWS} rows, got {len(ohlcv)}. "
+            "Provide more historical data before calling."
+        )
+    null_counts = ohlcv[list(REQUIRED_COLS)].isnull().sum()
+    if null_counts.any():
+        raise ValueError(
+            f"extract_features: OHLCV contains NaN values: "
+            f"{null_counts[null_counts > 0].to_dict()}. "
+            "Clean data before calling."
+        )
+    # ── Feature extraction ────────────────────────────────────────────────────
     close = ohlcv["close"]
     high = ohlcv["high"]
     low = ohlcv["low"]
@@ -67,9 +98,15 @@ def extract_features(ohlcv: pd.DataFrame, vix: float, pcr: float) -> FeatureSet:
     atr = tr.rolling(14).mean()
     atr_pct = (atr.iloc[-1] / close.iloc[-1]) * 100
 
-    # VWAP deviation
+    # Rolling 20-day VWAP deviation
+    # Using rolling window, not session cumsum, because ohlcv is daily data.
+    # Session cumsum on 90 days computes a 90-day cost-basis average (misleading).
     typical = (high + low + close) / 3
-    vwap = (typical * volume).cumsum() / volume.cumsum()
+    _rolling_window = 20
+    vwap = (
+        (typical * volume).rolling(_rolling_window).sum()
+        / volume.rolling(_rolling_window).sum().replace(0, np.nan)
+    )
     vwap_dev = ((close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1]) * 100
 
     # Volume ratio
@@ -104,13 +141,26 @@ def extract_features(ohlcv: pd.DataFrame, vix: float, pcr: float) -> FeatureSet:
 def classify_regime(features: FeatureSet) -> Regime:
     """
     Rule-based regime classifier.
+
+    Fail-safe: any NaN feature field returns "high_vol" (blocks trading).
     Phase 1: rules. Phase 2: replace with XGBoost trained on historical regimes.
     """
-    vix = features.india_vix
-    rsi = features.rsi_14
-    pcr = features.oi_pcr
+    vix  = features.india_vix
+    rsi  = features.rsi_14
+    pcr  = features.oi_pcr
     macd = features.macd_signal_gap
 
+    # ── Fail-safe: NaN on any key field → block trading ───────────────────────
+    # NaN comparisons in Python always return False, which would silently
+    # fall through to "sideways" (allowed). We must check explicitly.
+    if math.isnan(vix) or math.isnan(rsi) or math.isnan(macd):
+        logger.warning(
+            "classify_regime: NaN feature detected "
+            f"(vix={vix}, rsi={rsi}, macd={macd}) — returning high_vol (fail-safe)"
+        )
+        return "high_vol"
+
+    # ── Normal classification ─────────────────────────────────────────────────
     if vix > 20:
         return "high_vol"
 
