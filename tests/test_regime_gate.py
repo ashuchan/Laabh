@@ -1,6 +1,8 @@
 """Unit tests for regime gate."""
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -44,3 +46,39 @@ def test_all_regimes_classified():
     """Every possible Regime is in either ALLOWED or BLOCKED."""
     all_regimes = {"trending_bullish", "trending_bearish", "sideways", "high_vol"}
     assert all_regimes == ALLOWED_REGIMES | BLOCKED_REGIMES
+
+
+# ── Fail-safe tests ───────────────────────────────────────────────────────────
+
+def test_empty_dataframe_blocks_trading():
+    """Empty DataFrame must block trading — never raise."""
+    result = asyncio.get_event_loop().run_until_complete(
+        is_regime_tradeable(pd.DataFrame(), float("nan"), 1.0)
+    )
+    assert result == (False, "high_vol"), f"Expected fail-safe, got {result}"
+
+
+def test_nan_vix_blocks_trading():
+    """NaN VIX must block trading even with otherwise valid data."""
+    df = pd.DataFrame(
+        {c: [float(100 + i) for i in range(35)] for c in ["open", "high", "low", "close"]}
+        | {"volume": [1_000_000.0] * 35}
+    )
+    result = asyncio.get_event_loop().run_until_complete(
+        is_regime_tradeable(df, float("nan"), 1.0)
+    )
+    assert result[0] is False, f"NaN VIX should block trade, got {result}"
+    assert result[1] == "high_vol"
+
+
+def test_high_vix_blocks_trading():
+    """VIX > 20 must block trading."""
+    df = pd.DataFrame(
+        {c: [float(100 + i) for i in range(35)] for c in ["open", "high", "low", "close"]}
+        | {"volume": [1_000_000.0] * 35}
+    )
+    result = asyncio.get_event_loop().run_until_complete(
+        is_regime_tradeable(df, 25.0, 1.0)
+    )
+    assert result[0] is False
+    assert result[1] == "high_vol"
