@@ -79,15 +79,15 @@ services:
     container_name: paperbull-openalgo
     restart: unless-stopped
     ports:
-      - "5000:5000"                           # REST API
-      - "8765:8765"                           # WebSocket proxy (ZMQ pub)
+      - "127.0.0.1:5000:5000"                 # REST API
+      - "127.0.0.1:8765:8765"                 # WebSocket proxy (ZMQ pub)
     env_file: ../.env
     environment:
       BROKER_API_KEY: ${ANGELONE_API_KEY}
       BROKER_API_SECRET: ${ANGELONE_API_SECRET}
       BROKER_TOTP_SECRET: ${ANGELONE_TOTP_SECRET}
       REDIRECT_URL: http://127.0.0.1:5000/angel/callback
-      DATABASE_URL: sqlite:///openalgo.db
+      DATABASE_URL: sqlite:////app/db/openalgo.db
       FLASK_ENV: production
     volumes:
       - openalgo_data:/app/db
@@ -96,6 +96,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 60s
     networks:
       - paperbull-net
 
