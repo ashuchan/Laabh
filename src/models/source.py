@@ -62,7 +62,7 @@ class JobLog(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, default=None)
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
 
 
 class SystemConfig(Base):

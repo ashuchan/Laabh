@@ -52,4 +52,4 @@ class FNOCandidate(Base):
     config_version: Mapped[str | None] = mapped_column(String(20))
 
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, default=None)
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

@@ -35,3 +35,4 @@ class ChainCollectionIssue(Base):
     github_issue_url: Mapped[str | None] = mapped_column(Text)
     resolved_at: Mapped[datetime | None] = mapped_column()
     resolved_by: Mapped[str | None] = mapped_column(String(50))
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

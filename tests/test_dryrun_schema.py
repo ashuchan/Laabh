@@ -1,11 +1,11 @@
 """Tests for Task 1 — dryrun_run_id schema migration.
 
 Verifies:
-  - The dryrun_run_id column is declared as nullable on all 11 model classes.
+  - The dryrun_run_id column is declared as nullable on all 15 model classes.
   - The column carries the correct PostgreSQL UUID type.
   - Existing model instantiation (without dryrun_run_id) still works (backward compat).
-  - The migration upgrade SQL adds a partial index on every affected table.
-  - The migration downgrade SQL drops both the index and the column.
+  - source_health deliberately does NOT have the column.
+  - The migration module loads and exposes the expected revision metadata.
 """
 from __future__ import annotations
 
@@ -31,20 +31,30 @@ from src.models.llm_audit_log import LLMAuditLog
 from src.models.fno_chain import OptionsChain
 from src.models.fno_chain_log import ChainCollectionLog
 from src.models.source import JobLog
+from src.models.fno_ban import FNOBanList
+from src.models.fno_chain_issue import ChainCollectionIssue
+from src.models.content import RawContent
+from src.models.fno_collection_tier import FNOCollectionTier
+from src.models.fno_source_health import SourceHealth
 
 
 _MODEL_CLASSES = [
-    ("fno_candidates",        FNOCandidate),
-    ("fno_signals",           FNOSignal),
-    ("fno_signal_events",     FNOSignalEvent),
-    ("fno_cooldowns",         FNOCooldown),
-    ("iv_history",            IVHistory),
-    ("vix_ticks",             VIXTick),
-    ("notifications",         Notification),
-    ("llm_audit_log",         LLMAuditLog),
-    ("options_chain",         OptionsChain),
-    ("chain_collection_log",  ChainCollectionLog),
-    ("job_log",               JobLog),
+    ("fno_candidates",          FNOCandidate),
+    ("fno_signals",             FNOSignal),
+    ("fno_signal_events",       FNOSignalEvent),
+    ("fno_cooldowns",           FNOCooldown),
+    ("iv_history",              IVHistory),
+    ("vix_ticks",               VIXTick),
+    ("notifications",           Notification),
+    ("llm_audit_log",           LLMAuditLog),
+    ("options_chain",           OptionsChain),
+    ("chain_collection_log",    ChainCollectionLog),
+    ("job_log",                 JobLog),
+    # Task 1B additions:
+    ("fno_ban_list",            FNOBanList),
+    ("chain_collection_issues", ChainCollectionIssue),
+    ("raw_content",             RawContent),
+    ("fno_collection_tiers",    FNOCollectionTier),
 ]
 
 
@@ -56,7 +66,7 @@ _MODEL_CLASSES = [
 def test_dryrun_run_id_column_exists(table_name: str, model_cls):
     """dryrun_run_id must be declared as a mapped column on the model."""
     mapper = sa_inspect(model_cls)
-    col_names = {c.key for c in mapper.mapper.column_attrs}
+    col_names = {c.key for c in mapper.column_attrs}
     assert "dryrun_run_id" in col_names, (
         f"{model_cls.__name__} (table={table_name}) is missing dryrun_run_id"
     )
@@ -66,7 +76,7 @@ def test_dryrun_run_id_column_exists(table_name: str, model_cls):
 def test_dryrun_run_id_is_nullable(table_name: str, model_cls):
     """dryrun_run_id must be nullable so live inserts need not supply it."""
     mapper = sa_inspect(model_cls)
-    col = mapper.mapper.columns["dryrun_run_id"]
+    col = mapper.columns["dryrun_run_id"]
     assert col.nullable, (
         f"{model_cls.__name__}.dryrun_run_id must be nullable"
     )
@@ -76,9 +86,27 @@ def test_dryrun_run_id_is_nullable(table_name: str, model_cls):
 def test_dryrun_run_id_is_uuid_type(table_name: str, model_cls):
     """dryrun_run_id must use the PostgreSQL UUID dialect type."""
     mapper = sa_inspect(model_cls)
-    col = mapper.mapper.columns["dryrun_run_id"]
+    col = mapper.columns["dryrun_run_id"]
     assert isinstance(col.type, PG_UUID), (
         f"{model_cls.__name__}.dryrun_run_id should be PG_UUID, got {type(col.type)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# source_health must NOT have the column (intentionally excluded)
+# ---------------------------------------------------------------------------
+
+def test_source_health_does_not_have_dryrun_run_id():
+    """source_health is suppressed via SideEffectGateway in Task 3, not tagged.
+
+    Replay must not touch this table at all — adding dryrun_run_id would
+    imply writes are acceptable, which they are not.
+    """
+    mapper = sa_inspect(SourceHealth)
+    col_names = {c.key for c in mapper.column_attrs}
+    assert "dryrun_run_id" not in col_names, (
+        "SourceHealth must not have dryrun_run_id — "
+        "replay suppresses writes to source_health via SideEffectGateway (Task 3)"
     )
 
 
@@ -88,9 +116,8 @@ def test_dryrun_run_id_is_uuid_type(table_name: str, model_cls):
 
 def test_fno_candidate_no_dryrun_run_id():
     """FNOCandidate can be created without passing dryrun_run_id."""
-    inst_id = uuid.uuid4()
     from datetime import date
-    obj = FNOCandidate(instrument_id=inst_id, run_date=date(2026, 4, 23), phase=1)
+    obj = FNOCandidate(instrument_id=uuid.uuid4(), run_date=date(2026, 4, 23), phase=1)
     assert obj.dryrun_run_id is None
 
 
@@ -123,6 +150,19 @@ def test_vix_tick_no_dryrun_run_id():
     assert obj.dryrun_run_id is None
 
 
+def test_fno_ban_list_no_dryrun_run_id():
+    """FNOBanList can be created without passing dryrun_run_id."""
+    from datetime import date
+    obj = FNOBanList(instrument_id=uuid.uuid4(), symbol="NIFTY", ban_date=date(2026, 4, 23))
+    assert obj.dryrun_run_id is None
+
+
+def test_raw_content_no_dryrun_run_id():
+    """RawContent can be created without passing dryrun_run_id."""
+    obj = RawContent(source_id=uuid.uuid4(), content_hash="abc123")
+    assert obj.dryrun_run_id is None
+
+
 # ---------------------------------------------------------------------------
 # dryrun_run_id can be set to a UUID value
 # ---------------------------------------------------------------------------
@@ -141,24 +181,10 @@ def test_dryrun_run_id_can_hold_uuid():
 
 
 # ---------------------------------------------------------------------------
-# Migration SQL sanity checks
+# Migration module loads with correct metadata
 # ---------------------------------------------------------------------------
 
 _MIGRATION_MODULE = "database.migrations.versions.0006_add_dryrun_run_id"
-
-_TABLES = [
-    "fno_candidates",
-    "fno_signals",
-    "fno_signal_events",
-    "fno_cooldowns",
-    "iv_history",
-    "vix_ticks",
-    "notifications",
-    "llm_audit_log",
-    "chain_collection_log",
-    "options_chain",
-    "job_log",
-]
 
 
 @pytest.fixture(scope="module")
@@ -166,46 +192,25 @@ def migration():
     return importlib.import_module(_MIGRATION_MODULE)
 
 
-def test_migration_revision(migration):
+def test_migration_module_loads(migration):
+    """Migration module must load and expose correct revision metadata and callables."""
     assert migration.revision == "0006_add_dryrun_run_id"
     assert migration.down_revision == "0005_chain_observability"
+    assert callable(migration.upgrade)
+    assert callable(migration.downgrade)
 
 
-@pytest.mark.parametrize("table", _TABLES)
-def test_upgrade_sql_adds_column(migration, table: str):
-    """Upgrade SQL must contain ADD COLUMN for every target table."""
-    assert f"ALTER TABLE {table} ADD COLUMN" in migration._UPGRADE_SQL, (
-        f"_UPGRADE_SQL missing ADD COLUMN for {table}"
-    )
+def test_migration_tables_list_has_15_entries(migration):
+    """_TABLES must contain exactly 15 entries."""
+    assert len(migration._TABLES) == 15
 
 
-@pytest.mark.parametrize("table", _TABLES)
-def test_upgrade_sql_creates_partial_index(migration, table: str):
-    """Upgrade SQL must create a partial index for every target table."""
-    assert f"idx_{table}_dryrun_run_id" in migration._UPGRADE_SQL, (
-        f"_UPGRADE_SQL missing partial index for {table}"
-    )
-    assert "WHERE dryrun_run_id IS NOT NULL" in migration._UPGRADE_SQL
+def test_migration_tables_includes_task1b_additions(migration):
+    """_TABLES must include the four tables added in Task 1B."""
+    for t in ("fno_ban_list", "chain_collection_issues", "raw_content", "fno_collection_tiers"):
+        assert t in migration._TABLES, f"_TABLES is missing Task 1B table: {t}"
 
 
-@pytest.mark.parametrize("table", _TABLES)
-def test_downgrade_sql_drops_index_and_column(migration, table: str):
-    """Downgrade SQL must drop both the index and the column for every table."""
-    assert f"DROP INDEX IF EXISTS idx_{table}_dryrun_run_id" in migration._DOWNGRADE_SQL, (
-        f"_DOWNGRADE_SQL missing DROP INDEX for {table}"
-    )
-    assert f"ALTER TABLE {table} DROP COLUMN IF EXISTS dryrun_run_id" in migration._DOWNGRADE_SQL, (
-        f"_DOWNGRADE_SQL missing DROP COLUMN for {table}"
-    )
-
-
-def test_upgrade_covers_all_11_tables(migration):
-    """_UPGRADE_SQL must reference exactly the 11 expected tables."""
-    for table in _TABLES:
-        assert table in migration._UPGRADE_SQL
-
-
-def test_downgrade_covers_all_11_tables(migration):
-    """_DOWNGRADE_SQL must reference exactly the 11 expected tables."""
-    for table in _TABLES:
-        assert table in migration._DOWNGRADE_SQL
+def test_migration_excludes_source_health(migration):
+    """source_health must not appear in _TABLES."""
+    assert "source_health" not in migration._TABLES

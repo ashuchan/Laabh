@@ -20,4 +20,4 @@ class VIXTick(Base):
     timestamp: Mapped[datetime] = mapped_column(primary_key=True)
     vix_value: Mapped[float] = mapped_column(Numeric(8, 4), nullable=False)
     regime: Mapped[str] = mapped_column(String(10), nullable=False)
-    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, default=None)
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

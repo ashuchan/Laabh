@@ -352,10 +352,25 @@ defaults to `'nse'` and is dropped on downgrade).
 ## Dry-run isolation
 
 Migration `0006_add_dryrun_run_id` adds a nullable `dryrun_run_id UUID` column
-to every table the F&O pipeline writes to: `fno_candidates`, `fno_signals`,
-`fno_signal_events`, `fno_cooldowns`, `iv_history`, `vix_ticks`,
-`notifications`, `llm_audit_log`, `chain_collection_log`, `options_chain`, and
-`job_log`.
+to every table the F&O pipeline writes to (15 tables total):
+
+| Table | Written by |
+|---|---|
+| `fno_candidates` | Phase 1/2/3 filter runs |
+| `fno_signals` | Ranker / strategy builder |
+| `fno_signal_events` | Signal lifecycle transitions |
+| `fno_cooldowns` | Stop-hit cooldown recorder |
+| `iv_history` | EOD IV recorder |
+| `vix_ticks` | VIX collector |
+| `notifications` | All notification writers |
+| `llm_audit_log` | Every Claude API call |
+| `chain_collection_log` | Chain collector |
+| `options_chain` | Chain snapshot writer |
+| `job_log` | All collector/extractor jobs |
+| `fno_ban_list` | `ban_list.fetch_today()` |
+| `chain_collection_issues` | `chain_collector._record_schema_mismatch()` |
+| `raw_content` | `macro_collector`, `fii_dii_collector` |
+| `fno_collection_tiers` | `tier_manager.refresh()` |
 
 **Live writes** leave the column `NULL` — no application code needs to change
 for the live path.
@@ -370,6 +385,33 @@ A **partial index** `WHERE dryrun_run_id IS NOT NULL` is created on each table,
 so the live-path query planner never sees the index and existing query
 performance is unchanged.
 
-**Rollback**: `alembic downgrade -1` drops all 11 partial indexes and then
-drops the 11 columns.  The live path is unaffected at every point during the
+**Rollback**: `alembic downgrade -1` drops all 15 partial indexes and then
+drops the 15 columns.  The live path is unaffected at every point during the
 rollback.
+
+### Tables intentionally not tagged
+
+`source_health` is **not** included in the migration.  Source health tracks
+live data-source operability (error counts, degradation thresholds) and drives
+operator pages.  A replay must not write to this table at all — the right
+suppression mechanism is the `SideEffectGateway` introduced in Task 3, which
+intercepts `_record_source_success` and `_record_source_error` in replay
+context and routes them to an in-memory capture buffer instead.  Adding
+`dryrun_run_id` to `source_health` would imply writes are acceptable, which
+they are not.
+
+### Migration testing
+
+The upgrade/downgrade path is exercised by integration tests in
+`tests/integration/test_migrations.py`.  To run locally:
+
+```bash
+POSTGRES_TEST_URL=postgresql://laabh:laabh@localhost:5432/laabh_test \
+    pytest tests/integration/ -v
+```
+
+The three tests cover: (1) clean upgrade + downgrade on all 15 tables with
+index predicate verification, (2) idempotency when a column was pre-added
+manually (`ALTER TABLE … ADD COLUMN IF NOT EXISTS` semantics), and (3) chunk
+propagation on TimescaleDB hypertables — skipped automatically when the
+`timescaledb` extension is not installed.

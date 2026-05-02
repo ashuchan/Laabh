@@ -23,4 +23,4 @@ class IVHistory(Base):
     atm_iv: Mapped[float] = mapped_column(Numeric(8, 4), nullable=False)
     iv_rank_52w: Mapped[float | None] = mapped_column(Numeric(6, 2))
     iv_percentile_52w: Mapped[float | None] = mapped_column(Numeric(6, 2))
-    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, default=None)
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
