@@ -28,3 +28,4 @@ class FNOBanList(Base):
     source: Mapped[str] = mapped_column(String(20), server_default="NSE")
     is_active: Mapped[bool] = mapped_column(server_default="true", nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

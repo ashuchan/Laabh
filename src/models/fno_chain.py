@@ -43,3 +43,4 @@ class OptionsChain(Base):
 
     underlying_ltp: Mapped[float | None] = mapped_column(Numeric(12, 2))
     source: Mapped[str | None] = mapped_column(String(20), default="nse")
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

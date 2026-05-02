@@ -24,3 +24,4 @@ class FNOCollectionTier(Base):
     avg_volume_5d: Mapped[int | None] = mapped_column(BigInteger)
     last_promoted_at: Mapped[datetime | None] = mapped_column()
     updated_at: Mapped[datetime | None] = mapped_column()
+    dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
