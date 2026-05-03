@@ -73,7 +73,7 @@ async def _fetch_vix_historical(as_of: datetime) -> float:
             return float(hist["Close"].iloc[0])
         return float(candidates["Close"].iloc[-1])
 
-    return await asyncio.get_event_loop().run_in_executor(None, _sync_fetch)
+    return await asyncio.get_running_loop().run_in_executor(None, _sync_fetch)
 
 
 async def run_once(

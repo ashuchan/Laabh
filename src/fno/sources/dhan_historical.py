@@ -172,23 +172,25 @@ class DhanHistoricalSource(BaseChainSource):
             with cache_file.open() as f:
                 return json.load(f)
 
-        # Dhan intraday endpoint requires date range
-        from_dt = datetime(
+        # Dhan intraday endpoint requires date range in IST (API interprets strings as IST)
+        import pytz as _pytz
+        _ist_tz = _pytz.timezone("Asia/Kolkata")
+        from_ist = _ist_tz.localize(datetime(
             self._replay_date.year, self._replay_date.month, self._replay_date.day,
-            9, 0, 0, tzinfo=timezone.utc
-        )
-        to_dt = datetime(
+            9, 0, 0
+        ))
+        to_ist = _ist_tz.localize(datetime(
             self._replay_date.year, self._replay_date.month, self._replay_date.day,
-            15, 30, 0, tzinfo=timezone.utc
-        )
+            15, 30, 0
+        ))
         payload = {
             "securityId": security_id,
             "exchangeSegment": _SEG_EQUITY,
             "instrument": "OPTIDX",
             "interval": _CANDLE_INTERVAL,
             "oi": True,
-            "fromDate": from_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "toDate": to_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "fromDate": from_ist.strftime("%Y-%m-%d %H:%M:%S"),
+            "toDate": to_ist.strftime("%Y-%m-%d %H:%M:%S"),
         }
         async with self._semaphore:
             async with self._client_instance() as client:

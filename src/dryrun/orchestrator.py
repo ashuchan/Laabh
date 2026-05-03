@@ -232,7 +232,11 @@ async def _run_replay(
     await run_eod_tasks(D)
 
     for eod_phase in ("iv-history", "ban-list"):
-        cr = await make_phase_check(eod_phase, settings, D).run()
+        check = make_phase_check(eod_phase, settings, D)
+        if check is None:
+            logger.debug(f"dryrun: no check registered for {eod_phase} — skipping gate")
+            continue
+        cr = await check.run()
         if cr.severity != Severity.FAIL:
             result.gates_passed.append(f"stage5.{eod_phase}")
 

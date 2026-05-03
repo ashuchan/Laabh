@@ -122,6 +122,7 @@ async def test_nse_schema_error_logs_issue_and_tries_dhan():
         ) as mock_schema_log,
         patch("src.fno.chain_collector._persist_snapshot", new_callable=AsyncMock),
     ):
+        mock_nse.name = "nse"
         mock_nse.fetch = AsyncMock(
             side_effect=SchemaError("missing records key", '{"bad": "data"}')
         )

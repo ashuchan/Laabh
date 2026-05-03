@@ -259,7 +259,10 @@ async def collect_one(
     primary_name = getattr(primary_source, "name", "nse")
     log.primary_source = primary_name
     try:
-        snapshot = await primary_source.fetch(instrument.symbol, expiry)
+        if as_of is not None:
+            snapshot = await primary_source.fetch(instrument.symbol, expiry, as_of=as_of)
+        else:
+            snapshot = await primary_source.fetch(instrument.symbol, expiry)
         await _persist_snapshot(snapshot, instrument, source=primary_name, as_of=as_of, dryrun_run_id=dryrun_run_id)
         log.final_source = primary_name
         log.status = "ok"

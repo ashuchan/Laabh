@@ -176,8 +176,13 @@ async def fetch_yesterday(target_date: date | None = None) -> dict | None:
         return None
 
     summary = _parse_fii_dii(raw_records)
-    now = datetime.now(tz=timezone.utc)
-    date_str = summary.get("date") or (target_date or today).isoformat()
+    effective_date = target_date or today
+    stamp = (
+        datetime(effective_date.year, effective_date.month, effective_date.day, 18, 0, 0, tzinfo=timezone.utc)
+        if is_historical
+        else datetime.now(tz=timezone.utc)
+    )
+    date_str = summary.get("date") or effective_date.isoformat()
     h = hashlib.sha256(f"fii_dii:{date_str}".encode()).hexdigest()
 
     async with session_scope() as session:
@@ -188,7 +193,7 @@ async def fetch_yesterday(target_date: date | None = None) -> dict | None:
             content_text=json.dumps(summary),
             media_type="fii_dii",
             is_processed=True,
-            fetched_at=now,
+            fetched_at=stamp,
         ))
 
     logger.info(
