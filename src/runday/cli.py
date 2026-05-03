@@ -797,9 +797,17 @@ async def _replay_async(
         Path(md_path).write_text(format_markdown_report(data), encoding="utf-8")
         _console.print(f"Report: [bold]{md_path}[/bold]")
 
+    # Determine exit code from gate results regardless of output format
+    if result.gates_failed:
+        exit_code = 20
+    elif result.gates_warned:
+        exit_code = 10
+    else:
+        exit_code = 0
+
     if emit_json:
         print(json_out.emit_report(data))
-        return 0
+        return exit_code
 
     _render_report_console(data)
 
@@ -809,12 +817,10 @@ async def _replay_async(
     _console.print(f"\n[cyan]Captured Telegrams: {telegram_count} (suppressed)[/cyan]")
     if result.gates_failed:
         _console.print(f"[red]Gates failed: {', '.join(result.gates_failed)}[/red]")
-        return 20
     if result.gates_warned:
         _console.print(f"[yellow]Gates warned: {', '.join(result.gates_warned)}[/yellow]")
-        return 10
 
-    return 0
+    return exit_code
 
 
 def main() -> None:

@@ -56,10 +56,19 @@ def _fetch_ticker_historical(symbol: str, as_of: datetime) -> dict:
     hist = yf.Ticker(symbol).history(start=str(start), end=str(end))
     if hist.empty:
         return {"symbol": symbol, "price": None, "prev_close": None, "change_pct": None}
-    # Pick the row closest to as_of (last row on or before as_of)
+    # Pick the row closest to as_of (last row on or before as_of).
+    # yfinance returns tz-naive IST for Indian tickers and tz-aware UTC for
+    # international ones.  Normalise both to UTC before comparing with as_of
+    # (which is always UTC throughout this codebase).
     hist_utc = hist.copy()
     if hist_utc.index.tzinfo is None:
-        hist_utc.index = hist_utc.index.tz_localize("UTC")
+        # Tz-naive index — yfinance Indian tickers return midnight IST,
+        # so localize as IST then convert.
+        hist_utc.index = (
+            hist_utc.index
+            .tz_localize("Asia/Kolkata")
+            .tz_convert("UTC")
+        )
     else:
         hist_utc.index = hist_utc.index.tz_convert("UTC")
     candidates = hist_utc[hist_utc.index <= as_of]

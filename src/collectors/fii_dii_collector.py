@@ -67,8 +67,8 @@ async def _fetch_fii_dii_archive(target_date: date) -> list[dict]:
         await client.get("https://www.nseindia.com", headers=_HEADERS)
         resp = await client.get(url, headers=_HEADERS)
         if resp.status_code == 404:
-            logger.warning(f"fii_dii_collector: archive 404 for {target_date} — trying live API")
-            return await _fetch_fii_dii_raw()
+            logger.warning(f"fii_dii_collector: archive not available for {target_date} (404) — returning empty")
+            return []
         resp.raise_for_status()
 
     # Parse the CSV into the live-API record shape

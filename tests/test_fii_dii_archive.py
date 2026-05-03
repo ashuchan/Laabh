@@ -80,3 +80,33 @@ async def test_fetch_yesterday_uses_live_for_today():
 
     assert mock_live.called
     assert not mock_archive.called
+
+
+@pytest.mark.asyncio
+async def test_archive_404_returns_empty_not_live_data():
+    """_fetch_fii_dii_archive on 404 must return [] — not fall back to the live API.
+
+    Bug: the original implementation called _fetch_fii_dii_raw() on 404, which
+    returns today's FII/DII data and stamps it as a historical date — silently
+    corrupting the replay dataset.
+    """
+    from src.collectors.fii_dii_collector import _fetch_fii_dii_archive
+    import httpx
+
+    past_date = date.today() - timedelta(days=30)
+
+    with patch("src.collectors.fii_dii_collector._fetch_fii_dii_raw", new=AsyncMock()) as mock_live:
+        # Simulate the NSE archive returning 404 for this date
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("src.collectors.fii_dii_collector.httpx.AsyncClient", return_value=mock_client):
+            records = await _fetch_fii_dii_archive(past_date)
+
+    assert records == [], "404 must return empty list, not live fallback data"
+    assert not mock_live.called, "_fetch_fii_dii_raw must NOT be called on archive 404"
