@@ -26,6 +26,7 @@ from src.config import get_settings
 from src.db import session_scope
 from src.models.fno_chain_issue import ChainCollectionIssue
 from src.models.instrument import Instrument
+from src.services.side_effect_gateway import get_gateway
 
 _settings = get_settings()
 
@@ -120,23 +121,6 @@ async def _last_comment_age(client: httpx.AsyncClient, issue_number: int) -> flo
 
 
 # ---------------------------------------------------------------------------
-# Telegram helper
-# ---------------------------------------------------------------------------
-
-async def _send_telegram(message: str) -> None:
-    token = _settings.telegram_bot_token
-    chat_id = _settings.telegram_chat_id
-    if not token or not chat_id:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"})
-    except Exception as exc:
-        logger.error(f"issue_filer: Telegram send failed: {exc}")
-
-
-# ---------------------------------------------------------------------------
 # Main run
 # ---------------------------------------------------------------------------
 
@@ -164,7 +148,7 @@ async def run() -> None:
 
     if not raw_rows:
         logger.info("issue_filer: no unresolved chain issues in the last 24h")
-        await _send_telegram("✅ <b>Chain Collector Review</b>\nNo unresolved issues in the last 24h.")
+        await get_gateway().send_telegram("✅ <b>Chain Collector Review</b>\nNo unresolved issues in the last 24h.")
         return
 
     # Group by (source, symbol, date)
@@ -251,5 +235,5 @@ async def run() -> None:
     if not github_enabled:
         summary += "\n⚠️ GITHUB_TOKEN not set — no issues filed"
 
-    await _send_telegram(summary)
+    await get_gateway().send_telegram(summary)
     logger.info(f"issue_filer: done — new={new_issues} updated={updated_issues}")
