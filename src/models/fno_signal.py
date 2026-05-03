@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Date, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -45,9 +45,9 @@ class FNOSignal(Base):
     vix_at_entry: Mapped[float | None] = mapped_column(Numeric(8, 4))
 
     status: Mapped[str] = mapped_column(String(15), server_default="proposed")
-    proposed_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    filled_at: Mapped[datetime | None] = mapped_column()
-    closed_at: Mapped[datetime | None] = mapped_column()
+    proposed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     final_pnl: Mapped[float | None] = mapped_column(Numeric(12, 2))
     notes: Mapped[str | None] = mapped_column(Text)
     dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
@@ -67,5 +67,5 @@ class FNOSignalEvent(Base):
     from_status: Mapped[str | None] = mapped_column(String(15))
     to_status: Mapped[str] = mapped_column(String(15), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

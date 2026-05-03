@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -19,6 +19,6 @@ class FNOCooldown(Base):
     underlying_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("instruments.id"), primary_key=True
     )
-    cooldown_until: Mapped[datetime] = mapped_column(primary_key=True)
+    cooldown_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     reason: Mapped[str | None] = mapped_column(String(50))
     dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

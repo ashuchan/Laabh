@@ -350,7 +350,7 @@ async def _collect_status_data(settings) -> dict:
                         "SELECT COUNT(*) FROM fno_candidates "
                         "WHERE phase = :p AND run_date = :d"
                     ),
-                    {"p": phase_num, "d": today.isoformat()},
+                    {"p": phase_num, "d": today},
                 )
                 count = pr.scalar() or 0
                 pipeline_data[f"phase{phase_num}"] = {
@@ -366,7 +366,7 @@ async def _collect_status_data(settings) -> dict:
                     "AND DATE(created_at AT TIME ZONE 'UTC') = :d "
                     "AND is_pushed = true"
                 ),
-                {"d": today.isoformat()},
+                {"d": today},
             )
             mb_time = mbr.scalar()
             pipeline_data["morning_brief"] = {
@@ -377,7 +377,7 @@ async def _collect_status_data(settings) -> dict:
             # Ban list count
             banr = await session.execute(
                 text("SELECT COUNT(*) FROM fno_ban_list WHERE ban_date = :d"),
-                {"d": today.isoformat()},
+                {"d": today},
             )
             pipeline_data["ban_list_count"] = banr.scalar() or 0
             pipeline_data["vix"] = vix_data

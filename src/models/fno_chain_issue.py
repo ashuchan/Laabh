@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, Text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,8 +31,8 @@ class ChainCollectionIssue(Base):
     issue_type: Mapped[str] = mapped_column(String(30), nullable=False)
     error_message: Mapped[str] = mapped_column(Text, nullable=False)
     raw_response: Mapped[str | None] = mapped_column(Text)  # truncated to 8 KB
-    detected_at: Mapped[datetime | None] = mapped_column()
+    detected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     github_issue_url: Mapped[str | None] = mapped_column(Text)
-    resolved_at: Mapped[datetime | None] = mapped_column()
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolved_by: Mapped[str | None] = mapped_column(String(50))
     dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

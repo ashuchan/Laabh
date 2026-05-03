@@ -219,7 +219,7 @@ class Phase3Check:
                         "WHERE caller = 'fno.thesis' "
                         "AND DATE(created_at AT TIME ZONE 'UTC') = :today"
                     ),
-                    {"today": today.isoformat()},
+                    {"today": today},
                 )
                 audit_count = audit_result.scalar() or 0
 
@@ -280,7 +280,7 @@ class MorningBriefCheck:
                         "AND is_pushed = true "
                         "ORDER BY created_at DESC LIMIT 1"
                     ),
-                    {"today": today.isoformat()},
+                    {"today": today},
                 )
                 row = result.fetchone()
 
@@ -510,7 +510,7 @@ class ReviewLoopCheck:
                         "WHERE job_name ILIKE '%review%loop%' "
                         "AND DATE(created_at AT TIME ZONE 'UTC') = :today"
                     ),
-                    {"today": today.isoformat()},
+                    {"today": today},
                 )
                 loop_runs = loop_result.scalar() or 0
 
@@ -521,7 +521,7 @@ class ReviewLoopCheck:
                         "AND github_issue_url IS NULL "
                         "AND resolved_at IS NULL"
                     ),
-                    {"today": today.isoformat()},
+                    {"today": today},
                 )
                 unfiled = unfiled_result.scalar() or 0
 

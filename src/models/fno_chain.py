@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import BigInteger, CheckConstraint, Date, ForeignKey, Integer, Numeric, String  # noqa: F401
+from sqlalchemy import BigInteger, CheckConstraint, Date, DateTime, ForeignKey, Integer, Numeric, String  # noqa: F401
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,7 +20,7 @@ class OptionsChain(Base):
     instrument_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("instruments.id"), primary_key=True
     )
-    snapshot_at: Mapped[datetime] = mapped_column(primary_key=True)
+    snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     expiry_date: Mapped[date] = mapped_column(Date, primary_key=True)
     strike_price: Mapped[float] = mapped_column(Numeric(12, 2), primary_key=True)
     option_type: Mapped[str] = mapped_column(String(2), primary_key=True)

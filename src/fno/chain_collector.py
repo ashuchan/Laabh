@@ -21,6 +21,7 @@ from decimal import Decimal
 
 from loguru import logger
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.config import get_settings
 from src.db import session_scope
@@ -166,66 +167,77 @@ async def _persist_snapshot(
     now = as_of if as_of is not None else snapshot.snapshot_at
     r_factor = _settings.fno_risk_free_rate_pct / 100.0
 
+    rows_to_insert: list[dict] = []
+    for strike in snapshot.strikes:
+        T = max(
+            0.0,
+            (snapshot.expiry_date - now.date()).days / 365.0,
+        )
+        underlying = float(snapshot.underlying_ltp or 0)
+        K = float(strike.strike)
+        opt = strike.option_type
+
+        row = ChainRow(
+            instrument_id=instrument.id,
+            expiry_date=snapshot.expiry_date,
+            strike_price=strike.strike,
+            option_type=opt,
+            ltp=strike.ltp,
+            bid_price=strike.bid,
+            ask_price=strike.ask,
+            bid_qty=strike.bid_qty,
+            ask_qty=strike.ask_qty,
+            volume=strike.volume,
+            oi=strike.oi,
+            iv=strike.iv,
+            delta=strike.delta,
+            gamma=strike.gamma,
+            theta=strike.theta,
+            vega=strike.vega,
+            underlying_ltp=snapshot.underlying_ltp,
+        )
+
+        # Compute Greeks when the source (NSE) didn't supply them
+        if underlying > 0 and K > 0 and T > 0:
+            if row.iv is None or row.delta is None:
+                row = enrich_chain_row(row, T, r=r_factor)
+
+        rows_to_insert.append({
+            "instrument_id": row.instrument_id,
+            "snapshot_at": now,
+            "expiry_date": row.expiry_date,
+            "strike_price": row.strike_price,
+            "option_type": row.option_type,
+            "ltp": row.ltp,
+            "bid_price": row.bid_price,
+            "ask_price": row.ask_price,
+            "bid_qty": row.bid_qty,
+            "ask_qty": row.ask_qty,
+            "volume": row.volume,
+            "oi": row.oi,
+            "oi_change": None,
+            "iv": row.iv,
+            "delta": row.delta,
+            "gamma": row.gamma,
+            "theta": row.theta,
+            "vega": row.vega,
+            "underlying_ltp": row.underlying_ltp,
+            "source": source,
+            "dryrun_run_id": dryrun_run_id,
+        })
+
+    if not rows_to_insert:
+        return
+
+    # Use ON CONFLICT DO NOTHING so re-runs / tier overlaps don't crash.
+    # Live writes have unique wall-clock snapshot_at, so this is a no-op
+    # for the live path.
     async with session_scope() as session:
-        for strike in snapshot.strikes:
-            T = max(
-                0.0,
-                (snapshot.expiry_date - now.date()).days / 365.0,
-            )
-            underlying = float(snapshot.underlying_ltp or 0)
-            K = float(strike.strike)
-            opt = strike.option_type
-
-            row = ChainRow(
-                instrument_id=instrument.id,
-                expiry_date=snapshot.expiry_date,
-                strike_price=strike.strike,
-                option_type=opt,
-                ltp=strike.ltp,
-                bid_price=strike.bid,
-                ask_price=strike.ask,
-                bid_qty=strike.bid_qty,
-                ask_qty=strike.ask_qty,
-                volume=strike.volume,
-                oi=strike.oi,
-                iv=strike.iv,
-                delta=strike.delta,
-                gamma=strike.gamma,
-                theta=strike.theta,
-                vega=strike.vega,
-                underlying_ltp=snapshot.underlying_ltp,
-            )
-
-            # Compute Greeks when the source (NSE) didn't supply them
-            if underlying > 0 and K > 0 and T > 0:
-                if row.iv is None or row.delta is None:
-                    row = enrich_chain_row(row, T, r=r_factor)
-
-            session.add(
-                OptionsChain(
-                    instrument_id=row.instrument_id,
-                    snapshot_at=now,
-                    expiry_date=row.expiry_date,
-                    strike_price=row.strike_price,
-                    option_type=row.option_type,
-                    ltp=row.ltp,
-                    bid_price=row.bid_price,
-                    ask_price=row.ask_price,
-                    bid_qty=row.bid_qty,
-                    ask_qty=row.ask_qty,
-                    volume=row.volume,
-                    oi=row.oi,
-                    oi_change=None,
-                    iv=row.iv,
-                    delta=row.delta,
-                    gamma=row.gamma,
-                    theta=row.theta,
-                    vega=row.vega,
-                    underlying_ltp=row.underlying_ltp,
-                    source=source,
-                    dryrun_run_id=dryrun_run_id,
-                )
-            )
+        stmt = pg_insert(OptionsChain).values(rows_to_insert)
+        stmt = stmt.on_conflict_do_nothing(
+            index_elements=["instrument_id", "snapshot_at", "expiry_date", "strike_price", "option_type"]
+        )
+        await session.execute(stmt)
 
 
 # ---------------------------------------------------------------------------

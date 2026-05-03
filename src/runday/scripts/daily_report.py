@@ -50,7 +50,7 @@ async def build_report(
                 ORDER BY last_run DESC
                 """
             ),
-            {"today": today.isoformat(), **run_params},
+            {"today": today, **run_params},
         )
         job_rows = jobs_result.fetchall()
 
@@ -71,7 +71,7 @@ async def build_report(
                 GROUP BY status
                 """
             ),
-            {"today": today.isoformat(), **run_params},
+            {"today": today, **run_params},
         )
         chain_rows = chain_result.fetchall()
 
@@ -84,7 +84,7 @@ async def build_report(
                 {run_filter}
                 """
             ),
-            {"today": today.isoformat(), **run_params},
+            {"today": today, **run_params},
         )
         nse_count = nse_share_result.scalar() or 0
 
@@ -98,7 +98,7 @@ async def build_report(
                 GROUP BY issue_type
                 """
             ),
-            {"today": today.isoformat()},
+            {"today": today},
         )
         issue_rows = issues_result.fetchall()
 
@@ -116,7 +116,7 @@ async def build_report(
                 GROUP BY caller
                 """
             ),
-            {"today": today.isoformat(), **run_params},
+            {"today": today, **run_params},
         )
         llm_rows = llm_result.fetchall()
 
@@ -139,7 +139,7 @@ async def build_report(
                 ORDER BY strategy_type, status
                 """
             ),
-            {"today": today.isoformat(), **run_params},
+            {"today": today, **run_params},
         )
         signal_rows = signals_result.fetchall()
 
@@ -164,7 +164,7 @@ async def build_report(
                 LIMIT 20
                 """
             ),
-            {"today": today.isoformat(), **run_params},
+            {"today": today, **run_params},
         )
         quality_rows = quality_result.fetchall()
 
@@ -180,7 +180,7 @@ async def build_report(
                 {run_filter}
                 """
             ),
-            {"today": today.isoformat(), **run_params},
+            {"today": today, **run_params},
         )
         vix_row = vix_result.fetchone()
 
@@ -192,7 +192,7 @@ async def build_report(
                 f"SELECT phase, COUNT(*) FROM fno_candidates "
                 f"WHERE run_date = :today {run_filter} GROUP BY phase"
             ),
-            {"today": today.isoformat(), **run_params},
+            {"today": today, **run_params},
         )
         candidate_rows = {r[0]: r[1] for r in candidates_result.fetchall()}
 

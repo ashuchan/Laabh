@@ -195,12 +195,19 @@ async def _get_avg_volume_5d(
 ) -> int | None:
     """Return 5-day average daily volume from price_daily ending before cutoff_date."""
     cutoff = cutoff_date if cutoff_date is not None else as_of
-    result = await session.execute(
-        select(func.avg(PriceDaily.volume)).where(
+    # Pick the 5 most recent rows (subquery), then average their volume.
+    # A single SELECT with both AVG and ORDER BY+LIMIT is invalid SQL.
+    recent = (
+        select(PriceDaily.volume)
+        .where(
             PriceDaily.instrument_id == instrument_id,
             PriceDaily.date < cutoff,
-        ).order_by(PriceDaily.date.desc()).limit(5)
+        )
+        .order_by(PriceDaily.date.desc())
+        .limit(5)
+        .subquery()
     )
+    result = await session.execute(select(func.avg(recent.c.volume)))
     avg = result.scalar_one_or_none()
     return int(avg) if avg else None
 

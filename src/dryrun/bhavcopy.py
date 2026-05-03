@@ -94,8 +94,11 @@ def _parse_fo_csv(csv_text: str) -> pd.DataFrame:
     # Normalise column names: strip whitespace, lowercase
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Map known NSE column aliases to canonical names
+    # Map known NSE column aliases to canonical names.
+    # Covers both legacy bhavcopy (finsymbol/expiry_dt/...) and current
+    # UDiFF format (tckrsymb/xprydt/strkpric/optntp/...).
     rename_map = {
+        # Legacy NSE bhavcopy
         "finsymbol": "symbol",
         "expiry_dt": "expiry_date",
         "strikeprice": "strike_price",
@@ -110,12 +113,29 @@ def _parse_fo_csv(csv_text: str) -> pd.DataFrame:
         "open_int": "oi",
         "chng_in_opn_int": "change_in_oi",
         "lastpric": "last_price",
+        # UDiFF (current NSE bhavcopy format, post-2024)
+        "tckrsymb": "symbol",
+        "xprydt": "expiry_date",
+        "strkpric": "strike_price",
+        "optntp": "option_type",
+        "fininstrmtp": "instrument",
+        "opnpric": "open",
+        "hghpric": "high",
+        "lwpric": "low",
+        "clspric": "close",
+        "sttlmpric": "settle_price",
+        "ttltradgvol": "contracts",
+        "ttltrfval": "value_in_lakh",
+        "opnintrst": "oi",
+        "chnginopnintrst": "change_in_oi",
+        "undrlygpric": "underlying_price",
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
     # Coerce numeric columns
     for col in ["strike_price", "open", "high", "low", "close", "settle_price",
-                "contracts", "value_in_lakh", "oi", "change_in_oi", "last_price"]:
+                "contracts", "value_in_lakh", "oi", "change_in_oi", "last_price",
+                "underlying_price"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -123,13 +143,14 @@ def _parse_fo_csv(csv_text: str) -> pd.DataFrame:
     if "expiry_date" in df.columns:
         df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce").dt.date
 
-    # Keep only OPTSTK and OPTIDX instruments (skip futures)
+    # Keep only options (skip futures). Legacy uses OPTSTK/OPTIDX; UDiFF uses STO/IDO.
     if "instrument" in df.columns:
-        df = df[df["instrument"].str.startswith("OPT", na=False)].copy()
+        instr = df["instrument"].astype(str).str.upper()
+        df = df[instr.str.startswith("OPT") | instr.isin(["STO", "IDO"])].copy()
 
     # Normalise option_type to CE/PE
     if "option_type" in df.columns:
-        df["option_type"] = df["option_type"].str.strip().str.upper()
+        df["option_type"] = df["option_type"].astype(str).str.strip().str.upper()
         df = df[df["option_type"].isin(["CE", "PE"])].copy()
 
     return df.reset_index(drop=True)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, ForeignKey, Integer, String, Text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -25,7 +25,7 @@ class ChainCollectionLog(Base):
     instrument_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("instruments.id"), nullable=False
     )
-    attempted_at: Mapped[datetime] = mapped_column(nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     primary_source: Mapped[str] = mapped_column(String(20), nullable=False)
     fallback_source: Mapped[str | None] = mapped_column(String(20))
     final_source: Mapped[str | None] = mapped_column(String(20))

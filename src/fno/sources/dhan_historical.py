@@ -343,18 +343,30 @@ class DhanHistoricalSource(BaseChainSource):
                 oi=oi,
             ))
 
-        # Get underlying LTP from bhavcopy (CM) or return None
+        # Get underlying LTP — prefer F&O bhavcopy's undrlygpric column
+        # (every option row carries the underlying close price for that day),
+        # then fall back to the cash-market bhavcopy if missing.
         underlying_ltp: Decimal | None = None
-        try:
-            from src.dryrun.bhavcopy import fetch_cm_bhavcopy
-            cm_df = await fetch_cm_bhavcopy(self._replay_date)
-            cm_row = cm_df[cm_df["symbol"].str.upper() == symbol.upper()]
-            if not cm_row.empty:
-                close_val = cm_row["close"].iloc[0]
-                if not pd_is_na(close_val):
-                    underlying_ltp = Decimal(str(float(close_val)))
-        except Exception:
-            pass
+        if "underlying_price" in sub.columns and not sub.empty:
+            for val in sub["underlying_price"].dropna():
+                try:
+                    candidate = float(val)
+                    if candidate > 0:
+                        underlying_ltp = Decimal(str(candidate))
+                        break
+                except (ValueError, TypeError):
+                    continue
+        if underlying_ltp is None:
+            try:
+                from src.dryrun.bhavcopy import fetch_cm_bhavcopy
+                cm_df = await fetch_cm_bhavcopy(self._replay_date)
+                cm_row = cm_df[cm_df["symbol"].str.upper() == symbol.upper()]
+                if not cm_row.empty:
+                    close_val = cm_row["close"].iloc[0]
+                    if not pd_is_na(close_val):
+                        underlying_ltp = Decimal(str(float(close_val)))
+            except Exception:
+                pass
 
         return ChainSnapshot(
             symbol=symbol,

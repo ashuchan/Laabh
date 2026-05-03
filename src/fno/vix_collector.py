@@ -97,15 +97,23 @@ async def run_once(
     regime = classify_regime(vix_value)
     stamp = as_of if as_of is not None else datetime.now(tz=timezone.utc)
 
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
     async with session_scope() as session:
-        row = VIXTick(
+        stmt = pg_insert(VIXTick).values(
             timestamp=stamp,
             vix_value=vix_value,
             regime=regime,
             dryrun_run_id=dryrun_run_id,
-        )
-        session.add(row)
+        ).on_conflict_do_nothing(index_elements=["timestamp"])
+        await session.execute(stmt)
 
+    row = VIXTick(
+        timestamp=stamp,
+        vix_value=vix_value,
+        regime=regime,
+        dryrun_run_id=dryrun_run_id,
+    )
     logger.info(f"vix_collector: VIX={vix_value:.2f} regime={regime}")
     return row
 

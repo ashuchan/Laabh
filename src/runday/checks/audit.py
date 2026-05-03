@@ -47,7 +47,7 @@ class LLMAuditCheck:
                         AND DATE(created_at AT TIME ZONE 'UTC') = :today
                         """
                     ),
-                    {"caller": self._caller, "today": today.isoformat()},
+                    {"caller": self._caller, "today": today},
                 )
                 row = result.fetchone()
 
@@ -125,7 +125,7 @@ class LLMAuditSummaryCheck:
                         ORDER BY row_count DESC
                         """
                     ),
-                    {"today": today.isoformat()},
+                    {"today": today},
                 )
                 rows = result.fetchall()
 

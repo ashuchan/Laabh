@@ -33,7 +33,7 @@ class TradingStatusCheck:
                         "WHERE DATE(proposed_at AT TIME ZONE 'UTC') = :today "
                         "GROUP BY status"
                     ),
-                    {"today": today.isoformat()},
+                    {"today": today},
                 )
                 by_status: dict[str, int] = {r[0]: r[1] for r in result.fetchall()}
 
@@ -43,7 +43,7 @@ class TradingStatusCheck:
                         "WHERE DATE(proposed_at AT TIME ZONE 'UTC') = :today "
                         "AND final_pnl IS NOT NULL"
                     ),
-                    {"today": today.isoformat()},
+                    {"today": today},
                 )
                 day_pnl = float(pnl_result.scalar() or 0)
 
