@@ -9,7 +9,7 @@ Writes to fno_collection_tiers (upsert — idempotent within the same day).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from loguru import logger
 from sqlalchemy import func, select, text
@@ -33,7 +33,7 @@ async def refresh() -> dict[str, int]:
 
     Returns a dict with counts: {'tier1': N, 'tier2': M}.
     """
-    now = datetime.now(tz=timezone.utc)
+    now = datetime.utcnow()
     tier1_size = _settings.fno_tier1_size
 
     async with session_scope() as session:
