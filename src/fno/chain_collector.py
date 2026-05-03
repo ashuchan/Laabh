@@ -13,7 +13,9 @@ Failover sequence per underlying per poll:
 """
 from __future__ import annotations
 
+import contextlib
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -45,6 +47,24 @@ _settings = get_settings()
 # Module-level source instances (one each — re-used across calls)
 _nse: NSESource = NSESource()
 _dhan: DhanSource = DhanSource()
+
+# Context-variable override — set to a custom source inside replay_chain_source()
+_ACTIVE_SOURCE: ContextVar = ContextVar("chain_active_source", default=None)
+
+
+def _get_active_source():
+    """Return the context-local source override, or None to use the live failover logic."""
+    return _ACTIVE_SOURCE.get()
+
+
+@contextlib.contextmanager
+def replay_chain_source(source):
+    """Context manager: override the primary chain source for the current async context."""
+    token = _ACTIVE_SOURCE.set(source)
+    try:
+        yield
+    finally:
+        _ACTIVE_SOURCE.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +158,12 @@ async def _persist_snapshot(
     snapshot: SourceSnapshot,
     instrument: Instrument,
     source: str,
+    *,
+    as_of: datetime | None = None,
+    dryrun_run_id: "uuid.UUID | None" = None,
 ) -> None:
     """Convert a SourceSnapshot to ChainRows, enrich Greeks, write to DB."""
-    now = snapshot.snapshot_at
+    now = as_of if as_of is not None else snapshot.snapshot_at
     r_factor = _settings.fno_risk_free_rate_pct / 100.0
 
     async with session_scope() as session:
@@ -200,6 +223,7 @@ async def _persist_snapshot(
                     vega=row.vega,
                     underlying_ltp=row.underlying_ltp,
                     source=source,
+                    dryrun_run_id=dryrun_run_id,
                 )
             )
 
@@ -208,9 +232,14 @@ async def _persist_snapshot(
 # Per-underlying collection with failover
 # ---------------------------------------------------------------------------
 
-async def collect_one(instrument: Instrument) -> None:
+async def collect_one(
+    instrument: Instrument,
+    *,
+    as_of: datetime | None = None,
+    dryrun_run_id: "uuid.UUID | None" = None,
+) -> None:
     """Collect and persist chain data for one instrument (NSE → Dhan failover)."""
-    started = datetime.now(tz=timezone.utc)
+    started = as_of if as_of is not None else datetime.now(tz=timezone.utc)
     expiry = next_weekly_expiry(instrument.symbol, reference=started.date())
 
     log = ChainCollectionLog(
@@ -223,30 +252,38 @@ async def collect_one(instrument: Instrument) -> None:
     nse_ok = False
     dhan_ok = False
 
-    # --- Primary: NSE ---
+    # Allow caller to inject a custom source (used in replay mode)
+    primary_source = _get_active_source() or _nse
+
+    # --- Primary source ---
+    primary_name = getattr(primary_source, "name", "nse")
+    log.primary_source = primary_name
     try:
-        snapshot = await _nse.fetch(instrument.symbol, expiry)
-        await _persist_snapshot(snapshot, instrument, source="nse")
-        log.final_source = "nse"
+        snapshot = await primary_source.fetch(instrument.symbol, expiry)
+        await _persist_snapshot(snapshot, instrument, source=primary_name, as_of=as_of, dryrun_run_id=dryrun_run_id)
+        log.final_source = primary_name
         log.status = "ok"
         nse_ok = True
-        await _record_source_success("nse")
-        logger.info(f"chain_collector: {instrument.symbol} OK via NSE")
+        if as_of is None:
+            await _record_source_success(primary_name)
+        logger.info(f"chain_collector: {instrument.symbol} OK via {primary_name}")
     except SchemaError as exc:
         log.nse_error = f"schema: {exc}"
-        await _record_schema_mismatch("nse", instrument, str(exc), exc.raw_response)
-        await _record_source_error("nse", str(exc))
+        if as_of is None:
+            await _record_schema_mismatch(primary_name, instrument, str(exc), exc.raw_response)
+            await _record_source_error(primary_name, str(exc))
     except (RateLimitError, AuthError, SourceUnavailableError) as exc:
         log.nse_error = str(exc)
-        await _record_source_error("nse", str(exc))
-        logger.warning(f"chain_collector: {instrument.symbol} NSE failed: {exc}")
+        if as_of is None:
+            await _record_source_error(primary_name, str(exc))
+        logger.warning(f"chain_collector: {instrument.symbol} {primary_name} failed: {exc}")
 
-    # --- Fallback: Dhan (only when NSE failed) ---
-    if not nse_ok:
+    # --- Fallback: Dhan (only when primary failed and we're in live mode) ---
+    if not nse_ok and as_of is None:
         log.fallback_source = "dhan"
         try:
             snapshot = await _dhan.fetch(instrument.symbol, expiry)
-            await _persist_snapshot(snapshot, instrument, source="dhan")
+            await _persist_snapshot(snapshot, instrument, source="dhan", dryrun_run_id=dryrun_run_id)
             log.final_source = "dhan"
             log.status = "fallback_used"
             dhan_ok = True
@@ -260,7 +297,7 @@ async def collect_one(instrument: Instrument) -> None:
             log.dhan_error = str(exc)
             await _record_source_error("dhan", str(exc))
             logger.error(
-                f"chain_collector: {instrument.symbol} MISSED — NSE: {log.nse_error}, "
+                f"chain_collector: {instrument.symbol} MISSED — {primary_name}: {log.nse_error}, "
                 f"Dhan: {exc}"
             )
 
@@ -269,6 +306,7 @@ async def collect_one(instrument: Instrument) -> None:
 
     elapsed_ms = int((datetime.now(tz=timezone.utc) - started).total_seconds() * 1000)
     log.latency_ms = elapsed_ms
+    log.dryrun_run_id = dryrun_run_id
 
     async with session_scope() as session:
         session.add(log)
@@ -278,7 +316,12 @@ async def collect_one(instrument: Instrument) -> None:
 # Tier-aware collection
 # ---------------------------------------------------------------------------
 
-async def collect_tier(tier: int) -> None:
+async def collect_tier(
+    tier: int,
+    *,
+    as_of: datetime | None = None,
+    dryrun_run_id: "uuid.UUID | None" = None,
+) -> None:
     """Collect chain data for all instruments in the given tier (1 or 2)."""
     async with session_scope() as session:
         result = await session.execute(
@@ -305,10 +348,14 @@ async def collect_tier(tier: int) -> None:
         f"chain_collector: tier-{tier} sweep for {len(instruments)} instruments"
     )
     for inst in instruments:
-        await collect_one(inst)
+        await collect_one(inst, as_of=as_of, dryrun_run_id=dryrun_run_id)
 
 
-async def collect_all() -> None:
+async def collect_all(
+    *,
+    as_of: datetime | None = None,
+    dryrun_run_id: "uuid.UUID | None" = None,
+) -> None:
     """Fallback: collect chains for all F&O instruments regardless of tier."""
     async with session_scope() as session:
         result = await session.execute(
@@ -323,4 +370,4 @@ async def collect_all() -> None:
         f"chain_collector: full sweep for {len(instruments)} F&O instruments"
     )
     for inst in instruments:
-        await collect_one(inst)
+        await collect_one(inst, as_of=as_of, dryrun_run_id=dryrun_run_id)

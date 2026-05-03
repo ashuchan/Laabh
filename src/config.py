@@ -164,6 +164,24 @@ class Settings(BaseSettings):
     # --- Risk-free rate for Black-Scholes Greeks ---
     fno_risk_free_rate_pct: float = Field(default=6.5, alias="FNO_RISK_FREE_RATE_PCT")
 
+    # --- Dry-run replay ---
+    dryrun_enabled: bool = Field(default=True, alias="DRYRUN_ENABLED")
+    dryrun_historical_chain_source: str = Field(
+        default="dhan", alias="DRYRUN_HISTORICAL_CHAIN_SOURCE"
+    )
+    dryrun_bhavcopy_cache_dir: str = Field(
+        default="~/.cache/laabh/bhavcopy", alias="DRYRUN_BHAVCOPY_CACHE_DIR"
+    )
+    dryrun_dhan_cache_dir: str = Field(
+        default="~/.cache/laabh/dhan_intraday", alias="DRYRUN_DHAN_CACHE_DIR"
+    )
+    dryrun_min_contract_oi: int = Field(default=1000, alias="DRYRUN_MIN_CONTRACT_OI")
+    dryrun_min_contract_volume: int = Field(default=100, alias="DRYRUN_MIN_CONTRACT_VOLUME")
+    dryrun_report_dir: str = Field(default="reports", alias="DRYRUN_REPORT_DIR")
+    dryrun_llm_mode: str = Field(
+        default="cached_or_live", alias="DRYRUN_LLM_MODE"
+    )  # cached_or_live | mock | live
+
     @property
     def sync_database_url(self) -> str:
         """Sync URL for Alembic (replace asyncpg driver with psycopg2)."""

@@ -115,15 +115,7 @@ async def run_eod_tasks(run_date: date | None = None) -> None:
 
 async def _send_daily_summary(run_date: date) -> None:
     from src.fno.notifications import format_daily_summary
-    from src.services.notification_service import NotificationService
-
-    from sqlalchemy import select
-    from src.db import session_scope
-    from src.models.fno_candidate import FNOCandidate
-
-    async with session_scope() as session:
-        def _count(phase, passed_field=None):
-            return 0  # placeholder — counts come from pipeline run results
+    from src.services.side_effect_gateway import get_gateway
 
     summary_msg = format_daily_summary(
         run_date=run_date.isoformat(),
@@ -133,6 +125,5 @@ async def _send_daily_summary(run_date: date) -> None:
         trades_entered=0,
         net_pnl=Decimal("0"),
     )
-    svc = NotificationService()
-    await svc.send_text(summary_msg)
+    await get_gateway().send_telegram(summary_msg)
     logger.info("fno.orchestrator: daily summary notification sent")

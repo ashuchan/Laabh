@@ -370,18 +370,30 @@ class Phase4EntryCheck:
 
 
 class Phase4ManageCheck:
-    """Assert the manage loop ran ≥1 tick in the last 5 min during 09:15–14:30."""
+    """Assert the manage loop ran ≥1 tick in the last 5 min during 09:15–14:30.
+
+    Pass `now` to simulate a specific wall-clock time (replay mode).
+    When `now` is None, uses datetime.now(UTC) (live mode).
+    """
 
     name = "checkpoint.phase4_manage"
 
-    def __init__(self, settings: RundaySettings, anchor_date: date | None = None) -> None:
+    def __init__(
+        self,
+        settings: RundaySettings,
+        anchor_date: date | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> None:
         self._settings = settings
         self._anchor = anchor_date
+        self._now = now  # None = use real clock; set for replay simulated time
 
     async def run(self) -> CheckResult:
         t0 = time.monotonic()
-        now_utc = datetime.now(timezone.utc)
-        today = self._anchor or date.today()
+        from datetime import timedelta
+        now_utc = self._now if self._now is not None else datetime.now(timezone.utc)
+        today = self._anchor or (self._now.date() if self._now else date.today())
 
         market_open = _IST.localize(datetime(today.year, today.month, today.day, 9, 15, 0))
         market_close = _IST.localize(datetime(today.year, today.month, today.day, 14, 30, 0))
@@ -394,8 +406,6 @@ class Phase4ManageCheck:
                 message="Outside market hours (09:15–14:30 IST) — manage loop check skipped",
             )
 
-        five_min_ago = now_utc.replace(second=0, microsecond=0)
-        from datetime import timedelta
         five_min_ago = now_utc - timedelta(minutes=5)
 
         try:

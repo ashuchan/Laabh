@@ -3,8 +3,15 @@
 NSE publishes FII/DII activity at:
   https://www.nseindia.com/api/fiidiiTradeReact
 
+For historical dates, data is fetched from NSE's archive endpoint:
+  https://archives.nseindia.com/content/nsccl/fao_participant_vol_DDMMYYYY.csv
+  (or the equity market equivalent for cash-market FII/DII flows)
+
 This is fetched post-market (after 6 PM IST) and stored as raw_content
 with media_type='fii_dii' for consumption by the F&O catalyst scorer.
+
+Replay note: in replay mode, fetch_yesterday(target_date=D) should be called
+with D = replay_date - 1 trading day, because FII/DII data lags by one day.
 """
 from __future__ import annotations
 
@@ -22,9 +29,15 @@ from src.models.source import DataSource
 from sqlalchemy import select
 
 _NSE_FII_DII_URL = "https://www.nseindia.com/api/fiidiiTradeReact"
+# NSE FII/DII archive: participant-wise F&O turnover by date
+# Date format: DDMMYYYY
+_NSE_FII_DII_ARCHIVE_URL = (
+    "https://archives.nseindia.com/content/nsccl/fao_participant_vol_{ddmmyyyy}.csv"
+)
 _HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; Laabh/1.0)",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json,text/csv,*/*",
     "Referer": "https://www.nseindia.com/",
 }
 _FII_DII_SOURCE_NAME = "NSE FII/DII Data"
@@ -32,13 +45,64 @@ _FII_DII_SOURCE_NAME = "NSE FII/DII Data"
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=3, max=30))
 async def _fetch_fii_dii_raw() -> list[dict]:
-    """Fetch raw FII/DII JSON from NSE API."""
+    """Fetch raw FII/DII JSON from NSE live API."""
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         # NSE requires a cookie from the homepage first
         await client.get("https://www.nseindia.com", headers=_HEADERS)
         resp = await client.get(_NSE_FII_DII_URL, headers=_HEADERS)
         resp.raise_for_status()
         return resp.json()
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=15))
+async def _fetch_fii_dii_archive(target_date: date) -> list[dict]:
+    """Fetch FII/DII data from NSE archives for a historical date.
+
+    The archive CSV has columns: Client_Type, Buy_Value, Sell_Value, Net_Value, etc.
+    Returns records in the same shape as the live API so _parse_fii_dii can consume them.
+    """
+    ddmmyyyy = target_date.strftime("%d%m%Y")
+    url = _NSE_FII_DII_ARCHIVE_URL.format(ddmmyyyy=ddmmyyyy)
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        await client.get("https://www.nseindia.com", headers=_HEADERS)
+        resp = await client.get(url, headers=_HEADERS)
+        if resp.status_code == 404:
+            logger.warning(f"fii_dii_collector: archive 404 for {target_date} — trying live API")
+            return await _fetch_fii_dii_raw()
+        resp.raise_for_status()
+
+    # Parse the CSV into the live-API record shape
+    records: list[dict] = []
+    lines = resp.text.strip().splitlines()
+    if len(lines) < 2:
+        return records
+
+    header = [h.strip().lower() for h in lines[0].split(",")]
+    for line in lines[1:]:
+        parts = line.split(",")
+        if len(parts) < len(header):
+            continue
+        row = dict(zip(header, [p.strip() for p in parts]))
+        client_type = row.get("client_type", "").upper()
+        try:
+            buy_val = float(row.get("buy_value", 0) or 0)
+            sell_val = float(row.get("sell_value", 0) or 0)
+        except ValueError:
+            continue
+        # Map archive category names to live-API shape
+        if "FII" in client_type or "FPI" in client_type:
+            category = "FII/FPI"
+        elif "DII" in client_type:
+            category = "DII"
+        else:
+            continue
+        records.append({
+            "category": category,
+            "buyValue": buy_val,
+            "sellValue": sell_val,
+            "date": target_date.strftime("%d-%b-%Y"),
+        })
+    return records
 
 
 def _parse_fii_dii(raw_records: list[dict]) -> dict:
@@ -81,7 +145,11 @@ def _parse_fii_dii(raw_records: list[dict]) -> dict:
 
 
 async def fetch_yesterday(target_date: date | None = None) -> dict | None:
-    """Fetch FII/DII data and store in raw_content. Returns the parsed summary."""
+    """Fetch FII/DII data and store in raw_content. Returns the parsed summary.
+
+    When target_date is today or None, hits the live NSE API.
+    When target_date is in the past, routes to the NSE archive endpoint.
+    """
     async with session_scope() as session:
         result = await session.execute(
             select(DataSource).where(
@@ -95,15 +163,21 @@ async def fetch_yesterday(target_date: date | None = None) -> dict | None:
         logger.warning("fii_dii_collector: no active source — skipping")
         return None
 
+    today = date.today()
+    is_historical = target_date is not None and target_date < today
+
     try:
-        raw_records = await _fetch_fii_dii_raw()
+        if is_historical:
+            raw_records = await _fetch_fii_dii_archive(target_date)
+        else:
+            raw_records = await _fetch_fii_dii_raw()
     except Exception as exc:
         logger.error(f"fii_dii_collector: fetch failed: {exc}")
         return None
 
     summary = _parse_fii_dii(raw_records)
     now = datetime.now(tz=timezone.utc)
-    date_str = summary.get("date") or (target_date or date.today()).isoformat()
+    date_str = summary.get("date") or (target_date or today).isoformat()
     h = hashlib.sha256(f"fii_dii:{date_str}".encode()).hexdigest()
 
     async with session_scope() as session:
