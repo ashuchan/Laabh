@@ -34,10 +34,14 @@ from src.fno.vix_collector import run_once as collect_vix
 _settings = Settings()
 
 
-async def run_premarket_pipeline(run_date: date | None = None) -> dict:
+async def run_premarket_pipeline(
+    run_date: date | None = None,
+    *,
+    as_of: "datetime | None" = None,
+) -> dict:
     """Run Phases 1-3 and return summary counts."""
     if run_date is None:
-        run_date = date.today()
+        run_date = date.today() if as_of is None else as_of.date()
 
     if not _settings.fno_module_enabled:
         logger.info("fno.orchestrator: F&O module disabled — skipping premarket pipeline")
@@ -45,8 +49,8 @@ async def run_premarket_pipeline(run_date: date | None = None) -> dict:
 
     logger.info(f"fno.orchestrator: starting premarket pipeline for {run_date}")
 
-    # Phase 1: liquidity filter
-    phase1_results = await run_phase1(run_date)
+    # Phase 1: liquidity filter — pass as_of so chain queries are bounded to the replay time
+    phase1_results = await run_phase1(run_date, as_of=as_of)
     phase1_passed = sum(1 for r in phase1_results if r.passed)
     logger.info(f"fno.orchestrator: Phase 1 → {phase1_passed}/{len(phase1_results)} passed")
 

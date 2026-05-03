@@ -561,8 +561,14 @@ def make_phase_check(
     phase: str,
     settings: RundaySettings,
     anchor_date: date | None = None,
+    *,
+    now: "datetime | None" = None,
 ) -> "CheckResult | None":
-    """Return the appropriate check instance for the given phase name, or None."""
+    """Return the appropriate check instance for the given phase name, or None.
+
+    Pass ``now`` to override the wall-clock for checks that support simulated
+    time (currently ``Phase4ManageCheck``).
+    """
     _MAP = {
         "tier-refresh": TierRefreshCheck,
         "phase1": Phase1Check,
@@ -575,4 +581,8 @@ def make_phase_check(
         "review-loop": ReviewLoopCheck,
     }
     cls = _MAP.get(phase)
-    return cls(settings, anchor_date) if cls else None
+    if cls is None:
+        return None
+    if cls is Phase4ManageCheck and now is not None:
+        return cls(settings, anchor_date, now=now)
+    return cls(settings, anchor_date)

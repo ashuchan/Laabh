@@ -808,7 +808,10 @@ async def _replay_async(
     telegram_count = sum(1 for c in captures if c.get("type") == "telegram")
     _console.print(f"\n[cyan]Captured Telegrams: {telegram_count} (suppressed)[/cyan]")
     if result.gates_failed:
-        _console.print(f"[yellow]Gates failed: {', '.join(result.gates_failed)}[/yellow]")
+        _console.print(f"[red]Gates failed: {', '.join(result.gates_failed)}[/red]")
+        return 20
+    if result.gates_warned:
+        _console.print(f"[yellow]Gates warned: {', '.join(result.gates_warned)}[/yellow]")
         return 10
 
     return 0

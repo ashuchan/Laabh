@@ -49,6 +49,7 @@ class ReplayResult:
     replay_date: date
     gates_passed: list[str] = field(default_factory=list)
     gates_failed: list[str] = field(default_factory=list)
+    gates_warned: list[str] = field(default_factory=list)
     captures: list[dict] = field(default_factory=list)
     stage_counts: dict = field(default_factory=dict)
     success: bool = True
@@ -127,6 +128,8 @@ async def _run_replay(
             result.success = False
             result.gates_failed.append(check.name)
             _gate(cr)
+        elif cr.severity == Severity.WARN:
+            result.gates_warned.append(check.name)
         else:
             result.gates_passed.append(check.name)
 
@@ -182,7 +185,9 @@ async def _run_replay(
     # Stage 3 — Phases 1–3 (live functions, unchanged)
     # ------------------------------------------------------------------
     logger.info("dryrun: Stage 3 — Phases 1–3")
-    pipeline_result = await run_premarket_pipeline(D)
+    # Pass as_of so Phase 1 chain queries are bounded to the replay timestamp
+    phase1_as_of = ist(D, 9, 0)
+    pipeline_result = await run_premarket_pipeline(D, as_of=phase1_as_of)
     result.stage_counts["pipeline"] = pipeline_result
 
     for phase in ("phase1", "phase2", "phase3"):
@@ -191,6 +196,8 @@ async def _run_replay(
             result.success = False
             result.gates_failed.append(f"stage3.{phase}")
             logger.warning(f"dryrun: phase gate {phase} FAILED: {cr.message}")
+        elif cr.severity == Severity.WARN:
+            result.gates_warned.append(f"stage3.{phase}")
         else:
             result.gates_passed.append(f"stage3.{phase}")
 
@@ -222,7 +229,11 @@ async def _run_replay(
 
     hard_exit_check = make_phase_check("hard-exit", settings, D)
     cr = await hard_exit_check.run()
-    if cr.severity != Severity.FAIL:
+    if cr.severity == Severity.FAIL:
+        result.gates_failed.append("stage4.hard_exit")
+    elif cr.severity == Severity.WARN:
+        result.gates_warned.append("stage4.hard_exit")
+    else:
         result.gates_passed.append("stage4.hard_exit")
 
     # ------------------------------------------------------------------
