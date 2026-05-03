@@ -13,6 +13,7 @@ from src.models.fno_collection_tier import FNOCollectionTier
 from src.models.fno_iv import IVHistory
 from src.models.fno_vix import VIXTick
 from src.models.instrument import Instrument
+from src.dryrun.bhavcopy import BhavcopyMissingError, fetch_fo_bhavcopy
 from src.runday.checks.base import CheckResult, Severity
 from src.runday.config import RundaySettings
 
@@ -262,4 +263,39 @@ class BanListCheck:
                 severity=Severity.FAIL,
                 message=f"Ban list check error: {exc}",
                 details={"error": str(exc)},
+            )
+
+
+class BhavcopyAvailableCheck:
+    """Assert the NSE F&O bhavcopy is available (non-404) for the target date."""
+
+    name = "preflight.bhavcopy_available"
+
+    def __init__(self, settings: RundaySettings, target_date: date) -> None:
+        self._settings = settings
+        self._date = target_date
+
+    async def run(self) -> CheckResult:
+        t0 = time.monotonic()
+        try:
+            await fetch_fo_bhavcopy(self._date)
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            return CheckResult(
+                name=self.name,
+                severity=Severity.OK,
+                message=f"F&O bhavcopy available for {self._date.isoformat()}",
+                details={"date": self._date.isoformat()},
+                duration_ms=latency_ms,
+            )
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            is_missing = "404" in str(exc) or "Missing" in type(exc).__name__
+            return CheckResult(
+                name=self.name,
+                severity=Severity.FAIL,
+                message=(
+                    f"F&O bhavcopy not available for {self._date.isoformat()}: {exc}"
+                ),
+                details={"date": self._date.isoformat(), "error": str(exc)},
+                duration_ms=latency_ms,
             )

@@ -7,8 +7,9 @@ macro-alignment scores.
 """
 from __future__ import annotations
 
+import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import yfinance as yf
 from loguru import logger
@@ -47,8 +48,43 @@ def _fetch_ticker(symbol: str) -> dict:
     }
 
 
-async def collect() -> int:
-    """Collect macro data for all configured tickers. Returns count stored."""
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=15))
+def _fetch_ticker_historical(symbol: str, as_of: datetime) -> dict:
+    """Fetch historical price info for a yfinance ticker around as_of. Synchronous."""
+    start = (as_of - timedelta(days=5)).date()
+    end = (as_of + timedelta(days=1)).date()
+    hist = yf.Ticker(symbol).history(start=str(start), end=str(end))
+    if hist.empty:
+        return {"symbol": symbol, "price": None, "prev_close": None, "change_pct": None}
+    # Pick the row closest to as_of (last row on or before as_of).
+    # yfinance returns tz-naive IST for Indian tickers and tz-aware UTC for
+    # international ones.  Normalise both to UTC before comparing with as_of
+    # (which is always UTC throughout this codebase).
+    hist_utc = hist.copy()
+    if hist_utc.index.tzinfo is None:
+        # Tz-naive index — yfinance Indian tickers return midnight IST,
+        # so localize as IST then convert.
+        hist_utc.index = (
+            hist_utc.index
+            .tz_localize("Asia/Kolkata")
+            .tz_convert("UTC")
+        )
+    else:
+        hist_utc.index = hist_utc.index.tz_convert("UTC")
+    candidates = hist_utc[hist_utc.index <= as_of]
+    row = candidates.iloc[-1] if not candidates.empty else hist_utc.iloc[0]
+    price = float(row["Close"])
+    prev_close = float(hist_utc["Close"].iloc[-2]) if len(hist_utc) >= 2 else price
+    change_pct = round((price - prev_close) / prev_close * 100, 4) if prev_close else None
+    return {"symbol": symbol, "price": price, "prev_close": prev_close, "change_pct": change_pct}
+
+
+async def collect(as_of: datetime | None = None) -> int:
+    """Collect macro data for all configured tickers. Returns count stored.
+
+    When `as_of` is set, fetches historical data at that timestamp and stamps
+    fetched_at = as_of instead of now.
+    """
     async with session_scope() as session:
         result = await session.execute(
             select(DataSource).where(
@@ -62,20 +98,22 @@ async def collect() -> int:
         logger.warning("macro_collector: no active data source found — skipping")
         return 0
 
-    now = datetime.now(tz=timezone.utc)
+    stamp = as_of if as_of is not None else datetime.now(tz=timezone.utc)
     stored = 0
 
     for name, ticker_sym in _MACRO_TICKERS.items():
         try:
-            data = _fetch_ticker(ticker_sym)
+            if as_of is not None:
+                data = _fetch_ticker_historical(ticker_sym, as_of)
+            else:
+                data = _fetch_ticker(ticker_sym)
             price = data.get("price")
             prev = data.get("prev_close")
-            if price and prev and prev != 0:
+            if price and prev and prev != 0 and data.get("change_pct") is None:
                 data["change_pct"] = round((price - prev) / prev * 100, 4)
 
             content_json = json.dumps({"macro_name": name, **data})
-            import hashlib
-            h = hashlib.sha256(f"{name}:{now.isoformat()}".encode()).hexdigest()
+            h = hashlib.sha256(f"{name}:{stamp.isoformat()}".encode()).hexdigest()
 
             async with session_scope() as session:
                 session.add(RawContent(
@@ -85,7 +123,7 @@ async def collect() -> int:
                     content_text=content_json,
                     media_type="macro",
                     is_processed=True,
-                    fetched_at=now,
+                    fetched_at=stamp,
                 ))
             stored += 1
         except Exception as exc:

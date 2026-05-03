@@ -32,7 +32,7 @@ from src.runday.checks.connectivity import (
     NSECheck,
     TelegramCheck,
 )
-from src.runday.checks.data import BanListCheck, IVHistoryCoverageCheck, TierTableCheck, TradingDayCheck
+from src.runday.checks.data import BanListCheck, BhavcopyAvailableCheck, IVHistoryCoverageCheck, TierTableCheck, TradingDayCheck
 from src.runday.checks.pipeline import make_phase_check
 from src.runday.checks.schema import MigrationsCurrentCheck, RequiredTablesCheck, SeedDataCheck
 from src.runday.checks.trading import RiskCapCheck, TradingStatusCheck
@@ -68,12 +68,36 @@ def preflight(
     quiet: Annotated[bool, typer.Option("--quiet", "-q", help="Skip Telegram message")] = False,
     json: Annotated[bool, typer.Option("--json", help="Emit JSON instead of console output")] = False,
     skip: Annotated[Optional[list[str]], typer.Option("--skip", help="Skip a specific check (repeatable)")] = None,
+    profile: Annotated[str, typer.Option("--profile", help="Check profile: 'live' (default) or 'replay'")] = "live",
+    date_str: Annotated[Optional[str], typer.Option("--date", help="Target date for replay profile (YYYY-MM-DD)")] = None,
 ) -> None:
     """Pre-market sanity check. Run the night before or by 6 AM on trade day.
 
     Exits 0 (all green), 10 (warnings), or 20 (any failure).
+
+    Use --profile replay --date YYYY-MM-DD to check replay prerequisites.
     """
-    code = asyncio.run(_preflight_async(quiet=quiet, emit_json=json, skip=set(skip or [])))
+    target_date: date | None = None
+    if date_str:
+        try:
+            target_date = date.fromisoformat(date_str)
+        except ValueError:
+            _console.print(f"[red]Invalid --date '{date_str}'. Use YYYY-MM-DD format.[/red]")
+            raise SystemExit(1)
+
+    if profile not in ("live", "replay"):
+        _console.print(f"[red]Invalid --profile '{profile}'. Use 'live' or 'replay'.[/red]")
+        raise SystemExit(1)
+
+    code = asyncio.run(
+        _preflight_async(
+            quiet=quiet,
+            emit_json=json,
+            skip=set(skip or []),
+            profile=profile,
+            target_date=target_date,
+        )
+    )
     raise SystemExit(code)
 
 
@@ -81,6 +105,8 @@ async def _preflight_async(
     quiet: bool,
     emit_json: bool,
     skip: set[str],
+    profile: str = "live",
+    target_date: date | None = None,
 ) -> int:
     settings = get_runday_settings()
     telegram = TelegramReporter(settings)
@@ -88,21 +114,33 @@ async def _preflight_async(
     # Normalize skip names: accept either "dhan" or "preflight.dhan".
     skip = {s if s.startswith("preflight.") else f"preflight.{s}" for s in skip}
 
-    checks = [
-        EnvCheck(settings, skipped_checks=skip),
-        DBConnectivityCheck(settings),
-        MigrationsCurrentCheck(settings),
-        RequiredTablesCheck(settings),
-        SeedDataCheck(settings),
-        AnthropicCheck(settings),
-        TelegramCheck(settings, quiet=quiet),
-        AngelOneCheck(settings),
-        NSECheck(settings),
-        DhanCheck(settings),
-        GitHubCheck(settings),
-        TierTableCheck(settings),
-        TradingDayCheck(settings),
-    ]
+    if profile == "replay":
+        if target_date is None:
+            target_date = date.today()
+        checks = [
+            DBConnectivityCheck(settings),
+            MigrationsCurrentCheck(settings),
+            RequiredTablesCheck(settings),
+            AnthropicCheck(settings),
+            TradingDayCheck(settings, anchor_date=target_date),
+            BhavcopyAvailableCheck(settings, target_date),
+        ]
+    else:
+        checks = [
+            EnvCheck(settings, skipped_checks=skip),
+            DBConnectivityCheck(settings),
+            MigrationsCurrentCheck(settings),
+            RequiredTablesCheck(settings),
+            SeedDataCheck(settings),
+            AnthropicCheck(settings),
+            TelegramCheck(settings, quiet=quiet),
+            AngelOneCheck(settings),
+            NSECheck(settings),
+            DhanCheck(settings),
+            GitHubCheck(settings),
+            TierTableCheck(settings),
+            TradingDayCheck(settings),
+        ]
 
     results: list[CheckResult] = []
     for check in checks:
@@ -134,16 +172,19 @@ async def _preflight_async(
     if emit_json:
         print(json_out.emit_results(results))
     else:
-        console_reporter.render_check_list(results, title="laabh-runday preflight")
+        title = f"laabh-runday preflight ({profile})"
+        console_reporter.render_check_list(results, title=title)
         console_reporter.render_summary_line(results)
 
     code = exit_code_for(results)
 
-    any_fail = any(r.severity == Severity.FAIL for r in results)
-    if any_fail:
-        await telegram.send_preflight_fail(results)
-    elif settings.runday_telegram_on_preflight_ok and not quiet:
-        await telegram.send_preflight_ok(results)
+    # Only send Telegram for live preflight failures (replay is local-only)
+    if profile == "live":
+        any_fail = any(r.severity == Severity.FAIL for r in results)
+        if any_fail:
+            await telegram.send_preflight_fail(results)
+        elif settings.runday_telegram_on_preflight_ok and not quiet:
+            await telegram.send_preflight_ok(results)
 
     return code
 
@@ -689,6 +730,97 @@ def _render_report_console(data: dict) -> None:
         _console.print()
     else:
         _console.print("[green]No surprises detected.[/green]")
+
+
+# ---------------------------------------------------------------------------
+# replay
+# ---------------------------------------------------------------------------
+
+@app.command()
+def replay(
+    date_str: Annotated[str, typer.Option("--date", help="Replay date YYYY-MM-DD")] = "",
+    mock_llm: Annotated[bool, typer.Option("--mock-llm/--live-llm", help="Use cached LLM results (default: mock)")] = True,
+    out: Annotated[str, typer.Option("--out", help="Output directory for the report")] = "reports",
+    json_out_flag: Annotated[bool, typer.Option("--json", help="Emit structured JSON to stdout")] = False,
+) -> None:
+    """Replay the full F&O daily routine for a historical date.
+
+    Exits 0 (clean), 10 (gate WARN), 20 (gate FAIL).
+    """
+    if not date_str:
+        _console.print("[red]--date is required for replay (e.g. --date 2026-04-23)[/red]")
+        raise SystemExit(1)
+
+    try:
+        target_date = date.fromisoformat(date_str)
+    except ValueError:
+        _console.print(f"[red]Invalid --date '{date_str}'. Use YYYY-MM-DD format.[/red]")
+        raise SystemExit(1)
+
+    code = asyncio.run(_replay_async(target_date=target_date, mock_llm=mock_llm, out_dir=out, emit_json=json_out_flag))
+    raise SystemExit(code)
+
+
+async def _replay_async(
+    target_date: date,
+    mock_llm: bool,
+    out_dir: str,
+    emit_json: bool,
+) -> int:
+    import uuid as _uuid
+    from src.dryrun.orchestrator import ReplayGateFailed, replay as _replay
+    from src.runday.checks.base import Severity
+    from src.runday.scripts.daily_report import build_report, format_markdown_report
+
+    run_id = _uuid.uuid4()
+    _console.print(f"[bold]Replaying {target_date.isoformat()}[/bold] run_id={str(run_id)[:8]}")
+
+    try:
+        result = await _replay(target_date, mock_llm=mock_llm, run_id=run_id)
+    except ReplayGateFailed as exc:
+        _console.print(f"[red]Replay gate FAILED: {exc}[/red]")
+        return 20
+    except Exception as exc:
+        _console.print(f"[red]Replay error: {exc}[/red]")
+        return 20
+
+    # Build and write the report
+    data = await build_report(target_date, dryrun_run_id=run_id)
+
+    run_short = str(run_id)[:8]
+    md_path: str | None = None
+    if out_dir:
+        from pathlib import Path
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        md_path = str(out_path / f"replay-{target_date.isoformat()}-{run_short}.md")
+        Path(md_path).write_text(format_markdown_report(data), encoding="utf-8")
+        _console.print(f"Report: [bold]{md_path}[/bold]")
+
+    # Determine exit code from gate results regardless of output format
+    if result.gates_failed:
+        exit_code = 20
+    elif result.gates_warned:
+        exit_code = 10
+    else:
+        exit_code = 0
+
+    if emit_json:
+        print(json_out.emit_report(data))
+        return exit_code
+
+    _render_report_console(data)
+
+    # Show captured side-effects
+    captures = result.captures
+    telegram_count = sum(1 for c in captures if c.get("type") == "telegram")
+    _console.print(f"\n[cyan]Captured Telegrams: {telegram_count} (suppressed)[/cyan]")
+    if result.gates_failed:
+        _console.print(f"[red]Gates failed: {', '.join(result.gates_failed)}[/red]")
+    if result.gates_warned:
+        _console.print(f"[yellow]Gates warned: {', '.join(result.gates_warned)}[/yellow]")
+
+    return exit_code
 
 
 def main() -> None:

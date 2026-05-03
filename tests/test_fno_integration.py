@@ -443,6 +443,7 @@ async def test_collect_one_nse_ok_persists_with_nse_source() -> None:
         patch("src.fno.chain_collector._record_source_success", new_callable=AsyncMock),
         patch("src.fno.chain_collector._record_source_error", new_callable=AsyncMock),
     ):
+        mock_nse.name = "nse"
         mock_nse.fetch = AsyncMock(return_value=snapshot)
 
         from src.fno.chain_collector import collect_one
@@ -627,7 +628,7 @@ async def test_collect_all_calls_collect_one_per_instrument() -> None:
 
     call_log: list[str] = []
 
-    async def fake_collect_one(inst):
+    async def fake_collect_one(inst, **kwargs):
         call_log.append(inst.symbol)
 
     with (

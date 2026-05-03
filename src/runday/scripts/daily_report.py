@@ -1,6 +1,7 @@
 """End-of-day rollup queries for laabh-runday report."""
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -9,8 +10,15 @@ from sqlalchemy import text
 from src.db import session_scope
 
 
-async def build_report(report_date: date) -> dict[str, Any]:
+async def build_report(
+    report_date: date,
+    *,
+    dryrun_run_id: "uuid.UUID | None" = None,
+) -> dict[str, Any]:
     """Query all relevant tables and assemble the daily report dict.
+
+    When dryrun_run_id is provided, every query filters to that run only.
+    When None (default), queries return live-path data (dryrun_run_id IS NULL).
 
     Reads from: chain_collection_log, fno_signals, fno_candidates,
                 llm_audit_log, notifications, source_health, job_log, vix_ticks.
@@ -18,22 +26,31 @@ async def build_report(report_date: date) -> dict[str, Any]:
     """
     today = report_date
 
+    # Build SQL snippet and params for dryrun_run_id filtering
+    if dryrun_run_id is not None:
+        run_filter = "AND dryrun_run_id = :dryrun_run_id"
+        run_params: dict = {"dryrun_run_id": str(dryrun_run_id)}
+    else:
+        run_filter = "AND dryrun_run_id IS NULL"
+        run_params = {}
+
     async with session_scope() as session:
         # ---------------------------------------------------------------
         # 1. Pipeline completeness
         # ---------------------------------------------------------------
         jobs_result = await session.execute(
             text(
-                """
+                f"""
                 SELECT job_name, status, COUNT(*) as runs,
                        MAX(created_at) as last_run
                 FROM job_log
                 WHERE DATE(created_at AT TIME ZONE 'UTC') = :today
+                {run_filter}
                 GROUP BY job_name, status
                 ORDER BY last_run DESC
                 """
             ),
-            {"today": today.isoformat()},
+            {"today": today.isoformat(), **run_params},
         )
         job_rows = jobs_result.fetchall()
 
@@ -42,7 +59,7 @@ async def build_report(report_date: date) -> dict[str, Any]:
         # ---------------------------------------------------------------
         chain_result = await session.execute(
             text(
-                """
+                f"""
                 SELECT
                     status,
                     COUNT(*) as cnt,
@@ -50,22 +67,24 @@ async def build_report(report_date: date) -> dict[str, Any]:
                     PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) as p95_lat
                 FROM chain_collection_log
                 WHERE DATE(attempted_at AT TIME ZONE 'UTC') = :today
+                {run_filter}
                 GROUP BY status
                 """
             ),
-            {"today": today.isoformat()},
+            {"today": today.isoformat(), **run_params},
         )
         chain_rows = chain_result.fetchall()
 
         nse_share_result = await session.execute(
             text(
-                """
+                f"""
                 SELECT COUNT(*) FROM chain_collection_log
                 WHERE DATE(attempted_at AT TIME ZONE 'UTC') = :today
                 AND final_source = 'nse'
+                {run_filter}
                 """
             ),
-            {"today": today.isoformat()},
+            {"today": today.isoformat(), **run_params},
         )
         nse_count = nse_share_result.scalar() or 0
 
@@ -88,15 +107,16 @@ async def build_report(report_date: date) -> dict[str, Any]:
         # ---------------------------------------------------------------
         llm_result = await session.execute(
             text(
-                """
+                f"""
                 SELECT caller, COUNT(*), SUM(tokens_in), SUM(tokens_out),
                        AVG(latency_ms), PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms)
                 FROM llm_audit_log
                 WHERE DATE(created_at AT TIME ZONE 'UTC') = :today
+                {run_filter}
                 GROUP BY caller
                 """
             ),
-            {"today": today.isoformat()},
+            {"today": today.isoformat(), **run_params},
         )
         llm_rows = llm_result.fetchall()
 
@@ -105,7 +125,7 @@ async def build_report(report_date: date) -> dict[str, Any]:
         # ---------------------------------------------------------------
         signals_result = await session.execute(
             text(
-                """
+                f"""
                 SELECT
                     strategy_type,
                     status,
@@ -114,18 +134,19 @@ async def build_report(report_date: date) -> dict[str, Any]:
                     AVG(EXTRACT(EPOCH FROM (closed_at - filled_at))/60) as avg_hold_min
                 FROM fno_signals
                 WHERE DATE(proposed_at AT TIME ZONE 'UTC') = :today
+                {run_filter}
                 GROUP BY strategy_type, status
                 ORDER BY strategy_type, status
                 """
             ),
-            {"today": today.isoformat()},
+            {"today": today.isoformat(), **run_params},
         )
         signal_rows = signals_result.fetchall()
 
         # Decision quality: closed signals with thesis
         quality_result = await session.execute(
             text(
-                """
+                f"""
                 SELECT
                     i.symbol,
                     fc.llm_thesis,
@@ -138,11 +159,12 @@ async def build_report(report_date: date) -> dict[str, Any]:
                 WHERE DATE(fs.proposed_at AT TIME ZONE 'UTC') = :today
                 AND fs.status LIKE 'closed%'
                 AND fc.llm_thesis IS NOT NULL
+                AND fs.dryrun_run_id {'= :dryrun_run_id' if dryrun_run_id else 'IS NULL'}
                 ORDER BY fs.final_pnl DESC NULLS LAST
                 LIMIT 20
                 """
             ),
-            {"today": today.isoformat()},
+            {"today": today.isoformat(), **run_params},
         )
         quality_rows = quality_result.fetchall()
 
@@ -151,13 +173,14 @@ async def build_report(report_date: date) -> dict[str, Any]:
         # ---------------------------------------------------------------
         vix_result = await session.execute(
             text(
-                """
+                f"""
                 SELECT COUNT(*), AVG(vix_value), MIN(vix_value), MAX(vix_value)
                 FROM vix_ticks
                 WHERE DATE(timestamp AT TIME ZONE 'UTC') = :today
+                {run_filter}
                 """
             ),
-            {"today": today.isoformat()},
+            {"today": today.isoformat(), **run_params},
         )
         vix_row = vix_result.fetchone()
 
@@ -166,10 +189,10 @@ async def build_report(report_date: date) -> dict[str, Any]:
         # ---------------------------------------------------------------
         candidates_result = await session.execute(
             text(
-                "SELECT phase, COUNT(*) FROM fno_candidates "
-                "WHERE run_date = :today GROUP BY phase"
+                f"SELECT phase, COUNT(*) FROM fno_candidates "
+                f"WHERE run_date = :today {run_filter} GROUP BY phase"
             ),
-            {"today": today.isoformat()},
+            {"today": today.isoformat(), **run_params},
         )
         candidate_rows = {r[0]: r[1] for r in candidates_result.fetchall()}
 

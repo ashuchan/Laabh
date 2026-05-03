@@ -128,11 +128,16 @@ async def _get_fno_instruments(session) -> list[tuple[str, str]]:
 async def _get_atm_chain_row(
     session,
     instrument_id: str,
+    *,
+    as_of: datetime | None = None,
 ) -> tuple[int | None, float | None]:
-    """Return (atm_oi, atm_spread_pct) from latest chain snapshot."""
+    """Return (atm_oi, atm_spread_pct) from latest chain snapshot on or before as_of."""
+    where_clauses = [OptionsChain.instrument_id == instrument_id]
+    if as_of is not None:
+        where_clauses.append(OptionsChain.snapshot_at <= as_of)
     snap_subq = (
         select(func.max(OptionsChain.snapshot_at))
-        .where(OptionsChain.instrument_id == instrument_id)
+        .where(*where_clauses)
         .scalar_subquery()
     )
 
@@ -181,12 +186,19 @@ async def _get_atm_chain_row(
     return (atm_oi if atm_oi > 0 else None), spread
 
 
-async def _get_avg_volume_5d(session, instrument_id: str, as_of: date) -> int | None:
-    """Return 5-day average daily volume from price_daily."""
+async def _get_avg_volume_5d(
+    session,
+    instrument_id: str,
+    as_of: date,
+    *,
+    cutoff_date: date | None = None,
+) -> int | None:
+    """Return 5-day average daily volume from price_daily ending before cutoff_date."""
+    cutoff = cutoff_date if cutoff_date is not None else as_of
     result = await session.execute(
         select(func.avg(PriceDaily.volume)).where(
             PriceDaily.instrument_id == instrument_id,
-            PriceDaily.date < as_of,
+            PriceDaily.date < cutoff,
         ).order_by(PriceDaily.date.desc()).limit(5)
     )
     avg = result.scalar_one_or_none()
@@ -230,14 +242,19 @@ async def _upsert_candidate(
 # Public entry point
 # ---------------------------------------------------------------------------
 
-async def run_phase1(run_date: date | None = None) -> list[LiquidityResult]:
+async def run_phase1(
+    run_date: date | None = None,
+    *,
+    as_of: datetime | None = None,
+) -> list[LiquidityResult]:
     """Run Phase 1 liquidity filter for all F&O instruments.
 
     Returns a list of LiquidityResult for every instrument screened.
     Passing instruments get a phase=1 fno_candidates row written.
+    When `as_of` is set, chain queries use the snapshot on-or-before that timestamp.
     """
     if run_date is None:
-        run_date = date.today()
+        run_date = date.today() if as_of is None else as_of.date()
 
     cfg = _settings
     min_oi = cfg.fno_phase1_min_atm_oi
@@ -263,8 +280,8 @@ async def run_phase1(run_date: date | None = None) -> list[LiquidityResult]:
 
         try:
             async with session_scope() as session:
-                atm_oi, spread = await _get_atm_chain_row(session, inst_id)
-                avg_vol = await _get_avg_volume_5d(session, inst_id, run_date)
+                atm_oi, spread = await _get_atm_chain_row(session, inst_id, as_of=as_of)
+                avg_vol = await _get_avg_volume_5d(session, inst_id, run_date, cutoff_date=run_date)
 
             passed, fail_reason = apply_liquidity_filter(
                 atm_oi, spread, avg_vol,

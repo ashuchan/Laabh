@@ -317,6 +317,67 @@ pass if pipeline completed before the degradation.
 
 ---
 
+## replay — Historical Dry-Run
+
+Replay the full F&O daily routine for any historical trading date without
+any real-world side effects. See [`docs/dryrun_runbook.md`](dryrun_runbook.md) for the
+complete operator guide.
+
+### Quick Reference
+
+```bash
+# Check replay prerequisites for a date
+laabh-runday preflight --profile replay --date 2026-04-23
+
+# Run the replay
+laabh-runday replay --date 2026-04-23 --mock-llm --out reports/
+```
+
+### `preflight --profile` comparison
+
+| Check | `--profile live` | `--profile replay` |
+|-------|-----------------|-------------------|
+| Env vars | ✅ | — |
+| DB connectivity | ✅ | ✅ |
+| Migrations current | ✅ | ✅ |
+| Required tables | ✅ | ✅ |
+| Anthropic API | ✅ | ✅ |
+| Telegram | ✅ | — |
+| Angel One | ✅ | — |
+| NSE cookie | ✅ | — |
+| Dhan live | ✅ | — |
+| GitHub | ✅ | — |
+| Tier table | ✅ | — |
+| Trading day | ✅ | ✅ |
+| Bhavcopy available | — | ✅ |
+
+### `replay` flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--date` | (required) | Historical trading date YYYY-MM-DD |
+| `--mock-llm` | true | Re-use cached LLM prompts |
+| `--live-llm` | — | Force fresh Anthropic calls |
+| `--out` | `reports/` | Output directory |
+| `--json` | false | Structured JSON to stdout |
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | All gates passed |
+| 10 | Gate WARN (replay completed with warnings) |
+| 20 | Gate FAIL (replay aborted) |
+
+### Suggested use after a failed live day
+
+```bash
+# After a failed live day, replay with the next day's config to inspect decisions
+laabh-runday replay --date <failed-date> --mock-llm
+```
+
+---
+
 ## Testing
 
 ```bash

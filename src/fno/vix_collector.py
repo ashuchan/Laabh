@@ -1,7 +1,9 @@
 """India VIX collector — fetches live VIX from Angel One and classifies regime."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -52,21 +54,56 @@ async def _fetch_vix_from_angel_one() -> float:
     return float(ltp_data["data"]["ltp"])
 
 
-async def run_once(vix_override: float | None = None) -> VIXTick:
+async def _fetch_vix_historical(as_of: datetime) -> float:
+    """Fetch India VIX from yfinance for a historical timestamp."""
+    import asyncio
+
+    def _sync_fetch() -> float:
+        import yfinance as yf
+        start = (as_of - timedelta(days=3)).date()
+        end = (as_of + timedelta(days=1)).date()
+        hist = yf.Ticker("^INDIAVIX").history(start=str(start), end=str(end))
+        if hist.empty:
+            raise RuntimeError(f"No VIX history from yfinance for {as_of.date()}")
+        # Pick the row closest to as_of
+        hist.index = hist.index.tz_localize("Asia/Kolkata") if hist.index.tzinfo is None else hist.index.tz_convert("Asia/Kolkata")
+        as_of_ist = as_of.astimezone(__import__("pytz").timezone("Asia/Kolkata"))
+        candidates = hist[hist.index <= as_of_ist]
+        if candidates.empty:
+            return float(hist["Close"].iloc[0])
+        return float(candidates["Close"].iloc[-1])
+
+    return await asyncio.get_running_loop().run_in_executor(None, _sync_fetch)
+
+
+async def run_once(
+    vix_override: float | None = None,
+    *,
+    as_of: datetime | None = None,
+    dryrun_run_id: uuid.UUID | None = None,
+) -> VIXTick:
     """Fetch VIX, classify regime, persist to vix_ticks, and return the row.
 
     Pass `vix_override` in tests to skip the live API call.
+    When `as_of` is set, fetches historical VIX from yfinance at that timestamp.
     """
     if vix_override is not None:
         vix_value = vix_override
+    elif as_of is not None:
+        vix_value = await _fetch_vix_historical(as_of)
     else:
         vix_value = await _fetch_vix_from_angel_one()
 
     regime = classify_regime(vix_value)
-    now = datetime.now(tz=timezone.utc)
+    stamp = as_of if as_of is not None else datetime.now(tz=timezone.utc)
 
     async with session_scope() as session:
-        row = VIXTick(timestamp=now, vix_value=vix_value, regime=regime)
+        row = VIXTick(
+            timestamp=stamp,
+            vix_value=vix_value,
+            regime=regime,
+            dryrun_run_id=dryrun_run_id,
+        )
         session.add(row)
 
     logger.info(f"vix_collector: VIX={vix_value:.2f} regime={regime}")

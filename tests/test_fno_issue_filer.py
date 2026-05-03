@@ -57,18 +57,19 @@ async def test_same_group_creates_one_github_issue():
         created_issues.append({"title": title, "body": body})
         return "https://github.com/ashuchan/Laabh/issues/1"
 
+    mock_gw = MagicMock()
+    mock_gw.send_telegram = AsyncMock()
+
     with (
         patch("src.fno.issue_filer.session_scope", return_value=ctx),
         patch("src.fno.issue_filer._search_issues", new_callable=AsyncMock, return_value=[]),
         patch("src.fno.issue_filer._create_issue", side_effect=fake_create),
-        patch("src.fno.issue_filer._send_telegram", new_callable=AsyncMock),
+        patch("src.fno.issue_filer.get_gateway", return_value=mock_gw),
         patch("src.fno.issue_filer._settings") as ms,
     ):
         ms.github_token = "tok"
         ms.github_repo = "ashuchan/Laabh"
         ms.github_issue_labels = "bug,chain-collector"
-        ms.telegram_bot_token = ""
-        ms.telegram_chat_id = ""
 
         from src.fno.issue_filer import run
         await run()
@@ -114,14 +115,12 @@ async def test_rerun_with_same_data_does_not_create_second_issue():
             "src.fno.issue_filer._create_issue",
             side_effect=lambda *a, **k: created_issues.append(1),
         ),
-        patch("src.fno.issue_filer._send_telegram", new_callable=AsyncMock),
+        patch("src.fno.issue_filer.get_gateway", return_value=MagicMock(send_telegram=AsyncMock())),
         patch("src.fno.issue_filer._settings") as ms,
     ):
         ms.github_token = "tok"
         ms.github_repo = "ashuchan/Laabh"
         ms.github_issue_labels = "bug"
-        ms.telegram_bot_token = ""
-        ms.telegram_chat_id = ""
 
         from src.fno.issue_filer import run
         await run()
@@ -155,14 +154,12 @@ async def test_different_underlying_creates_second_issue():
         patch("src.fno.issue_filer.session_scope", return_value=ctx),
         patch("src.fno.issue_filer._search_issues", new_callable=AsyncMock, return_value=[]),
         patch("src.fno.issue_filer._create_issue", side_effect=fake_create),
-        patch("src.fno.issue_filer._send_telegram", new_callable=AsyncMock),
+        patch("src.fno.issue_filer.get_gateway", return_value=MagicMock(send_telegram=AsyncMock())),
         patch("src.fno.issue_filer._settings") as ms,
     ):
         ms.github_token = "tok"
         ms.github_repo = "ashuchan/Laabh"
         ms.github_issue_labels = "bug"
-        ms.telegram_bot_token = ""
-        ms.telegram_chat_id = ""
 
         from src.fno.issue_filer import run
         await run()
@@ -190,19 +187,17 @@ async def test_missing_github_token_still_sends_telegram():
 
     telegram_calls: list[str] = []
 
-    async def fake_telegram(msg: str) -> None:
-        telegram_calls.append(msg)
+    mock_gw = MagicMock()
+    mock_gw.send_telegram = AsyncMock(side_effect=lambda msg: telegram_calls.append(msg))
 
     with (
         patch("src.fno.issue_filer.session_scope", return_value=ctx),
-        patch("src.fno.issue_filer._send_telegram", side_effect=fake_telegram),
+        patch("src.fno.issue_filer.get_gateway", return_value=mock_gw),
         patch("src.fno.issue_filer._settings") as ms,
     ):
         ms.github_token = ""  # missing token
         ms.github_repo = "ashuchan/Laabh"
         ms.github_issue_labels = "bug"
-        ms.telegram_bot_token = "tgbot"
-        ms.telegram_chat_id = "1234"
 
         from src.fno.issue_filer import run
         await run()
@@ -228,19 +223,17 @@ async def test_no_issues_sends_clean_telegram():
 
     telegram_msgs: list[str] = []
 
-    async def fake_telegram(msg: str) -> None:
-        telegram_msgs.append(msg)
+    mock_gw = MagicMock()
+    mock_gw.send_telegram = AsyncMock(side_effect=lambda msg: telegram_msgs.append(msg))
 
     with (
         patch("src.fno.issue_filer.session_scope", return_value=ctx),
-        patch("src.fno.issue_filer._send_telegram", side_effect=fake_telegram),
+        patch("src.fno.issue_filer.get_gateway", return_value=mock_gw),
         patch("src.fno.issue_filer._settings") as ms,
     ):
         ms.github_token = "tok"
         ms.github_repo = "ashuchan/Laabh"
         ms.github_issue_labels = "bug"
-        ms.telegram_bot_token = "tgbot"
-        ms.telegram_chat_id = "1234"
 
         from src.fno.issue_filer import run
         await run()

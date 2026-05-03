@@ -204,3 +204,4 @@ After Phase 1, running `python -m src.main` should:
 - Each collector must be independently testable
 - Use `tenacity.retry` for all external API calls with exponential backoff
 - Keep the extraction prompt in `prompts.py` as a versioned constant
+- Every new pipeline-mutating function must accept `as_of: datetime | None = None` and `dryrun_run_id: uuid.UUID | None = None` parameters by convention (defaults keep live behavior unchanged)

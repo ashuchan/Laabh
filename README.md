@@ -97,6 +97,11 @@ A personal-use system that:
 - Tailscale VPN for secure access
 - **Estimated time: 3-4 weeks**
 
+### F&O Dry-Run Replay (CLAUDE-PHASE-DRYRUN.md)
+- Replay the full F&O pipeline for any historical date using Dhan historical data
+- All Telegram/GitHub side-effects suppressed; captured in replay report
+- See [`docs/dryrun_runbook.md`](docs/dryrun_runbook.md) for operator guide
+
 ---
 
 ## How Real-Time Stock Data Works

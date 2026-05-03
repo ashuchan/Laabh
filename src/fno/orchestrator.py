@@ -34,10 +34,14 @@ from src.fno.vix_collector import run_once as collect_vix
 _settings = Settings()
 
 
-async def run_premarket_pipeline(run_date: date | None = None) -> dict:
+async def run_premarket_pipeline(
+    run_date: date | None = None,
+    *,
+    as_of: "datetime | None" = None,
+) -> dict:
     """Run Phases 1-3 and return summary counts."""
     if run_date is None:
-        run_date = date.today()
+        run_date = date.today() if as_of is None else as_of.date()
 
     if not _settings.fno_module_enabled:
         logger.info("fno.orchestrator: F&O module disabled — skipping premarket pipeline")
@@ -45,8 +49,8 @@ async def run_premarket_pipeline(run_date: date | None = None) -> dict:
 
     logger.info(f"fno.orchestrator: starting premarket pipeline for {run_date}")
 
-    # Phase 1: liquidity filter
-    phase1_results = await run_phase1(run_date)
+    # Phase 1: liquidity filter — pass as_of so chain queries are bounded to the replay time
+    phase1_results = await run_phase1(run_date, as_of=as_of)
     phase1_passed = sum(1 for r in phase1_results if r.passed)
     logger.info(f"fno.orchestrator: Phase 1 → {phase1_passed}/{len(phase1_results)} passed")
 
@@ -115,15 +119,7 @@ async def run_eod_tasks(run_date: date | None = None) -> None:
 
 async def _send_daily_summary(run_date: date) -> None:
     from src.fno.notifications import format_daily_summary
-    from src.services.notification_service import NotificationService
-
-    from sqlalchemy import select
-    from src.db import session_scope
-    from src.models.fno_candidate import FNOCandidate
-
-    async with session_scope() as session:
-        def _count(phase, passed_field=None):
-            return 0  # placeholder — counts come from pipeline run results
+    from src.services.side_effect_gateway import get_gateway
 
     summary_msg = format_daily_summary(
         run_date=run_date.isoformat(),
@@ -133,6 +129,5 @@ async def _send_daily_summary(run_date: date) -> None:
         trades_entered=0,
         net_pnl=Decimal("0"),
     )
-    svc = NotificationService()
-    await svc.send_text(summary_msg)
+    await get_gateway().send_telegram(summary_msg)
     logger.info("fno.orchestrator: daily summary notification sent")

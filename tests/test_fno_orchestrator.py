@@ -126,7 +126,7 @@ async def test_premarket_uses_today_when_no_date_given() -> None:
 
     captured = {}
 
-    async def _mock_p1(run_date):
+    async def _mock_p1(run_date, *, as_of=None):
         captured["run_date"] = run_date
         return []
 
