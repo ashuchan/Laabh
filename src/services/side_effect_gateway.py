@@ -72,7 +72,7 @@ class LiveGateway:
         from src.fno.issue_filer import _create_issue  # type: ignore[attr-defined]
         import httpx
         async with httpx.AsyncClient(timeout=30) as client:
-            url = await _create_issue(client, title, body, labels or [])
+            url = await _create_issue(client, title, body)
         return url or ""
 
     def record_capture(self) -> list[dict]:

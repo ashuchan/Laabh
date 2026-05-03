@@ -70,7 +70,7 @@ async def test_fetch_returns_chain_snapshot(tmp_path):
 
     candles = _make_candles(as_of)
 
-    async def fake_fetch_candles(sec_id, as_of_dt):
+    async def fake_fetch_candles(sec_id, as_of_dt, symbol=""):
         return candles
 
     source._fetch_candles = fake_fetch_candles

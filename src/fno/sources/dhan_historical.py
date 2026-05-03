@@ -165,7 +165,7 @@ class DhanHistoricalSource(BaseChainSource):
         # Fallback: return None and use bhavcopy close price
         return None
 
-    async def _fetch_candles(self, security_id: str, as_of: datetime) -> list[dict]:
+    async def _fetch_candles(self, security_id: str, as_of: datetime, symbol: str = "") -> list[dict]:
         """Fetch 5-min intraday candles with OI for a security_id, with disk cache."""
         cache_file = self._cache_dir / f"{security_id}_{_CANDLE_INTERVAL}.json"
         if cache_file.exists():
@@ -183,9 +183,10 @@ class DhanHistoricalSource(BaseChainSource):
             self._replay_date.year, self._replay_date.month, self._replay_date.day,
             15, 30, 0
         ))
+        segment = self._segment_for(symbol) if symbol else _SEG_EQUITY
         payload = {
             "securityId": security_id,
-            "exchangeSegment": _SEG_EQUITY,
+            "exchangeSegment": segment,
             "instrument": "OPTIDX",
             "interval": _CANDLE_INTERVAL,
             "oi": True,
@@ -193,13 +194,13 @@ class DhanHistoricalSource(BaseChainSource):
             "toDate": to_ist.strftime("%Y-%m-%d %H:%M:%S"),
         }
         async with self._semaphore:
-            async with self._client_instance() as client:
-                resp = await client.post(
-                    _DHAN_INTRADAY_URL,
-                    headers=self._headers(),
-                    json=payload,
-                    timeout=20,
-                )
+            client = self._client_instance()
+            resp = await client.post(
+                _DHAN_INTRADAY_URL,
+                headers=self._headers(),
+                json=payload,
+                timeout=20,
+            )
         if resp.status_code in (401, 403):
             raise AuthError(f"Dhan auth failed: {resp.status_code}")
         if resp.status_code != 200:
@@ -289,7 +290,7 @@ class DhanHistoricalSource(BaseChainSource):
         sec_ids_needed = [sec_id for _, _, _, sec_id in rows_to_process if sec_id]
         candles_by_sec: dict[str, list[dict]] = {}
         fetch_tasks = {
-            sec_id: asyncio.create_task(self._fetch_candles(sec_id, as_of))
+            sec_id: asyncio.create_task(self._fetch_candles(sec_id, as_of, symbol))
             for sec_id in set(sec_ids_needed)
         }
         for sec_id, task in fetch_tasks.items():

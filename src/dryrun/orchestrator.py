@@ -230,6 +230,7 @@ async def _run_replay(
     hard_exit_check = make_phase_check("hard-exit", settings, D)
     cr = await hard_exit_check.run()
     if cr.severity == Severity.FAIL:
+        result.success = False
         result.gates_failed.append("stage4.hard_exit")
     elif cr.severity == Severity.WARN:
         result.gates_warned.append("stage4.hard_exit")
@@ -248,7 +249,12 @@ async def _run_replay(
             logger.debug(f"dryrun: no check registered for {eod_phase} — skipping gate")
             continue
         cr = await check.run()
-        if cr.severity != Severity.FAIL:
+        if cr.severity == Severity.FAIL:
+            result.success = False
+            result.gates_failed.append(f"stage5.{eod_phase}")
+        elif cr.severity == Severity.WARN:
+            result.gates_warned.append(f"stage5.{eod_phase}")
+        else:
             result.gates_passed.append(f"stage5.{eod_phase}")
 
     logger.info(
