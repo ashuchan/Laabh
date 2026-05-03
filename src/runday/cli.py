@@ -11,8 +11,14 @@ from typing import Annotated, Optional
 
 import pytz
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.live import Live
+
+# Load .env from the repo root so EnvCheck and other os.environ readers see
+# values the user keeps in their .env file. override=False respects vars
+# already set in the shell.
+load_dotenv(override=False)
 
 from src.runday.checks.audit import LLMAuditCheck
 from src.runday.checks.chain import ChainCollectionHealthCheck, OpenIssuesCheck, SourceHealthCheck, get_tier_breakdown
@@ -79,8 +85,11 @@ async def _preflight_async(
     settings = get_runday_settings()
     telegram = TelegramReporter(settings)
 
+    # Normalize skip names: accept either "dhan" or "preflight.dhan".
+    skip = {s if s.startswith("preflight.") else f"preflight.{s}" for s in skip}
+
     checks = [
-        EnvCheck(settings),
+        EnvCheck(settings, skipped_checks=skip),
         DBConnectivityCheck(settings),
         MigrationsCurrentCheck(settings),
         RequiredTablesCheck(settings),

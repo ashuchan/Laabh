@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
 from typing import Sequence
 
@@ -43,14 +44,16 @@ class MigrationsCurrentCheck:
     async def run(self) -> CheckResult:
         t0 = time.monotonic()
         try:
+            # Invoke alembic via the current interpreter so we don't depend on
+            # PATH (Windows venvs often don't export Scripts/ to the parent shell).
             heads_proc = subprocess.run(
-                ["alembic", "heads"],
+                [sys.executable, "-m", "alembic", "heads"],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
             current_proc = subprocess.run(
-                ["alembic", "current"],
+                [sys.executable, "-m", "alembic", "current"],
                 capture_output=True,
                 text=True,
                 timeout=30,

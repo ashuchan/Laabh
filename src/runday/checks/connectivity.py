@@ -13,31 +13,43 @@ from src.db import get_engine
 from src.runday.checks.base import CheckResult, Severity
 from src.runday.config import RundaySettings
 
-_REQUIRED_ENV_VARS = [
-    "DATABASE_URL",
-    "ANTHROPIC_API_KEY",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
-    "ANGEL_ONE_API_KEY",
-    "ANGEL_ONE_CLIENT_ID",
-    "ANGEL_ONE_PASSWORD",
-    "ANGEL_ONE_TOTP_SECRET",
-    "DHAN_CLIENT_ID",
-    "DHAN_ACCESS_TOKEN",
-    "GITHUB_TOKEN",
-]
+# Env vars required by each connectivity check. When a check is skipped via
+# --skip, its env vars are dropped from EnvCheck's required list.
+_ENV_VARS_BY_CHECK: dict[str, list[str]] = {
+    "preflight.db_connectivity": ["DATABASE_URL"],
+    "preflight.anthropic": ["ANTHROPIC_API_KEY"],
+    "preflight.telegram": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"],
+    "preflight.angel_one": [
+        "ANGEL_ONE_API_KEY",
+        "ANGEL_ONE_CLIENT_ID",
+        "ANGEL_ONE_PASSWORD",
+        "ANGEL_ONE_TOTP_SECRET",
+    ],
+    "preflight.dhan": ["DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN"],
+    "preflight.github": ["GITHUB_TOKEN"],
+}
 
 
 class EnvCheck:
-    """Verify all required environment variables are present and non-empty."""
+    """Verify required env vars are present, excluding those for skipped checks."""
 
     name = "preflight.env"
 
-    def __init__(self, settings: RundaySettings) -> None:
+    def __init__(
+        self,
+        settings: RundaySettings,
+        skipped_checks: set[str] | None = None,
+    ) -> None:
         self._settings = settings
+        self._skipped = skipped_checks or set()
 
     async def run(self) -> CheckResult:
-        missing = [v for v in _REQUIRED_ENV_VARS if not os.environ.get(v)]
+        required: list[str] = []
+        for check_name, env_vars in _ENV_VARS_BY_CHECK.items():
+            if check_name in self._skipped:
+                continue
+            required.extend(env_vars)
+        missing = [v for v in required if not os.environ.get(v)]
         if missing:
             return CheckResult(
                 name=self.name,
@@ -48,7 +60,7 @@ class EnvCheck:
         return CheckResult(
             name=self.name,
             severity=Severity.OK,
-            message=f"All {len(_REQUIRED_ENV_VARS)} required env vars present",
+            message=f"All {len(required)} required env vars present",
         )
 
 

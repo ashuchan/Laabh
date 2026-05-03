@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     # --- Anthropic ---
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     anthropic_model: str = Field(
-        default="claude-sonnet-4-20250514", alias="ANTHROPIC_MODEL"
+        default="claude-haiku-4-5-20251001", alias="ANTHROPIC_MODEL"
     )
 
     # --- Telegram ---
