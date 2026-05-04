@@ -1,0 +1,14 @@
+{
+  "name": "laabh-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev:desktop": "pnpm --filter @laabh/desktop dev",
+    "build:desktop": "pnpm --filter @laabh/desktop build",
+    "build:shared": "pnpm --filter @laabh/shared build",
+    "type-check": "pnpm --filter @laabh/shared type-check && pnpm --filter @laabh/desktop type-check"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}

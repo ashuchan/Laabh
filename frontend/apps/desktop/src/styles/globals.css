@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --color-bg: #0a0a0a;
+    --color-surface: #161616;
+    --color-surface-elevated: #1e1e1e;
+    --color-border: #2a2a2a;
+    --color-text: #f0f0f0;
+    --color-text-secondary: #888;
+    --color-text-muted: #555;
+    --color-profit: #26a69a;
+    --color-profit-light: #1a3a38;
+    --color-loss: #ef5350;
+    --color-loss-light: #3a1a1a;
+    --color-buy: #26a69a;
+    --color-sell: #ef5350;
+    --color-hold: #ff9800;
+    --color-watch: #5c6bc0;
+    --color-primary: #5c6bc0;
+    --color-accent: #42a5f5;
+    --color-critical: #ef5350;
+    --color-high: #ff9800;
+    --color-medium: #42a5f5;
+    --color-low: #888;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body, #root {
+    height: 100%;
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-family: ui-monospace, 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 13px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--color-text-muted); }
+}
+
+@theme {
+  --color-bg: var(--color-bg);
+  --color-surface: var(--color-surface);
+  --color-surface-elevated: var(--color-surface-elevated);
+  --color-border: var(--color-border);
+  --color-text: var(--color-text);
+  --color-text-secondary: var(--color-text-secondary);
+  --color-text-muted: var(--color-text-muted);
+  --color-profit: var(--color-profit);
+  --color-loss: var(--color-loss);
+  --color-primary: var(--color-primary);
+  --color-accent: var(--color-accent);
+}
