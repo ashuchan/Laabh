@@ -1,6 +1,16 @@
 """APScheduler job registry — Phase 1+2+3 jobs."""
 from __future__ import annotations
 
+import asyncio
+import functools
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Awaitable, Callable
+
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobExecutionEvent
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -26,6 +36,52 @@ from src.trading.order_book import OrderBook
 from src.trading.portfolio_manager import PortfolioManager
 
 
+def _logged(scheduler_id: str) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
+    """Decorator: write a ``job_log`` row keyed by the APScheduler job id.
+
+    The reconciler in :mod:`src.scheduler_reconciler` checks ``job_log`` for
+    the most recent ``status='completed'`` row matching the scheduler id to
+    decide whether a daily-critical job needs catch-up. ``BaseCollector``
+    writes ``job_log`` rows under its own ``job_name``, which doesn't match
+    the scheduler id — and most non-collector jobs (snapshot, EOD, report,
+    etc.) don't write ``job_log`` at all. Wrapping the daily-critical job
+    coroutines with this decorator gives the reconciler a single source of
+    truth keyed by the scheduler id.
+
+    Failures inside the wrapped coroutine are re-raised so the
+    EVENT_JOB_ERROR listener still fires; the ``job_log`` row reflects the
+    failure with ``status='failed'``.
+    """
+    def decorator(coro_fn: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
+        @functools.wraps(coro_fn)
+        async def wrapper(*args, **kwargs) -> None:
+            from src.db import session_scope
+            from src.models.source import JobLog
+            started = time.monotonic()
+            status = "completed"
+            err_msg: str | None = None
+            try:
+                await coro_fn(*args, **kwargs)
+            except Exception as exc:
+                status = "failed"
+                err_msg = str(exc)
+                raise
+            finally:
+                duration_ms = int((time.monotonic() - started) * 1000)
+                try:
+                    async with session_scope() as session:
+                        session.add(JobLog(
+                            job_name=scheduler_id,
+                            status=status,
+                            duration_ms=duration_ms,
+                            error_message=err_msg,
+                        ))
+                except Exception as log_exc:
+                    logger.warning(f"job_log write for {scheduler_id} failed: {log_exc!r}")
+        return wrapper
+    return decorator
+
+
 # --- Phase 1 jobs ---
 
 async def _run_rss() -> None:
@@ -44,6 +100,7 @@ async def _run_nse() -> None:
     await NSEScraperCollector().run()
 
 
+@_logged("yahoo_eod")
 async def _run_yahoo_eod() -> None:
     await YahooFinanceCollector(days=1).run()
 
@@ -86,6 +143,7 @@ async def _run_check_pending_orders() -> None:
         logger.info(f"order book: {n} orders executed")
 
 
+@_logged("daily_snapshot")
 async def _run_daily_snapshot() -> None:
     from sqlalchemy import select
     from src.db import session_scope
@@ -103,14 +161,40 @@ async def _run_daily_snapshot() -> None:
             logger.error(f"snapshot failed for {p.id}: {exc}")
 
 
+@_logged("update_analyst_scores")
 async def _run_update_analyst_scores() -> None:
     n = await AnalystTracker().update_all_scores()
     await SourceScorer().update_all_source_scores()
     logger.info(f"analyst scores updated: {n}")
 
 
+@_logged("daily_report")
 async def _run_daily_report() -> None:
     await ReportGenerator().send_daily_report()
+
+
+# --- Phase 2.5 jobs: equity strategy (LLM-driven paper trading) ---
+# These let exceptions propagate so the EVENT_JOB_ERROR listener can Telegram-
+# alert and the @_logged decorator records status='failed' in job_log. The
+# previous swallowing try/except hid both signals. APScheduler-level catch
+# (max_instances=1, coalesce=True) keeps a single failure from cascading.
+
+@_logged("equity_morning_allocation")
+async def _run_equity_morning_allocation() -> None:
+    from src.trading.strategy_runner import run_morning_allocation
+    await run_morning_allocation()
+
+
+@_logged("equity_intraday_action")
+async def _run_equity_intraday_action() -> None:
+    from src.trading.strategy_runner import run_intraday_action
+    await run_intraday_action()
+
+
+@_logged("equity_eod_squareoff")
+async def _run_equity_eod_squareoff() -> None:
+    from src.trading.strategy_runner import run_eod_squareoff
+    await run_eod_squareoff()
 
 
 # --- Phase 3 jobs ---
@@ -158,6 +242,7 @@ async def _fno_tier_refresh() -> None:
     logger.info(f"fno tier refresh: {counts}")
 
 
+@_logged("fno_issue_review_loop")
 async def _fno_issue_review_loop() -> None:
     from src.fno.issue_filer import run
     await run()
@@ -174,6 +259,7 @@ async def _fno_premarket_pipeline() -> None:
     logger.info(f"fno premarket pipeline: {result}")
 
 
+@_logged("fno_eod")
 async def _fno_eod_tasks() -> None:
     from src.fno.orchestrator import run_eod_tasks
     await run_eod_tasks()
@@ -220,6 +306,7 @@ async def _fno_macro_collect() -> None:
     logger.info(f"macro collector: {n} records stored")
 
 
+@_logged("fno_fii_dii")
 async def _fno_fii_dii_collect() -> None:
     from src.collectors.fii_dii_collector import fetch_yesterday
     await fetch_yesterday()
@@ -231,11 +318,113 @@ async def _run_analyst_backtest_scoring() -> None:
     logger.info(f"analyst backtest scoring: {len(results)} analysts scored")
 
 
+# --- Service-resilience jobs ---
+
+def _runtime_dir() -> Path:
+    """Filesystem root for Windows service runtime state.
+
+    Defaults to ``%PROGRAMDATA%\\Laabh`` (or ``./.laabh-runtime`` if unset),
+    so heartbeats and other state never live on a OneDrive-synced path.
+
+    NOTE: when migrating the service account from ``LocalSystem`` to a
+    virtual account such as ``NT SERVICE\\Laabh`` (per the senior-admin
+    review item #1, currently deferred), grant that SID write access to
+    this directory or the heartbeat job will fail with PermissionError on
+    every tick.
+    """
+    raw = os.environ.get("LAABH_RUNTIME_DIR")
+    if raw:
+        return Path(raw)
+    pd = os.environ.get("PROGRAMDATA")
+    return Path(pd, "Laabh") if pd else Path(".laabh-runtime").resolve()
+
+
+async def _write_heartbeat() -> None:
+    """Atomically touch a heartbeat file. External monitors check its mtime."""
+    state_dir = _runtime_dir() / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    target = state_dir / "heartbeat.txt"
+    tmp = target.with_suffix(".tmp")
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    tmp.write_text(stamp + "\n", encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def _on_job_error(event: JobExecutionEvent) -> None:
+    """APScheduler error listener — log + Telegram alert without re-raising.
+
+    AsyncIOScheduler dispatches listeners in the loop thread, but to stay
+    safe against any future executor change (or a listener firing during
+    scheduler shutdown), we use ``call_soon_threadsafe`` to schedule the
+    coroutine, falling back to a same-thread ``create_task`` only when
+    no running loop is reachable.
+    """
+    logger.error(f"job {event.job_id} crashed: {event.exception!r}")
+    msg = f"Laabh job FAILED: {event.job_id}\n{event.exception!r}"
+    try:
+        from src.services.notification_service import NotificationService
+
+        async def _send() -> None:
+            try:
+                await NotificationService().send_text(msg)
+            except Exception as send_exc:
+                logger.warning(f"telegram send for {event.job_id} failed: {send_exc!r}")
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_send())
+        except RuntimeError:
+            # No running loop in this thread — try to find the scheduler's loop.
+            sched_loop = getattr(event, "_loop", None) or asyncio._get_running_loop()
+            if sched_loop is not None:
+                sched_loop.call_soon_threadsafe(lambda: sched_loop.create_task(_send()))
+            else:
+                logger.warning(
+                    f"telegram alert for {event.job_id} dropped: no event loop available"
+                )
+    except Exception as exc:  # never let the listener take the loop down
+        logger.warning(f"telegram alert for {event.job_id} suppressed: {exc!r}")
+
+
+def _on_job_missed(event: JobExecutionEvent) -> None:
+    """Logged but not alerted — a missed firing past grace_time is informational."""
+    logger.warning(f"job {event.job_id} missed scheduled run at {event.scheduled_run_time}")
+
+
 def build_scheduler() -> AsyncIOScheduler:
-    """Create and configure the full APScheduler instance (not yet started)."""
+    """Create and configure the full APScheduler instance (not yet started).
+
+    Uses a Postgres-backed SQLAlchemyJobStore so next-fire times survive
+    process restarts. Job-level defaults (``coalesce``, ``misfire_grace_time``)
+    ensure that an outage of up to one hour transparently catches up on the
+    next scheduler boot rather than silently dropping firings.
+    """
     settings = get_settings()
     ist = tz(settings.timezone)
-    sched = AsyncIOScheduler(timezone=ist)
+    sched = AsyncIOScheduler(
+        timezone=ist,
+        jobstores={"default": SQLAlchemyJobStore(url=settings.sync_database_url)},
+        job_defaults={
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": 3600,
+        },
+    )
+    sched.add_listener(_on_job_error, EVENT_JOB_ERROR)
+    sched.add_listener(_on_job_missed, EVENT_JOB_MISSED)
+
+    # Ensure the apscheduler_jobs table exists before we wipe it. The store's
+    # own .start() creates it, but that only runs inside scheduler.start() —
+    # we need to clear stale entries *before* adding the fresh job set. Doing
+    # the create-if-missing here makes first-ever boot (no table) behave the
+    # same as subsequent boots (table exists, may have stale rows).
+    default_store = sched._jobstores["default"]
+    default_store.jobs_t.create(default_store.engine, checkfirst=True)
+
+    # Code is the source of truth for the job set. Wipe whatever the previous
+    # process left in the persistent jobstore before re-adding from code, so
+    # renamed/removed jobs don't linger and id collisions can't raise.
+    sched.remove_all_jobs()
 
     # --- Phase 1: Data collection ---
     sched.add_job(_run_rss, IntervalTrigger(minutes=5), id="rss", max_instances=1, coalesce=True)
@@ -316,6 +505,39 @@ def build_scheduler() -> AsyncIOScheduler:
         CronTrigger(hour=18, minute=30, day_of_week="mon-fri", timezone=ist),
         id="daily_report",
     )
+
+    # --- Phase 2.5: Equity strategy (LLM-driven paper trading) ---
+    # Gated behind EQUITY_STRATEGY_ENABLED so the cron stays absent when off.
+    if settings.equity_strategy_enabled:
+        # 09:10 IST — morning allocation; BUYs fill at 09:15 open.
+        sched.add_job(
+            _run_equity_morning_allocation,
+            CronTrigger(hour=9, minute=10, day_of_week="mon-fri", timezone=ist),
+            id="equity_morning_allocation",
+        )
+        # Intraday re-eval: 09:45, 10:30, 11:30, 12:30, 13:30, 14:30 IST.
+        # Cap on calls/day enforced inside run_intraday_action().
+        sched.add_job(
+            _run_equity_intraday_action,
+            CronTrigger(
+                hour="9-14",
+                minute="30,45",
+                day_of_week="mon-fri",
+                timezone=ist,
+            ),
+            id="equity_intraday_action",
+            max_instances=1,
+            coalesce=True,
+        )
+        # 15:20 IST — square-off decision (10 min before close).
+        sched.add_job(
+            _run_equity_eod_squareoff,
+            CronTrigger(hour=15, minute=20, day_of_week="mon-fri", timezone=ist),
+            id="equity_eod_squareoff",
+        )
+        logger.info("equity strategy enabled — morning/intraday/eod jobs registered")
+    else:
+        logger.info("equity strategy disabled (EQUITY_STRATEGY_ENABLED=false)")
 
     # --- Phase 3: Whisper pipeline ---
     # WHISPER_MODEL is the feature flag — when unset, skip the entire pipeline.
@@ -476,6 +698,18 @@ def build_scheduler() -> AsyncIOScheduler:
         _run_analyst_backtest_scoring,
         CronTrigger(hour=10, minute=0, day_of_week="sun", timezone=ist),
         id="analyst_backtest_scoring",
+    )
+
+    # --- Service liveness heartbeat ---
+    # Touches %PROGRAMDATA%\Laabh\state\heartbeat.txt every 60s. An external
+    # watchdog (Task Scheduler) can alert if the file mtime grows stale.
+    sched.add_job(
+        _write_heartbeat,
+        IntervalTrigger(seconds=60),
+        id="heartbeat",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
     )
 
     return sched

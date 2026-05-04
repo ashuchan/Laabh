@@ -183,6 +183,45 @@ class Settings(BaseSettings):
     # --- Risk-free rate for Black-Scholes Greeks ---
     fno_risk_free_rate_pct: float = Field(default=6.5, alias="FNO_RISK_FREE_RATE_PCT")
 
+    # --- Equity Strategy (Phase 2.5: LLM-driven paper trading) ---
+    equity_strategy_enabled: bool = Field(default=False, alias="EQUITY_STRATEGY_ENABLED")
+    # Portfolio scope: "lumpsum" reuses one persistent portfolio (cash carries
+    # over, holdings carry over). "sip" tops up a fixed daily budget every
+    # morning from idle cash; un-deployed cash rolls forward.
+    equity_strategy_mode: str = Field(default="sip", alias="EQUITY_STRATEGY_MODE")
+    # Daily budget for SIP mode — added to current_cash each morning.
+    equity_strategy_daily_budget: float = Field(
+        default=20000.0, alias="EQUITY_STRATEGY_DAILY_BUDGET"
+    )
+    # Lumpsum total capital — set once at portfolio bootstrap; topup is a no-op.
+    equity_strategy_lumpsum_capital: float = Field(
+        default=100000.0, alias="EQUITY_STRATEGY_LUMPSUM_CAPITAL"
+    )
+    # Per-position cap as a fraction of daily-budget (sip) or current_value (lumpsum).
+    # Separated so each strategy mode has its own ceiling.
+    equity_strategy_pos_cap_pct_sip: float = Field(
+        default=0.40, alias="EQUITY_STRATEGY_POS_CAP_PCT_SIP"
+    )
+    equity_strategy_pos_cap_pct_lumpsum: float = Field(
+        default=0.15, alias="EQUITY_STRATEGY_POS_CAP_PCT_LUMPSUM"
+    )
+    # Risk dial — "safe" tightens caps and prefers reserve cash; "balanced"
+    # is default; "aggressive" allows fuller deployment & higher per-position caps.
+    equity_strategy_risk_profile: str = Field(
+        default="balanced", alias="EQUITY_STRATEGY_RISK_PROFILE"
+    )
+    # Models — Opus for high-stakes morning allocation, Sonnet for frequent intraday.
+    equity_strategy_morning_model: str = Field(
+        default="claude-opus-4-7", alias="EQUITY_STRATEGY_MORNING_MODEL"
+    )
+    equity_strategy_intraday_model: str = Field(
+        default="claude-sonnet-4-6", alias="EQUITY_STRATEGY_INTRADAY_MODEL"
+    )
+    # Hard cap on intraday LLM calls per day to bound API cost.
+    equity_strategy_max_intraday_calls: int = Field(
+        default=8, alias="EQUITY_STRATEGY_MAX_INTRADAY_CALLS"
+    )
+
     # --- Dry-run replay ---
     dryrun_enabled: bool = Field(default=True, alias="DRYRUN_ENABLED")
     dryrun_historical_chain_source: str = Field(

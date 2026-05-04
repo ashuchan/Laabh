@@ -1,15 +1,18 @@
 """Daily and weekly performance reports — formatted for Telegram delivery."""
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 
 from loguru import logger
-from sqlalchemy import select, text
+from sqlalchemy import desc, select, text
 
 from src.db import session_scope
 from src.models.analyst import Analyst
+from src.models.instrument import Instrument
 from src.models.portfolio import Holding, Portfolio
 from src.models.signal import Signal
+from src.models.strategy_decision import StrategyDecision
+from src.models.trade import Trade
 from src.services.notification_service import NotificationService
 
 
@@ -106,4 +109,109 @@ class ReportGenerator:
                 f"{top_analyst.total_signals or 0} signals)"
             )
 
+        # Equity strategy section
+        strategy_lines = await self._build_equity_strategy_section(today)
+        if strategy_lines:
+            lines.append("")
+            lines.extend(strategy_lines)
+
         return "\n".join(lines)
+
+    async def _build_equity_strategy_section(self, today: date) -> list[str]:
+        """Summarise the LLM-driven equity strategy for today.
+
+        Reports morning allocation rationale, every fill, intraday turnover,
+        EOD square-off rationale, and the strategy portfolio's day P&L.
+        Returns an empty list when the strategy hasn't run today (so the
+        section disappears for users who haven't enabled it).
+        """
+        from src.trading.strategy_runner import STRATEGY_PORTFOLIO_NAME
+
+        async with session_scope() as session:
+            result = await session.execute(
+                select(Portfolio).where(Portfolio.name == STRATEGY_PORTFOLIO_NAME)
+            )
+            portfolio = result.scalar_one_or_none()
+        if portfolio is None:
+            return []
+
+        day_start = datetime.combine(today, time.min, tzinfo=timezone.utc)
+        day_end = datetime.combine(today, time.max, tzinfo=timezone.utc)
+
+        async with session_scope() as session:
+            decisions = list(
+                (await session.execute(
+                    select(StrategyDecision)
+                    .where(
+                        StrategyDecision.portfolio_id == portfolio.id,
+                        StrategyDecision.as_of >= day_start,
+                        StrategyDecision.as_of <= day_end,
+                    )
+                    .order_by(StrategyDecision.as_of.asc())
+                )).scalars()
+            )
+            trade_rows = list(
+                (await session.execute(
+                    select(Trade, Instrument)
+                    .join(Instrument, Instrument.id == Trade.instrument_id)
+                    .where(
+                        Trade.portfolio_id == portfolio.id,
+                        Trade.executed_at >= day_start,
+                        Trade.executed_at <= day_end,
+                    )
+                    .order_by(Trade.executed_at.asc())
+                )).all()
+            )
+
+        if not decisions and not trade_rows:
+            return []
+
+        out: list[str] = ["📈 Equity Strategy"]
+
+        morning = next((d for d in decisions if d.decision_type == "morning_allocation"), None)
+        intraday = [d for d in decisions if d.decision_type == "intraday_action"]
+        eod = next((d for d in decisions if d.decision_type == "eod_squareoff"), None)
+
+        if morning:
+            executed = morning.actions_executed or 0
+            skipped = morning.actions_skipped or 0
+            out.append(
+                f"  Morning: {executed} fills, {skipped} skipped "
+                f"(budget ₹{(morning.budget_available or 0):,.0f})"
+            )
+            if morning.llm_reasoning:
+                out.append(f"    _{morning.llm_reasoning[:240]}_")
+
+        if intraday:
+            total_exec = sum((d.actions_executed or 0) for d in intraday)
+            total_skip = sum((d.actions_skipped or 0) for d in intraday)
+            out.append(
+                f"  Intraday: {len(intraday)} re-evals, {total_exec} fills, {total_skip} skipped"
+            )
+
+        if eod:
+            executed = eod.actions_executed or 0
+            out.append(f"  Square-off: {executed} positions closed")
+            if eod.llm_reasoning:
+                out.append(f"    _{eod.llm_reasoning[:240]}_")
+
+        if trade_rows:
+            out.append("  Fills:")
+            for t, inst in trade_rows[:15]:
+                tag = "🟢" if t.trade_type == "BUY" else "🔴"
+                out.append(
+                    f"    {tag} {t.trade_type} {t.quantity} {inst.symbol} "
+                    f"@ ₹{float(t.price):,.2f}"
+                )
+            if len(trade_rows) > 15:
+                out.append(f"    … {len(trade_rows) - 15} more")
+
+        cash = float(portfolio.current_cash or 0)
+        invested = float(portfolio.invested_value or 0)
+        day_pnl = float(portfolio.day_pnl or 0)
+        sign = "+" if day_pnl >= 0 else ""
+        out.append(
+            f"  Portfolio: cash ₹{cash:,.0f} • invested ₹{invested:,.0f} • "
+            f"day {sign}₹{day_pnl:,.0f}"
+        )
+        return out

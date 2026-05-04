@@ -554,6 +554,38 @@ CREATE TABLE portfolio_snapshots (
 );
 
 -- ============================================================================
+-- 10b. EQUITY STRATEGY — LLM-driven paper trading decisions
+-- ============================================================================
+-- Each decision_type captures one LLM invocation:
+--   morning_allocation     — 09:10 IST: split daily budget across BUY signals
+--   intraday_action        — 09:30–14:30 IST: hold/sell/buy based on monitoring
+--   eod_squareoff          — 15:20 IST: which intraday positions to close
+-- input_summary captures candidates/holdings shown to LLM (for replay & audit).
+-- actions_json captures the LLM's structured output (allocations or trade list).
+-- One row per call; trades reference this via entry_reason or a follow-up join.
+
+CREATE TABLE strategy_decisions (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    portfolio_id        UUID NOT NULL REFERENCES portfolios(id),
+    decision_type       VARCHAR(40) NOT NULL,          -- morning_allocation | intraday_action | eod_squareoff
+    as_of               TIMESTAMPTZ NOT NULL,          -- logical decision time (live = now, replay = historical)
+    risk_profile        VARCHAR(20),                   -- safe | balanced | aggressive
+    budget_available    NUMERIC(15,2),                 -- cash visible to LLM at decision time
+    input_summary       JSONB,                         -- candidates, holdings, signals snapshot
+    llm_model           VARCHAR(80),
+    llm_reasoning       TEXT,                          -- LLM's freeform explanation
+    actions_json        JSONB NOT NULL,                -- structured action list returned by LLM
+    actions_executed    INT DEFAULT 0,                 -- count of actions that successfully reached engine
+    actions_skipped     INT DEFAULT 0,                 -- count rejected by risk/cash/missing-LTP checks
+    dryrun_run_id       UUID,                          -- non-null when invoked from src/dryrun
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_strategy_decisions_portfolio ON strategy_decisions(portfolio_id, as_of DESC);
+CREATE INDEX idx_strategy_decisions_type ON strategy_decisions(decision_type, as_of DESC);
+CREATE INDEX idx_strategy_decisions_dryrun ON strategy_decisions(dryrun_run_id) WHERE dryrun_run_id IS NOT NULL;
+
+-- ============================================================================
 -- 11. NOTIFICATIONS
 -- ============================================================================
 

@@ -8,7 +8,7 @@ from sqlalchemy import desc, select, text
 
 from src.db import session_scope
 from src.models.instrument import Instrument
-from src.models.price import PriceTick
+from src.models.price import PriceDaily, PriceTick
 from src.models.watchlist import WatchlistItem
 from src.services.notification_service import NotificationService
 
@@ -20,12 +20,26 @@ class PriceService:
         self.notifier = notifier or NotificationService()
 
     async def latest_price(self, instrument_id: uuid.UUID) -> float | None:
-        """Return the most recent LTP for an instrument (or None if no ticks)."""
+        """Return the most recent price — live tick if available, else daily close.
+
+        Falls back to ``price_daily.close`` so callers (e.g. the equity
+        strategist at 09:10 IST) keep working when the WebSocket hasn't yet
+        streamed a tick for the instrument.
+        """
         async with session_scope() as session:
             row = await session.execute(
                 select(PriceTick.ltp)
                 .where(PriceTick.instrument_id == instrument_id)
                 .order_by(desc(PriceTick.timestamp))
+                .limit(1)
+            )
+            val = row.scalar_one_or_none()
+            if val is not None:
+                return float(val)
+            row = await session.execute(
+                select(PriceDaily.close)
+                .where(PriceDaily.instrument_id == instrument_id)
+                .order_by(desc(PriceDaily.date))
                 .limit(1)
             )
             val = row.scalar_one_or_none()

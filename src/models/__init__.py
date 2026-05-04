@@ -21,6 +21,7 @@ from src.models.portfolio import Holding, Portfolio, PortfolioSnapshot
 from src.models.price import PriceDaily, PriceTick
 from src.models.signal import Signal, SignalAutoTrade
 from src.models.source import DataSource, JobLog, SystemConfig
+from src.models.strategy_decision import StrategyDecision
 from src.models.trade import Trade
 from src.models.watchlist import Watchlist, WatchlistItem
 
@@ -57,6 +58,7 @@ __all__ = [
     "Signal",
     "SignalAutoTrade",
     "SourceHealth",
+    "StrategyDecision",
     "SystemConfig",
     "Trade",
     "VIXTick",
