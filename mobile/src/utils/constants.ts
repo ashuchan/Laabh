@@ -11,4 +11,6 @@ export const STALE_TIMES = {
   prices: 5_000,        // 5 seconds
   signals: 60_000,      // 1 minute
   analysts: 300_000,    // 5 minutes
+  reports: 120_000,     // 2 minutes
+  health: 30_000,       // 30 seconds
 };

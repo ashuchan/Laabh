@@ -4,16 +4,28 @@ import { createStackNavigator } from '@react-navigation/stack';
 import React from 'react';
 import { Text } from 'react-native';
 import { AnalystsScreen } from '../screens/AnalystsScreen';
+import { DailyReportScreen } from '../screens/DailyReportScreen';
+import { FNOCandidatesScreen } from '../screens/FNOCandidatesScreen';
 import { HomeScreen } from '../screens/HomeScreen';
 import { PortfolioScreen } from '../screens/PortfolioScreen';
+import { ReportsHubScreen } from '../screens/ReportsHubScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
+import { SignalPerformanceScreen } from '../screens/SignalPerformanceScreen';
 import { SignalsScreen } from '../screens/SignalsScreen';
+import { StrategyDecisionsScreen } from '../screens/StrategyDecisionsScreen';
+import { SystemHealthScreen } from '../screens/SystemHealthScreen';
 import { TradeScreen } from '../screens/TradeScreen';
 import { WatchlistScreen } from '../screens/WatchlistScreen';
 import { colors } from '../utils/colors';
 
 const Tab = createBottomTabNavigator();
 const Stack = createStackNavigator();
+
+const stackOptions = {
+  headerStyle: { backgroundColor: colors.surface },
+  headerTintColor: colors.text,
+  headerTitleStyle: { fontWeight: '600' as const },
+};
 
 function HomeStack() {
   return (
@@ -33,20 +45,40 @@ function SignalsStack() {
   );
 }
 
-function MoreStack() {
+function ReportsStack() {
   return (
     <Stack.Navigator screenOptions={stackOptions}>
+      <Stack.Screen name="ReportsHub" component={ReportsHubScreen} options={{ title: 'Reports' }} />
+      <Stack.Screen
+        name="DailyReport"
+        component={DailyReportScreen}
+        options={{ title: 'Daily Report' }}
+      />
+      <Stack.Screen
+        name="FNOCandidates"
+        component={FNOCandidatesScreen}
+        options={{ title: 'F&O Candidates' }}
+      />
+      <Stack.Screen
+        name="StrategyDecisions"
+        component={StrategyDecisionsScreen}
+        options={{ title: 'Strategy Decisions' }}
+      />
+      <Stack.Screen
+        name="SignalPerformance"
+        component={SignalPerformanceScreen}
+        options={{ title: 'Signal Performance' }}
+      />
+      <Stack.Screen
+        name="SystemHealth"
+        component={SystemHealthScreen}
+        options={{ title: 'System Health' }}
+      />
       <Stack.Screen name="Analysts" component={AnalystsScreen} options={{ title: 'Analysts' }} />
       <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: 'Settings' }} />
     </Stack.Navigator>
   );
 }
-
-const stackOptions = {
-  headerStyle: { backgroundColor: colors.surface },
-  headerTintColor: colors.text,
-  headerTitleStyle: { fontWeight: '600' as const },
-};
 
 export function TabNavigator() {
   return (
@@ -63,7 +95,8 @@ export function TabNavigator() {
               Signals: '📊',
               Trade: '💱',
               Watchlist: '👁',
-              More: '⋯',
+              Portfolio: '💼',
+              Reports: '📑',
             };
             return <Text style={{ fontSize: size - 4 }}>{icons[route.name] ?? '•'}</Text>;
           },
@@ -74,7 +107,7 @@ export function TabNavigator() {
         <Tab.Screen name="Trade" component={TradeScreen} />
         <Tab.Screen name="Watchlist" component={WatchlistScreen} />
         <Tab.Screen name="Portfolio" component={PortfolioScreen} />
-        <Tab.Screen name="More" component={MoreStack} />
+        <Tab.Screen name="Reports" component={ReportsStack} />
       </Tab.Navigator>
     </NavigationContainer>
   );
