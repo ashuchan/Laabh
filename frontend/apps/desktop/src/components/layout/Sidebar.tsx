@@ -37,8 +37,8 @@ const NAV_GROUPS: NavGroup[] = [
     label: 'Main',
     defaultOpen: true,
     items: [
-      { label: 'Portfolio', to: '/portfolio', icon: <BarChart2 size={15} />, shortcut: 'g p' },
-      { label: 'Signals', to: '/signals', icon: <TrendingUp size={15} />, shortcut: 'g s' },
+      { label: 'Portfolio', to: '/portfolio', icon: <BarChart2 size={15} /> },
+      { label: 'Signals', to: '/signals', icon: <TrendingUp size={15} /> },
       { label: 'Watchlists', to: '/watchlists', icon: <Star size={15} /> },
       { label: 'Analysts', to: '/analysts', icon: <Users size={15} /> },
     ],
@@ -49,8 +49,8 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { label: 'Daily', to: '/reports/daily', icon: <Calendar size={15} />, shortcut: 'g d' },
       { label: 'F&O Candidates', to: '/reports/fno-candidates', icon: <Zap size={15} />, shortcut: 'g f' },
-      { label: 'Strategy', to: '/reports/strategy-decisions', icon: <GitBranch size={15} /> },
-      { label: 'Signal Perf', to: '/reports/signal-performance', icon: <Activity size={15} /> },
+      { label: 'Strategy', to: '/reports/strategy-decisions', icon: <GitBranch size={15} />, shortcut: 'g s' },
+      { label: 'Signal Perf', to: '/reports/signal-performance', icon: <Activity size={15} />, shortcut: 'g p' },
       { label: 'System Health', to: '/reports/system-health', icon: <Heart size={15} />, shortcut: 'g h' },
     ],
   },
@@ -59,11 +59,14 @@ const NAV_GROUPS: NavGroup[] = [
 function NavLink({ item, collapsed }: { item: NavItem; collapsed: boolean }) {
   const { location } = useRouterState();
   const active = location.pathname === item.to || location.pathname.startsWith(item.to + '/');
+  const titleAttr = collapsed
+    ? item.shortcut ? `${item.label} (${item.shortcut})` : item.label
+    : undefined;
 
   return (
     <Link
       to={item.to}
-      title={collapsed ? item.label : undefined}
+      title={titleAttr}
       className={cn(
         'flex items-center gap-2 rounded px-2 py-1.5 text-xs transition-colors',
         'hover:bg-[var(--color-surface-elevated)] hover:text-[var(--color-text)]',
@@ -74,7 +77,16 @@ function NavLink({ item, collapsed }: { item: NavItem; collapsed: boolean }) {
       )}
     >
       <span className="shrink-0">{item.icon}</span>
-      {!collapsed && <span className="truncate">{item.label}</span>}
+      {!collapsed && (
+        <>
+          <span className="truncate flex-1">{item.label}</span>
+          {item.shortcut && (
+            <kbd className="ml-auto shrink-0 rounded bg-[var(--color-border)] px-1 py-0.5 text-[9px] text-[var(--color-text-muted)] font-mono">
+              {item.shortcut}
+            </kbd>
+          )}
+        </>
+      )}
     </Link>
   );
 }

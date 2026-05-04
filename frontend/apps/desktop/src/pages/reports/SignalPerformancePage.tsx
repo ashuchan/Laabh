@@ -240,6 +240,15 @@ export function SignalPerformancePage() {
                 </div>
               ))}
             </div>
+
+            {selectedRow.reasoning && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-2">Reasoning</div>
+                <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-elevated)] p-3 text-xs leading-relaxed text-[var(--color-text-secondary)] whitespace-pre-wrap max-h-64 overflow-y-auto">
+                  {selectedRow.reasoning}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </Drawer>

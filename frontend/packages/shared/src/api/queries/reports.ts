@@ -103,6 +103,28 @@ export function useSignalPerformance(opts?: { days?: number; analyst_id?: string
   });
 }
 
+export interface StrategyDecisionTrade {
+  id: string;
+  instrument_id: string;
+  trade_type: 'BUY' | 'SELL';
+  order_type: string;
+  quantity: number;
+  price: number;
+  status: string;
+  executed_at: string | null;
+}
+
+export function useDecisionTrades(decisionId: string | null) {
+  const api = useApiClient();
+  return useQuery<StrategyDecisionTrade[]>({
+    queryKey: ['decision-trades', decisionId],
+    queryFn: () =>
+      api.get(`/reports/strategy-decisions/${decisionId}/trades`).then((r) => r.data),
+    enabled: Boolean(decisionId),
+    staleTime: STALE_TIMES.reports,
+  });
+}
+
 export function useSignalPerformanceTimeseries(opts?: { bucket?: string; days?: number }) {
   const api = useApiClient();
   const params = new URLSearchParams();

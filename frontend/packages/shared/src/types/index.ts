@@ -187,6 +187,7 @@ export interface SignalPerformanceRow {
   analyst_id: string | null;
   analyst_name_raw: string | null;
   signal_date: string;
+  reasoning: string | null;
 }
 
 export interface SignalPerformance {

@@ -1,11 +1,11 @@
 import React, { useState } from 'react';
 import { useSearch, useNavigate } from '@tanstack/react-router';
-import { useStrategyDecisions } from '@laabh/shared';
-import { formatIST, timeAgo } from '@laabh/shared';
+import { useStrategyDecisions, useDecisionTrades } from '@laabh/shared';
+import { formatIST, formatINR } from '@laabh/shared';
 import { format, subDays, addDays, parseISO } from 'date-fns';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import type { StrategyDecision } from '@laabh/shared';
-import { Badge } from '../../components/ui/Badge';
+import { Badge, statusBadgeVariant } from '../../components/ui/Badge';
 import { Drawer } from '../../components/ui/Drawer';
 import { PageLoader, ErrorState, EmptyState } from '../../components/ui/Spinner';
 import { useDateStepShortcut } from '../../hooks/useDateStepShortcut';
@@ -59,6 +59,80 @@ function TimelineEvent({
         selected ? 'border-[var(--color-primary)] text-[var(--color-text)]' : 'border-[var(--color-border)] text-[var(--color-text-secondary)]',
       )}>
         {typeLabel(decision.decision_type)}
+      </div>
+    </div>
+  );
+}
+
+function DecisionDrawerContent({ decision }: { decision: StrategyDecision }) {
+  const { data: trades, isLoading: tradesLoading } = useDecisionTrades(decision.id);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="grid grid-cols-2 gap-3">
+        {[
+          { label: 'As Of', value: formatIST(decision.as_of) },
+          { label: 'Model', value: decision.llm_model ?? '—' },
+          { label: 'Risk Profile', value: decision.risk_profile ?? '—' },
+          { label: 'Budget', value: decision.budget_available != null ? `₹${decision.budget_available.toLocaleString()}` : '—' },
+          { label: 'Executed', value: String(decision.actions_executed) },
+          { label: 'Skipped', value: String(decision.actions_skipped) },
+        ].map(({ label, value }) => (
+          <div key={label}>
+            <div className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1">{label}</div>
+            <div className="text-sm text-[var(--color-text)]">{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {decision.llm_reasoning && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-2">LLM Reasoning</div>
+          <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-elevated)] p-3 text-xs leading-relaxed text-[var(--color-text-secondary)] whitespace-pre-wrap max-h-64 overflow-y-auto">
+            {decision.llm_reasoning}
+          </div>
+        </div>
+      )}
+
+      <div>
+        <div className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-2">
+          Attributed Trades {trades?.length ? `(${trades.length})` : ''}
+        </div>
+        {tradesLoading ? (
+          <div className="text-xs text-[var(--color-text-muted)]">Loading…</div>
+        ) : !trades?.length ? (
+          <div className="text-xs text-[var(--color-text-muted)] italic">No trades found in ±30 min window</div>
+        ) : (
+          <div className="overflow-auto rounded border border-[var(--color-border)]">
+            <table className="w-full border-collapse text-xs">
+              <thead>
+                <tr className="border-b border-[var(--color-border)] bg-[var(--color-surface-elevated)]">
+                  {['Instrument', 'Type', 'Qty', 'Price', 'Status', 'Executed'].map((h) => (
+                    <th key={h} className="px-2 py-1.5 text-left text-[10px] uppercase tracking-wider text-[var(--color-text-muted)]">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {trades.map((t) => (
+                  <tr key={t.id} className="border-b border-[var(--color-border)]">
+                    <td className="px-2 py-1.5 font-medium text-[var(--color-text)]">{t.instrument_id.slice(0, 8)}</td>
+                    <td className="px-2 py-1.5">
+                      <Badge variant={t.trade_type === 'BUY' ? 'success' : 'danger'}>{t.trade_type}</Badge>
+                    </td>
+                    <td className="px-2 py-1.5 text-[var(--color-text-secondary)]">{t.quantity}</td>
+                    <td className="px-2 py-1.5 text-[var(--color-text-secondary)]">{formatINR(t.price)}</td>
+                    <td className="px-2 py-1.5">
+                      <Badge variant={statusBadgeVariant(t.status)}>{t.status}</Badge>
+                    </td>
+                    <td className="px-2 py-1.5 text-[var(--color-text-muted)]">
+                      {t.executed_at ? formatIST(t.executed_at) : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -194,33 +268,7 @@ export function StrategyDecisionsPage() {
         title={selected ? typeLabel(selected.decision_type) : ''}
         width="w-[560px]"
       >
-        {selected && (
-          <div className="flex flex-col gap-4">
-            <div className="grid grid-cols-2 gap-3">
-              {[
-                { label: 'As Of', value: formatIST(selected.as_of) },
-                { label: 'Model', value: selected.llm_model ?? '—' },
-                { label: 'Risk Profile', value: selected.risk_profile ?? '—' },
-                { label: 'Budget', value: selected.budget_available != null ? `₹${selected.budget_available.toLocaleString()}` : '—' },
-                { label: 'Executed', value: String(selected.actions_executed) },
-                { label: 'Skipped', value: String(selected.actions_skipped) },
-              ].map(({ label, value }) => (
-                <div key={label}>
-                  <div className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1">{label}</div>
-                  <div className="text-sm text-[var(--color-text)]">{value}</div>
-                </div>
-              ))}
-            </div>
-            {selected.llm_reasoning && (
-              <div>
-                <div className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-2">LLM Reasoning</div>
-                <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-elevated)] p-3 text-xs leading-relaxed text-[var(--color-text-secondary)] whitespace-pre-wrap max-h-96 overflow-y-auto">
-                  {selected.llm_reasoning}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
+        {selected && <DecisionDrawerContent decision={selected} />}
       </Drawer>
     </div>
   );

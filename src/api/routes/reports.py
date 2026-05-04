@@ -98,6 +98,51 @@ class StrategyDecisionResponse(BaseModel):
     created_at: datetime
 
 
+class StrategyDecisionTradeRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    instrument_id: uuid.UUID
+    trade_type: str
+    order_type: str
+    quantity: int
+    price: float
+    status: str
+    executed_at: datetime | None
+
+
+@router.get("/strategy-decisions/{decision_id}/trades", response_model=list[StrategyDecisionTradeRow])
+async def get_decision_trades(decision_id: uuid.UUID):
+    """Return trades that executed within the window of a strategy decision.
+
+    Looks up the decision's `portfolio_id` and `as_of`, then returns trades
+    from that portfolio executed within ±30 minutes of `as_of`.
+    """
+    from datetime import timedelta
+
+    from src.models.trade import Trade
+
+    async with session_scope() as session:
+        decision = await session.get(StrategyDecision, decision_id)
+        if decision is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Decision not found")
+
+        window_start = decision.as_of - timedelta(minutes=30)
+        window_end = decision.as_of + timedelta(minutes=30)
+
+        q = (
+            select(Trade)
+            .where(Trade.portfolio_id == decision.portfolio_id)
+            .where(Trade.executed_at >= window_start)
+            .where(Trade.executed_at <= window_end)
+            .order_by(Trade.executed_at)
+        )
+        rows = (await session.execute(q)).scalars().all()
+
+    return [StrategyDecisionTradeRow.model_validate(r) for r in rows]
+
+
 @router.get("/strategy-decisions", response_model=list[StrategyDecisionResponse])
 async def list_strategy_decisions(
     decision_date: date | None = Query(None, alias="date"),
@@ -146,6 +191,7 @@ class SignalPerformanceRow(BaseModel):
     analyst_id: uuid.UUID | None
     analyst_name_raw: str | None
     signal_date: datetime
+    reasoning: str | None
 
 
 class SignalPerformanceSummary(BaseModel):
@@ -203,6 +249,7 @@ async def get_signal_performance(
                 analyst_id=sig.analyst_id,
                 analyst_name_raw=sig.analyst_name_raw,
                 signal_date=sig.signal_date,
+                reasoning=sig.reasoning,
             )
         )
         if sig.outcome_pnl_pct is not None:
