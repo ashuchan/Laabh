@@ -4,10 +4,13 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from src.api.middleware import RateLimitMiddleware, http_exception_handler
@@ -15,6 +18,9 @@ from src.api.routes import analysts, fno, instruments, portfolio, reports, signa
 from src.config import get_settings
 from src.db import dispose_engine
 from src.scheduler import build_scheduler
+
+# Path to the compiled Vite output for the desktop app
+_DESKTOP_DIST = Path(__file__).parent.parent.parent / "frontend" / "apps" / "desktop" / "dist"
 
 # Active WebSocket connections: symbol → set of websockets
 _price_subscribers: dict[str, set[WebSocket]] = {}
@@ -66,6 +72,22 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok"}
+
+    # Serve the compiled desktop app at /app (production mode only).
+    # In dev, use the Vite dev server on :5173 instead.
+    if _DESKTOP_DIST.exists():
+        app.mount("/app/assets", StaticFiles(directory=str(_DESKTOP_DIST / "assets")), name="desktop-assets")
+
+        @app.get("/app/{full_path:path}")
+        async def serve_desktop(full_path: str):
+            """Serve the desktop SPA — all unknown sub-paths return index.html."""
+            index = _DESKTOP_DIST / "index.html"
+            return FileResponse(str(index))
+
+        @app.get("/app")
+        async def serve_desktop_root():
+            index = _DESKTOP_DIST / "index.html"
+            return FileResponse(str(index))
 
     @app.websocket("/ws/prices")
     async def ws_prices(websocket: WebSocket):

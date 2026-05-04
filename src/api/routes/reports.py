@@ -226,6 +226,147 @@ async def get_signal_performance(
 
 
 # ---------------------------------------------------------------------------
+# Signal performance timeseries (for rolling hit-rate chart)
+# ---------------------------------------------------------------------------
+
+
+class TimeseriesBucket(BaseModel):
+    date: str
+    hit_rate: float
+    count: int
+
+
+class SignalPerformanceTimeseries(BaseModel):
+    buckets: list[TimeseriesBucket]
+
+
+@router.get("/signal-performance/timeseries", response_model=SignalPerformanceTimeseries)
+async def get_signal_performance_timeseries(
+    bucket: str = Query("day", pattern="^(day|week)$"),
+    days: int = Query(28, ge=7, le=180),
+    analyst_id: uuid.UUID | None = None,
+):
+    """Rolling hit-rate bucketed by day (or week) for trend chart."""
+    from datetime import timedelta
+
+    from sqlalchemy import case, func
+
+    from src.models.signal import Signal
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    async with session_scope() as session:
+        if bucket == "day":
+            date_trunc = func.date_trunc("day", Signal.signal_date)
+        else:
+            date_trunc = func.date_trunc("week", Signal.signal_date)
+
+        q = (
+            select(
+                date_trunc.label("bucket"),
+                func.count().label("total"),
+                func.count(case((Signal.outcome_pnl_pct > 0, 1))).label("hits"),
+            )
+            .where(Signal.signal_date >= since)
+            .where(Signal.outcome_pnl_pct.isnot(None))
+            .group_by(date_trunc)
+            .order_by(date_trunc)
+        )
+        if analyst_id:
+            q = q.where(Signal.analyst_id == analyst_id)
+        rows = (await session.execute(q)).all()
+
+    buckets = [
+        TimeseriesBucket(
+            date=row.bucket.strftime("%Y-%m-%d"),
+            hit_rate=(row.hits / row.total) if row.total else 0.0,
+            count=row.total,
+        )
+        for row in rows
+    ]
+    return SignalPerformanceTimeseries(buckets=buckets)
+
+
+# ---------------------------------------------------------------------------
+# Tier coverage heatmap (pre-aggregated for desktop heatmap widget)
+# ---------------------------------------------------------------------------
+
+
+class HeatmapCell(BaseModel):
+    symbol: str
+    bucket: str
+    success_rate: float | None
+
+
+class TierCoverageHeatmap(BaseModel):
+    symbols: list[str]
+    buckets: list[str]
+    cells: list[HeatmapCell]
+
+
+@router.get("/tier-coverage/heatmap", response_model=TierCoverageHeatmap)
+async def get_tier_coverage_heatmap(
+    since: datetime | None = Query(None),
+    buckets: int = Query(12, ge=1, le=60),
+):
+    """Pre-aggregated chain coverage in 5-minute buckets for the desktop heatmap.
+
+    Returns the last `buckets` × 5 minutes of data (default = last 60 min).
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import Integer, case, func, text
+
+    from src.models.fno_chain_log import ChainCollectionLog
+
+    if since is None:
+        since = datetime.now(timezone.utc) - timedelta(minutes=buckets * 5)
+
+    async with session_scope() as session:
+        # PostgreSQL: truncate to 5-min bucket via integer division
+        bucket_expr = func.date_trunc("hour", ChainCollectionLog.attempted_at) + (
+            func.floor(
+                func.extract("minute", ChainCollectionLog.attempted_at) / 5
+            ).cast(Integer)
+            * text("INTERVAL '5 minutes'")
+        )
+
+        q = (
+            select(
+                Instrument.symbol.label("symbol"),
+                bucket_expr.label("bucket"),
+                func.count().label("total"),
+                func.count(case((ChainCollectionLog.status == "ok", 1))).label("successes"),
+            )
+            .join(Instrument, ChainCollectionLog.instrument_id == Instrument.id, isouter=True)
+            .where(ChainCollectionLog.attempted_at >= since)
+            .group_by(Instrument.symbol, bucket_expr)
+            .order_by(Instrument.symbol, bucket_expr)
+        )
+        rows = (await session.execute(q)).all()
+
+    symbol_set: list[str] = []
+    bucket_set: list[str] = []
+    cells: list[HeatmapCell] = []
+
+    seen_symbols: set[str] = set()
+    seen_buckets: set[str] = set()
+
+    for row in rows:
+        sym = row.symbol or "Unknown"
+        bkt = row.bucket.strftime("%H:%M") if row.bucket else "?"
+        rate = (row.successes / row.total) if row.total else None
+        if sym not in seen_symbols:
+            symbol_set.append(sym)
+            seen_symbols.add(sym)
+        if bkt not in seen_buckets:
+            bucket_set.append(bkt)
+            seen_buckets.add(bkt)
+        cells.append(HeatmapCell(symbol=sym, bucket=bkt, success_rate=rate))
+
+    return TierCoverageHeatmap(symbols=symbol_set, buckets=bucket_set, cells=cells)
+
+
+# ---------------------------------------------------------------------------
 # Chain issues (read + resolve already exists under /fno; expose a thin wrapper here too)
 # ---------------------------------------------------------------------------
 
@@ -258,3 +399,31 @@ async def list_chain_issues(
         q = q.limit(limit)
         rows = (await session.execute(q)).scalars().all()
     return [ChainIssueRow.model_validate(r) for r in rows]
+
+
+class BulkResolveRequest(BaseModel):
+    issue_ids: list[uuid.UUID]
+    resolved_by: str = "desktop"
+
+
+class BulkResolveResponse(BaseModel):
+    resolved: int
+    not_found: int
+
+
+@router.post("/chain-issues/bulk-resolve", response_model=BulkResolveResponse)
+async def bulk_resolve_chain_issues(body: BulkResolveRequest):
+    """Resolve multiple chain issues in one request (desktop bulk-action)."""
+    now = datetime.now(timezone.utc)
+    resolved_count = 0
+    not_found_count = 0
+    async with session_scope() as session:
+        for issue_id in body.issue_ids:
+            row = await session.get(ChainCollectionIssue, issue_id)
+            if row is None:
+                not_found_count += 1
+            elif row.resolved_at is None:
+                row.resolved_at = now
+                session.add(row)
+                resolved_count += 1
+    return BulkResolveResponse(resolved=resolved_count, not_found=not_found_count)
