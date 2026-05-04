@@ -179,6 +179,41 @@ async def _fno_eod_tasks() -> None:
     await run_eod_tasks()
 
 
+async def _fno_morning_brief() -> None:
+    from src.fno.orchestrator import _send_morning_brief
+    await _send_morning_brief()
+
+
+async def _fno_phase4_entry() -> None:
+    """Auto-fire paper entries from Phase 3 PROCEED candidates."""
+    from src.fno.entry_executor import auto_enter
+    result = await auto_enter()
+    logger.info(f"fno phase4 entry: {result}")
+
+
+async def _fno_phase4_manage() -> None:
+    """Mark-to-market every open paper position; close on stop/target;
+    update trailing stops; emit Telegram alerts on close."""
+    from src.fno.position_manager import manage_tick
+    result = await manage_tick()
+    if result.get("closed", 0) or result.get("trailing", 0):
+        logger.info(f"fno phase4 manage: {result}")
+
+
+async def _fno_phase4_hard_exit() -> None:
+    """14:30 IST: force-close every still-open position with a hard-exit alert."""
+    from src.fno.position_manager import hard_exit_all
+    result = await hard_exit_all()
+    logger.info(f"fno phase4 hard exit: {result}")
+
+
+async def _fno_phase4_position_digest() -> None:
+    """Send a Telegram digest of open positions with MTM P&L."""
+    from src.fno.position_manager import send_position_digest
+    n = await send_position_digest()
+    logger.info(f"fno phase4 position digest: {n} open positions")
+
+
 async def _fno_macro_collect() -> None:
     from src.collectors.macro_collector import collect
     n = await collect()
@@ -375,6 +410,52 @@ def build_scheduler() -> AsyncIOScheduler:
         id="fno_vix_intraday",
         max_instances=1,
         coalesce=True,
+    )
+    # 09:11 IST — morning brief (Phase 3 PROCEED summary to Telegram)
+    sched.add_job(
+        _fno_morning_brief,
+        CronTrigger(hour=9, minute=11, day_of_week="mon-fri", timezone=ist),
+        id="fno_morning_brief",
+    )
+    # 09:15 IST — Phase 4 entry: open paper positions for each PROCEED.
+    # Runs once per day, four minutes after the morning brief, so the live
+    # 09:00 chain has had time to populate fresh bid/ask via the tier-1 cron.
+    sched.add_job(
+        _fno_phase4_entry,
+        CronTrigger(hour=9, minute=15, day_of_week="mon-fri", timezone=ist),
+        id="fno_phase4_entry",
+    )
+    # 09:16-14:30 IST every minute — Phase 4 manage tick: mark-to-market every
+    # open position, close on stop/target, update trailing stops, send alerts.
+    sched.add_job(
+        _fno_phase4_manage,
+        CronTrigger(
+            minute="*",
+            hour="9-14",
+            day_of_week="mon-fri",
+            timezone=ist,
+        ),
+        id="fno_phase4_manage",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 14:30 IST — Phase 4 hard exit: force-close anything still open.
+    sched.add_job(
+        _fno_phase4_hard_exit,
+        CronTrigger(hour=14, minute=30, day_of_week="mon-fri", timezone=ist),
+        id="fno_phase4_hard_exit",
+    )
+    # 11:30 IST — mid-session position digest to Telegram (open trades + MTM).
+    sched.add_job(
+        _fno_phase4_position_digest,
+        CronTrigger(hour=11, minute=30, day_of_week="mon-fri", timezone=ist),
+        id="fno_phase4_digest_midday",
+    )
+    # 13:30 IST — second position digest before the hard-exit window.
+    sched.add_job(
+        _fno_phase4_position_digest,
+        CronTrigger(hour=13, minute=30, day_of_week="mon-fri", timezone=ist),
+        id="fno_phase4_digest_afternoon",
     )
     # 15:40 IST — EOD IV history + daily summary
     sched.add_job(

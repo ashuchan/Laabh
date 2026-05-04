@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any, ClassVar
 
 import httpx
+from curl_cffi import requests as cf_requests
 from loguru import logger
 
 from src.config import get_settings
@@ -29,9 +30,14 @@ from src.fno.sources.exceptions import (
 )
 
 _NSE_BASE = "https://www.nseindia.com"
+# NSE migrated to /api/option-chain-v3 in 2024–25. The legacy v1 endpoints
+# (`/api/option-chain-indices`, `/api/option-chain-equities`) sit behind a
+# stricter Akamai bot check that rejects non-browser TLS fingerprints and
+# returns HTTP 200 with body `{}`. v3 works once we present a Chrome-impersonated
+# TLS handshake (via curl_cffi) plus a properly warmed cookie jar.
+_HOME_URL = f"{_NSE_BASE}/"
 _WARMUP_URL = f"{_NSE_BASE}/option-chain"
-_INDICES_URL = f"{_NSE_BASE}/api/option-chain-indices"
-_EQUITIES_URL = f"{_NSE_BASE}/api/option-chain-equities"
+_V3_URL = f"{_NSE_BASE}/api/option-chain-v3"
 
 # Symbols treated as indices (use /api/option-chain-indices)
 _INDEX_SYMBOLS = frozenset(
@@ -69,20 +75,39 @@ class NSESource(BaseChainSource):
     # Session management
     # ------------------------------------------------------------------
 
-    def _build_headers(self) -> dict[str, str]:
-        return {
+    def _build_headers(self, *, accept_html: bool = False) -> dict[str, str]:
+        # Modern Chrome fingerprint — NSE anti-bot reads sec-ch-ua/sec-fetch-*.
+        common = {
             "User-Agent": self._settings.nse_user_agent,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": _WARMUP_URL,
+            "Accept-Language": "en-US,en;q=0.9,en-IN;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not.A/Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Sec-Fetch-Dest": "document" if accept_html else "empty",
+            "Sec-Fetch-Mode": "navigate" if accept_html else "cors",
+            "Sec-Fetch-Site": "none" if accept_html else "same-origin",
         }
+        if accept_html:
+            common["Accept"] = (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            )
+        else:
+            common["Accept"] = "application/json, text/plain, */*"
+            common["Referer"] = _WARMUP_URL
+        return common
 
-    def _client_instance(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(15.0),
-                follow_redirects=True,
+    def _client_instance(self) -> "cf_requests.AsyncSession":
+        """curl_cffi AsyncSession impersonates Chrome's TLS handshake exactly,
+        which is required to defeat NSE's Akamai bot detection. The session
+        also persists cookies across requests."""
+        if self._client is None:
+            self._client = cf_requests.AsyncSession(
+                impersonate="chrome124",
+                timeout=20.0,
             )
         return self._client
 
@@ -91,21 +116,35 @@ class NSESource(BaseChainSource):
         return time.monotonic() - self._cookies_fetched_at > interval
 
     async def _refresh_cookies(self) -> None:
-        """GET the NSE option-chain page to obtain fresh session cookies."""
-        await _throttle(self._settings.nse_request_interval_sec)
+        """Two-step warmup: homepage then option-chain HTML page.
+
+        Even with curl_cffi's Chrome TLS fingerprint, NSE expects a request
+        sequence that mimics what a browser does: homepage first (sets the
+        Akamai `_abck`, `bm_sz`, `ak_bmsc` cookies), then the option-chain
+        HTML page (sets `nsit`, `nseappid` scoped to the API path).
+        """
         client = self._client_instance()
+        for url in (_HOME_URL, _WARMUP_URL):
+            await _throttle(self._settings.nse_request_interval_sec)
+            try:
+                resp = await client.get(url, headers=self._build_headers(accept_html=True))
+                if resp.status_code >= 400:
+                    raise SourceUnavailableError(
+                        f"NSE warmup {url} failed: HTTP {resp.status_code}"
+                    )
+            except Exception as exc:
+                raise SourceUnavailableError(
+                    f"NSE warmup network error on {url}: {exc}"
+                ) from exc
+
+        # Snapshot cookie names/count for logging only — curl_cffi's session
+        # holds the real values on its internal jar.
         try:
-            resp = await client.get(_WARMUP_URL, headers=self._build_headers())
-            resp.raise_for_status()
-            self._cookies = dict(resp.cookies)
-            self._cookies_fetched_at = time.monotonic()
-            logger.debug("nse_source: cookies refreshed")
-        except httpx.HTTPStatusError as exc:
-            raise SourceUnavailableError(
-                f"NSE cookie warmup failed: {exc.response.status_code}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise SourceUnavailableError(f"NSE cookie warmup network error: {exc}") from exc
+            self._cookies = {c.name: c.value for c in client.cookies.jar}
+        except Exception:
+            self._cookies = dict(getattr(client.cookies, "items", lambda: {})() or {})
+        self._cookies_fetched_at = time.monotonic()
+        logger.debug(f"nse_source: cookies refreshed ({len(self._cookies)} cookies)")
 
     async def _ensure_cookies(self) -> None:
         if not self._cookies or self._cookies_stale():
@@ -116,18 +155,14 @@ class NSESource(BaseChainSource):
     # ------------------------------------------------------------------
 
     async def _get(self, url: str) -> Any:
-        """Issue a GET with cookies; refresh once on auth failure."""
+        """Issue a GET with cookies; refresh once on auth failure or empty body."""
         for attempt in range(self._settings.nse_max_retries + 1):
             await _throttle(self._settings.nse_request_interval_sec)
             await self._ensure_cookies()
             client = self._client_instance()
             try:
-                resp = await client.get(
-                    url,
-                    headers=self._build_headers(),
-                    cookies=self._cookies,
-                )
-            except httpx.RequestError as exc:
+                resp = await client.get(url, headers=self._build_headers())
+            except Exception as exc:
                 raise SourceUnavailableError(f"NSE network error: {exc}") from exc
 
             if resp.status_code == 401 or resp.status_code == 403:
@@ -155,6 +190,18 @@ class NSESource(BaseChainSource):
                 raw = resp.text[:8192]
                 raise SchemaError(f"NSE response is not valid JSON: {exc}", raw) from exc
 
+            # NSE's anti-bot trick: HTTP 200 with body `{}`. Treat as a soft
+            # auth failure and retry after refreshing the cookie jar.
+            if isinstance(data, dict) and not data:
+                if attempt < self._settings.nse_max_retries:
+                    logger.warning(
+                        f"nse_source: empty body — refreshing cookies (attempt {attempt + 1})"
+                    )
+                    self._cookies = {}
+                    self._cookies_fetched_at = 0.0
+                    continue
+                raise SchemaError("NSE returned empty {} after retries", "{}")
+
             return data
 
         raise SourceUnavailableError("NSE: exhausted retries")
@@ -164,10 +211,14 @@ class NSESource(BaseChainSource):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _url_for(symbol: str) -> str:
-        if symbol.upper() in _INDEX_SYMBOLS:
-            return f"{_INDICES_URL}?symbol={symbol.upper()}"
-        return f"{_EQUITIES_URL}?symbol={symbol.upper()}"
+    def _url_for(symbol: str, expiry_date: date) -> str:
+        # v3 endpoint requires the type discriminator and a per-expiry filter.
+        # Expiry format is `DD-MMM-YYYY` (e.g. `26-May-2026`).
+        kind = "Indices" if symbol.upper() in _INDEX_SYMBOLS else "Equity"
+        exp = expiry_date.strftime("%d-%b-%Y")
+        sym = symbol.upper()
+        from urllib.parse import quote
+        return f"{_V3_URL}?type={kind}&symbol={quote(sym)}&expiry={quote(exp)}"
 
     @staticmethod
     def _parse_decimal(v: Any) -> Decimal | None:
@@ -180,6 +231,13 @@ class NSESource(BaseChainSource):
     def _parse_int(v: Any) -> int | None:
         try:
             return int(v) if v is not None else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_float(v: Any) -> float | None:
+        try:
+            return float(v) if v is not None and v != "" else None
         except Exception:
             return None
 
@@ -203,14 +261,16 @@ class NSESource(BaseChainSource):
         underlying_ltp = self._parse_decimal(records.get("underlyingValue"))
         snapshot_at = datetime.now(tz=timezone.utc)
 
-        # NSE returns all expiries; filter to the requested one
+        # v3 returns rows pre-filtered to the requested expiry, but the field
+        # is now `expiryDates` (plural). v1 used `expiryDate`. Accept either.
         expiry_str = expiry_date.strftime("%d-%b-%Y")
         strikes: list[StrikeRow] = []
 
         for entry in data:
             if not isinstance(entry, dict):
                 continue
-            if entry.get("expiryDate") != expiry_str:
+            row_expiry = entry.get("expiryDates") or entry.get("expiryDate")
+            if row_expiry and row_expiry != expiry_str:
                 continue
             strike_val = entry.get("strikePrice")
             if strike_val is None:
@@ -223,18 +283,25 @@ class NSESource(BaseChainSource):
                 opt_data = entry.get(key)
                 if not isinstance(opt_data, dict):
                     continue
+                # v3 uses `buyPrice1`/`sellPrice1` for top-of-book; v1 used
+                # `bidprice`/`askPrice`. Accept either.
+                bid_v = opt_data.get("buyPrice1", opt_data.get("bidprice"))
+                ask_v = opt_data.get("sellPrice1", opt_data.get("askPrice"))
+                bid_qty_v = opt_data.get("buyQuantity1", opt_data.get("bidQty"))
+                ask_qty_v = opt_data.get("sellQuantity1", opt_data.get("askQty"))
                 strikes.append(
                     StrikeRow(
                         strike=strike,
                         option_type=opt_type,
                         ltp=self._parse_decimal(opt_data.get("lastPrice")),
-                        bid=self._parse_decimal(opt_data.get("bidprice")),
-                        ask=self._parse_decimal(opt_data.get("askPrice")),
-                        bid_qty=self._parse_int(opt_data.get("bidQty")),
-                        ask_qty=self._parse_int(opt_data.get("askQty")),
+                        bid=self._parse_decimal(bid_v),
+                        ask=self._parse_decimal(ask_v),
+                        bid_qty=self._parse_int(bid_qty_v),
+                        ask_qty=self._parse_int(ask_qty_v),
                         volume=self._parse_int(opt_data.get("totalTradedVolume")),
                         oi=self._parse_int(opt_data.get("openInterest")),
-                        iv=None,  # NSE does not supply Greeks — parser computes them
+                        # v3 ships IV; Greeks are computed downstream.
+                        iv=self._parse_float(opt_data.get("impliedVolatility")),
                     )
                 )
 
@@ -252,7 +319,7 @@ class NSESource(BaseChainSource):
 
     async def fetch(self, symbol: str, expiry_date: date) -> ChainSnapshot:
         """Fetch and parse the NSE option chain for (symbol, expiry_date)."""
-        url = self._url_for(symbol)
+        url = self._url_for(symbol, expiry_date)
         raw = await self._get(url)
         snapshot = self._parse_response(raw, symbol, expiry_date)
         if not snapshot.strikes:
@@ -273,5 +340,15 @@ class NSESource(BaseChainSource):
             return False
 
     async def close(self) -> None:
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
+        # curl_cffi AsyncSession has .close() (sync) — no aclose().
+        if self._client is not None:
+            try:
+                close = getattr(self._client, "close", None)
+                if callable(close):
+                    res = close()
+                    # In some versions close() is async
+                    if hasattr(res, "__await__"):
+                        await res
+            except Exception:
+                pass
+            self._client = None

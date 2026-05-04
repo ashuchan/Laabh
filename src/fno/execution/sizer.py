@@ -45,7 +45,8 @@ def compute_lots(
     raw_lots = int(risk_budget / max_risk_per_lot)
 
     # Cap by max position size in nominal premium terms
-    premium_per_lot = atm_premium * lot_size
+    premium_per_lot = atm_premium * lot_size if atm_premium > 0 and lot_size > 0 else Decimal("0")
+    max_lots_by_capital = 0
     if premium_per_lot > 0:
         max_lots_by_capital = int(
             portfolio_capital * Decimal(str(max_position_pct)) / premium_per_lot
@@ -56,7 +57,17 @@ def compute_lots(
     if vix_regime == "high":
         raw_lots = max(raw_lots // 2, 0)
 
-    return max(raw_lots, 1) if raw_lots >= 1 else 0
+    if raw_lots >= 1:
+        return raw_lots
+
+    # Paper-trading floor: if the budget can't size by risk-per-trade but the
+    # position still fits within max_position_pct of capital, allow exactly
+    # 1 lot. This prevents the sizer from silently dropping every PROCEED
+    # when a single ATM premium exceeds the per-trade risk budget on a
+    # small account.
+    if max_lots_by_capital >= 1:
+        return 1
+    return 0
 
 
 def compute_stop_loss(

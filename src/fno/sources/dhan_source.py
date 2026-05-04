@@ -26,7 +26,8 @@ from src.fno.sources.exceptions import (
 )
 
 _DHAN_CHAIN_URL = "https://api.dhan.co/v2/optionchain"
-_DHAN_HEALTH_URL = "https://api.dhan.co/v2/marketstatus"
+_DHAN_HEALTH_URL = "https://api.dhan.co/v2/fundlimit"
+_DHAN_INSTRUMENT_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 # Dhan segment codes
 _SEG_INDEX = "IDX_I"
@@ -34,6 +35,23 @@ _SEG_EQUITY = "NSE_FNO"
 _INDEX_SYMBOLS = frozenset(
     {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 )
+
+# Dhan publishes well-known security_ids for the major indices on its docs.
+# Hard-coded so we don't have to load the master CSV just to query NIFTY.
+_INDEX_SECURITY_IDS: dict[str, int] = {
+    "NIFTY": 13,
+    "BANKNIFTY": 25,
+    "FINNIFTY": 27,
+    "MIDCPNIFTY": 442,
+    "NIFTYNXT50": 26,
+    "SENSEX": 51,
+    "BANKEX": 52,
+}
+
+# Process-wide cache: symbol → security_id for equities. Lazy-loaded on first
+# miss from the Dhan instrument master CSV.
+_EQUITY_SECID_CACHE: dict[str, int] = {}
+_MASTER_LOAD_LOCK = asyncio.Lock()
 
 
 class DhanSource(BaseChainSource):
@@ -81,6 +99,63 @@ class DhanSource(BaseChainSource):
     @staticmethod
     def _segment_for(symbol: str) -> str:
         return _SEG_INDEX if symbol.upper() in _INDEX_SYMBOLS else _SEG_EQUITY
+
+    async def _load_equity_master(self) -> None:
+        """Lazy-load Dhan's instrument master CSV into the equity security_id cache.
+
+        The CSV is ~5 MB. Called once per process. Filters to NSE equities
+        only (the F&O underlying segment).
+        """
+        async with _MASTER_LOAD_LOCK:
+            if _EQUITY_SECID_CACHE:
+                return
+            logger.info("dhan_source: downloading instrument master")
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.get(_DHAN_INSTRUMENT_MASTER_URL)
+                resp.raise_for_status()
+            import csv
+            import io
+            reader = csv.DictReader(io.StringIO(resp.text))
+            count = 0
+            for row in reader:
+                # Use the symbol that appears in NSE equity F&O underlying.
+                # Different vintages of the master CSV use different column
+                # names; check both common forms.
+                seg = (row.get("SEM_SEGMENT") or row.get("EXCH_SEGMENT") or "").strip()
+                inst = (row.get("SEM_INSTRUMENT_NAME") or row.get("INSTRUMENT") or "").strip()
+                sym = (
+                    row.get("SEM_TRADING_SYMBOL")
+                    or row.get("SM_SYMBOL_NAME")
+                    or row.get("UNDERLYING_SYMBOL")
+                    or ""
+                ).strip().upper()
+                sid = (row.get("SEM_SMST_SECURITY_ID") or row.get("SECURITY_ID") or "").strip()
+                if not sym or not sid:
+                    continue
+                # Keep only NSE cash-segment equity rows; F&O underlyings
+                # quote off NSE_EQ for option-chain lookups.
+                if seg and seg.upper() not in ("NSE_EQ", "E"):
+                    continue
+                if inst and inst.upper() not in ("EQUITY", "EQ"):
+                    continue
+                try:
+                    _EQUITY_SECID_CACHE[sym] = int(sid)
+                    count += 1
+                except ValueError:
+                    continue
+            logger.info(f"dhan_source: cached {count} NSE equity security_ids")
+
+    async def _security_id_for(self, symbol: str) -> int | None:
+        sym = symbol.upper()
+        if sym in _INDEX_SECURITY_IDS:
+            return _INDEX_SECURITY_IDS[sym]
+        if not _EQUITY_SECID_CACHE:
+            try:
+                await self._load_equity_master()
+            except Exception as exc:
+                logger.warning(f"dhan_source: master load failed: {exc}")
+                return None
+        return _EQUITY_SECID_CACHE.get(sym)
 
     @staticmethod
     def _parse_decimal(v: Any) -> Decimal | None:
@@ -137,27 +212,29 @@ class DhanSource(BaseChainSource):
             except Exception:
                 continue
 
-            for opt_type, key in (("CE", "call"), ("PE", "put")):
+            for opt_type, key in (("CE", "ce"), ("PE", "pe")):
                 opt_data = opts.get(key)
                 if not isinstance(opt_data, dict):
                     continue
+                # Dhan v2 nests greeks under a 'greeks' sub-dict
+                greeks = opt_data.get("greeks") or {}
                 strikes.append(
                     StrikeRow(
                         strike=strike,
                         option_type=opt_type,
                         ltp=self._parse_decimal(opt_data.get("last_price")),
-                        bid=self._parse_decimal(opt_data.get("bid_price")),
-                        ask=self._parse_decimal(opt_data.get("ask_price")),
-                        bid_qty=self._parse_int(opt_data.get("bid_qty")),
-                        ask_qty=self._parse_int(opt_data.get("ask_qty")),
+                        bid=self._parse_decimal(opt_data.get("top_bid_price")),
+                        ask=self._parse_decimal(opt_data.get("top_ask_price")),
+                        bid_qty=self._parse_int(opt_data.get("top_bid_quantity")),
+                        ask_qty=self._parse_int(opt_data.get("top_ask_quantity")),
                         volume=self._parse_int(opt_data.get("volume")),
                         oi=self._parse_int(opt_data.get("oi")),
-                        # Dhan provides Greeks natively
+                        # Dhan provides Greeks natively under data.oc[strike].{ce,pe}.greeks
                         iv=self._parse_float(opt_data.get("implied_volatility")),
-                        delta=self._parse_float(opt_data.get("delta")),
-                        gamma=self._parse_float(opt_data.get("gamma")),
-                        theta=self._parse_float(opt_data.get("theta")),
-                        vega=self._parse_float(opt_data.get("vega")),
+                        delta=self._parse_float(greeks.get("delta")),
+                        gamma=self._parse_float(greeks.get("gamma")),
+                        theta=self._parse_float(greeks.get("theta")),
+                        vega=self._parse_float(greeks.get("vega")),
                     )
                 )
 
@@ -178,8 +255,15 @@ class DhanSource(BaseChainSource):
         await self._throttle_for(symbol)
 
         headers = self._headers()  # raises AuthError if not configured
+
+        # Dhan's Data API expects an integer security_id, not the ticker string.
+        sec_id = await self._security_id_for(symbol)
+        if sec_id is None:
+            raise SourceUnavailableError(
+                f"Dhan: no security_id known for symbol '{symbol}'"
+            )
         payload = {
-            "UnderlyingScrip": symbol.upper(),
+            "UnderlyingScrip": sec_id,
             "UnderlyingSeg": self._segment_for(symbol),
             "Expiry": expiry_date.strftime("%Y-%m-%d"),
         }

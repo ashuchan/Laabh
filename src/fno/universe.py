@@ -264,13 +264,21 @@ async def run_phase1(
         run_date = date.today() if as_of is None else as_of.date()
 
     cfg = _settings
-    min_oi = cfg.fno_phase1_min_atm_oi
-    max_spread = cfg.fno_phase1_max_atm_spread_pct
+    min_oi_tier1 = cfg.fno_phase1_min_atm_oi
+    min_oi_tier2 = cfg.fno_phase1_min_atm_oi_tier2
+    max_spread_tier1 = cfg.fno_phase1_max_atm_spread_pct_tier1
+    max_spread_tier2 = cfg.fno_phase1_max_atm_spread_pct
     min_vol = cfg.fno_phase1_min_avg_volume_5d
     config_ver = getattr(cfg, "fno_ranker_version", "v1")
 
     async with session_scope() as session:
         instruments = await _get_fno_instruments(session)
+        # Tier lookup so Phase 1 can apply per-tier OI thresholds.
+        from src.models.fno_collection_tier import FNOCollectionTier
+        tier_rows = await session.execute(
+            select(FNOCollectionTier.instrument_id, FNOCollectionTier.tier)
+        )
+        tier_by_id = {str(r.instrument_id): r.tier for r in tier_rows.all()}
 
     if not instruments:
         logger.warning("fno.universe: no F&O instruments found")
@@ -289,6 +297,13 @@ async def run_phase1(
             async with session_scope() as session:
                 atm_oi, spread = await _get_atm_chain_row(session, inst_id, as_of=as_of)
                 avg_vol = await _get_avg_volume_5d(session, inst_id, run_date, cutoff_date=run_date)
+
+            # Tier-aware OI threshold: Tier 1 large-caps face the strict
+            # 50k bar; Tier 2 mid/small-caps get the lower bar. Untiered
+            # instruments default to Tier 2 (charitable assumption).
+            tier = tier_by_id.get(inst_id, 2)
+            min_oi = min_oi_tier1 if tier == 1 else min_oi_tier2
+            max_spread = max_spread_tier1 if tier == 1 else max_spread_tier2
 
             passed, fail_reason = apply_liquidity_filter(
                 atm_oi, spread, avg_vol,

@@ -137,17 +137,88 @@ def compute_composite(
     w_fii_dii: float = 0.8,
     w_macro: float = 0.8,
     w_convergence: float = 1.5,
+    policy_event: float | None = None,
+    w_policy_event: float = 0.6,
+    regime_bias: float = 0.0,
 ) -> float:
-    """Weighted average of five dimension scores, normalized to 0-10."""
-    total_weight = w_news + w_sentiment + w_fii_dii + w_macro + w_convergence
-    weighted = (
-        news * w_news
-        + sentiment * w_sentiment
-        + fii_dii * w_fii_dii
-        + macro * w_macro
-        + convergence * w_convergence
+    """Weighted average of dimension scores, normalized to 0-10, with optional
+    policy_event term and a global regime_bias offset.
+
+    `policy_event` is a 0-10 score for sector-specific election/policy impact.
+    `regime_bias` is a global offset (-2 to +2) applied uniformly to every
+    candidate on macro/event days; e.g. +1.5 across the board on a strong
+    pro-business election outcome.
+    """
+    weights = [(news, w_news), (sentiment, w_sentiment), (fii_dii, w_fii_dii),
+               (macro, w_macro), (convergence, w_convergence)]
+    if policy_event is not None:
+        weights.append((policy_event, w_policy_event))
+
+    total_weight = sum(w for _, w in weights)
+    weighted = sum(s * w for s, w in weights)
+    base = weighted / total_weight if total_weight > 0 else 5.0
+    return round(max(0.0, min(10.0, base + regime_bias)), 2)
+
+
+def score_policy_event(
+    sector: str | None,
+    policy_articles: list[dict],
+) -> float:
+    """Per-sector election/policy bias from `is_policy_related` articles.
+
+    `policy_articles` is a list of dicts with keys:
+      sectors_mentioned (list[str])  — canonicalised sector names
+      market_sentiment  (str)        — bullish | bearish | neutral
+
+    Returns 0-10 (5.0 = neutral / no relevant articles).
+    """
+    if not sector or not policy_articles:
+        return 5.0
+
+    bullish = bearish = 0
+    for art in policy_articles:
+        sectors = [str(s) for s in (art.get("sectors_mentioned") or [])]
+        if sector not in sectors:
+            continue
+        s = (art.get("market_sentiment") or "").strip().lower()
+        if s == "bullish":
+            bullish += 1
+        elif s == "bearish":
+            bearish += 1
+
+    total = bullish + bearish
+    if total == 0:
+        return 5.0
+    ratio = (bullish - bearish) / total  # -1..+1
+    return round(5.0 + ratio * 5.0, 2)
+
+
+def compute_regime_bias(policy_articles: list[dict]) -> float:
+    """Compute a global market regime offset from policy/macro articles.
+
+    Returns a value in roughly [-2, +2]. Applied as a constant additive offset
+    to every Phase 2 candidate's composite score on macro/event days.
+    """
+    if not policy_articles:
+        return 0.0
+
+    bullish = sum(
+        1 for a in policy_articles
+        if (a.get("market_sentiment") or "").strip().lower() == "bullish"
     )
-    return round(weighted / total_weight, 2)
+    bearish = sum(
+        1 for a in policy_articles
+        if (a.get("market_sentiment") or "").strip().lower() == "bearish"
+    )
+    total = bullish + bearish
+    if total < 3:  # need a minimum signal to apply a regime bias
+        return 0.0
+    ratio = (bullish - bearish) / total  # -1..+1
+    # Scale to ±2.0 max, dampened by sqrt(total)/5 so a single hot article
+    # doesn't shift the whole market.
+    import math
+    confidence = min(1.0, math.sqrt(total) / 5.0)
+    return round(ratio * 2.0 * confidence, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +306,43 @@ async def _get_latest_macro(session) -> dict[str, float]:
         except Exception:
             continue
     return snapshots
+
+
+async def _get_policy_articles(session, lookback_hours: int) -> list[dict]:
+    """Pull `is_policy_related=true` extractions from the last `lookback_hours`.
+
+    Returns a list of dicts with sectors_mentioned + market_sentiment, each
+    canonicalised. Reads RawContent.extraction_result JSON column written by
+    LLMExtractor._mark_processed.
+    """
+    from src.extraction.llm_extractor import _canonicalise_sector
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
+    result = await session.execute(
+        select(RawContent.extraction_result)
+        .where(
+            RawContent.fetched_at >= cutoff,
+            RawContent.is_processed == True,  # noqa: E712
+            RawContent.extraction_result.is_not(None),
+        )
+        .limit(500)
+    )
+    articles: list[dict] = []
+    for (er,) in result.all():
+        if not isinstance(er, dict):
+            continue
+        if not er.get("is_policy_related"):
+            continue
+        raw_sectors = er.get("sectors_mentioned") or []
+        canon = [
+            s for s in (_canonicalise_sector(str(x)) for x in raw_sectors) if s
+        ]
+        if not canon:
+            continue
+        articles.append({
+            "sectors_mentioned": canon,
+            "market_sentiment": (er.get("market_sentiment") or "").lower(),
+        })
+    return articles
 
 
 async def _get_sentiment_score(session) -> float:
@@ -332,8 +440,15 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
         fii_net, dii_net = await _get_latest_fii_dii(session)
         macro_snaps = await _get_latest_macro(session)
         sentiment = await _get_sentiment_score(session)
+        policy_articles = await _get_policy_articles(session, lookback)
 
     fii_dii_s = score_fii_dii(fii_net, dii_net)
+    regime_bias = compute_regime_bias(policy_articles)
+    if regime_bias != 0.0:
+        logger.info(
+            f"fno.catalyst: regime_bias={regime_bias:+.2f} from "
+            f"{len(policy_articles)} policy/macro articles"
+        )
 
     if not candidates:
         logger.warning("fno.catalyst: no Phase-1 candidates to score")
@@ -352,6 +467,7 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
 
             news_s = score_news(bullish_ct, bearish_ct)
             macro_s = score_macro(sector, macro_snaps)
+            policy_s = score_policy_event(sector, policy_articles)
             conv_s = score_convergence(news_s, sentiment, fii_dii_s, macro_s)
             comp_s = compute_composite(
                 news_s, sentiment, fii_dii_s, macro_s, conv_s,
@@ -360,6 +476,8 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
                 w_fii_dii=cfg.fno_phase2_weight_fii_dii,
                 w_macro=cfg.fno_phase2_weight_macro,
                 w_convergence=cfg.fno_phase2_weight_convergence,
+                policy_event=policy_s,
+                regime_bias=regime_bias,
             )
 
             passed = comp_s >= min_score

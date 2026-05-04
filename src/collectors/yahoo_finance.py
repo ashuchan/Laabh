@@ -62,18 +62,35 @@ class YahooFinanceCollector(BaseCollector):
         if df is None or df.empty:
             return 0
 
+        # Newer yfinance returns a MultiIndex on columns even for a single
+        # ticker (e.g. ("Open", "RELIANCE.NS")) which makes row["Open"] return
+        # a Series, breaking float() conversion. Flatten by dropping level 1.
+        if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+            df.columns = df.columns.get_level_values(0)
+
+        def _scalar(row, col):
+            v = row[col]
+            if hasattr(v, "iloc"):  # still a Series — take the first value
+                v = v.iloc[0]
+            return v
+
         rows_inserted = 0
         async with session_scope() as session:
             for idx, row in df.iterrows():
                 d: date = idx.date() if hasattr(idx, "date") else idx
+                op, hi, lo, cl, vol = (
+                    _scalar(row, "Open"), _scalar(row, "High"),
+                    _scalar(row, "Low"), _scalar(row, "Close"),
+                    _scalar(row, "Volume"),
+                )
                 payload = {
                     "instrument_id": inst.id,
                     "date": d,
-                    "open": float(row["Open"]) if not _isnan(row["Open"]) else None,
-                    "high": float(row["High"]) if not _isnan(row["High"]) else None,
-                    "low": float(row["Low"]) if not _isnan(row["Low"]) else None,
-                    "close": float(row["Close"]) if not _isnan(row["Close"]) else None,
-                    "volume": int(row["Volume"]) if not _isnan(row["Volume"]) else None,
+                    "open": float(op) if not _isnan(op) else None,
+                    "high": float(hi) if not _isnan(hi) else None,
+                    "low": float(lo) if not _isnan(lo) else None,
+                    "close": float(cl) if not _isnan(cl) else None,
+                    "volume": int(vol) if not _isnan(vol) else None,
                 }
                 stmt = pg_insert(PriceDaily).values(**payload)
                 stmt = stmt.on_conflict_do_update(

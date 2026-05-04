@@ -59,6 +59,28 @@ async def run_premarket_pipeline(
     phase2_passed = sum(1 for r in phase2_results if r.passed)
     logger.info(f"fno.orchestrator: Phase 2 → {phase2_passed}/{len(phase2_results)} passed")
 
+    # Phase 2.5: per-symbol news fan-in for Phase 3 context.
+    # Pulls a targeted Google News query for the top-N Phase 2 passers,
+    # immediately runs the LLM extractor over the new articles so that
+    # Phase 3's prompt has stock-specific narrative.
+    try:
+        from src.extraction.llm_extractor import LLMExtractor
+        from src.fno.news_fanin import fan_in_for_phase2
+        fanin = await fan_in_for_phase2(
+            run_date,
+            top_n=_settings.fno_phase3_target_output,
+        )
+        if fanin.get("articles", 0) > 0:
+            n_signals = await LLMExtractor().process_pending(
+                limit=fanin["articles"] + 10
+            )
+            logger.info(
+                f"fno.orchestrator: phase2.5 fan-in → "
+                f"{fanin['articles']} articles, {n_signals} signals"
+            )
+    except Exception as exc:
+        logger.warning(f"fno.orchestrator: phase2.5 fan-in failed: {exc}")
+
     # Phase 3: thesis synthesis
     phase3_results = await run_phase3(run_date)
     phase3_proceed = sum(1 for r in phase3_results if r.decision == "PROCEED")
@@ -118,16 +140,196 @@ async def run_eod_tasks(run_date: date | None = None) -> None:
 
 
 async def _send_daily_summary(run_date: date) -> None:
+    from sqlalchemy import func, select
+
+    from src.db import session_scope
     from src.fno.notifications import format_daily_summary
+    from src.models.fno_candidate import FNOCandidate
+    from src.models.fno_signal import FNOSignal
     from src.services.side_effect_gateway import get_gateway
+
+    async with session_scope() as session:
+        # Phase 1/2 = candidates that passed liquidity / had a composite score
+        p1_row = await session.execute(
+            select(func.count()).where(
+                FNOCandidate.run_date == run_date,
+                FNOCandidate.phase == 1,
+                FNOCandidate.passed_liquidity == True,  # noqa: E712
+                FNOCandidate.dryrun_run_id.is_(None),
+            )
+        )
+        phase1_passed = p1_row.scalar() or 0
+
+        p2_row = await session.execute(
+            select(func.count()).where(
+                FNOCandidate.run_date == run_date,
+                FNOCandidate.phase == 2,
+                FNOCandidate.composite_score.is_not(None),
+                FNOCandidate.dryrun_run_id.is_(None),
+            )
+        )
+        phase2_passed = p2_row.scalar() or 0
+
+        p3_row = await session.execute(
+            select(func.count()).where(
+                FNOCandidate.run_date == run_date,
+                FNOCandidate.phase == 3,
+                FNOCandidate.llm_decision == "PROCEED",
+                FNOCandidate.dryrun_run_id.is_(None),
+            )
+        )
+        phase3_proceed = p3_row.scalar() or 0
+
+        trades_row = await session.execute(
+            select(func.count()).where(
+                func.date(FNOSignal.proposed_at) == run_date,
+                FNOSignal.status.in_(
+                    ["paper_filled", "active", "scaled_out_50",
+                     "closed_target", "closed_stop", "closed_time"]
+                ),
+                FNOSignal.dryrun_run_id.is_(None),
+            )
+        )
+        trades_entered = trades_row.scalar() or 0
+
+        pnl_row = await session.execute(
+            select(func.coalesce(func.sum(FNOSignal.final_pnl), 0)).where(
+                func.date(FNOSignal.proposed_at) == run_date,
+                FNOSignal.final_pnl.is_not(None),
+                FNOSignal.dryrun_run_id.is_(None),
+            )
+        )
+        net_pnl = Decimal(str(pnl_row.scalar() or 0))
 
     summary_msg = format_daily_summary(
         run_date=run_date.isoformat(),
-        phase1_passed=0,
-        phase2_passed=0,
-        phase3_proceed=0,
-        trades_entered=0,
-        net_pnl=Decimal("0"),
+        phase1_passed=phase1_passed,
+        phase2_passed=phase2_passed,
+        phase3_proceed=phase3_proceed,
+        trades_entered=trades_entered,
+        net_pnl=net_pnl,
     )
     await get_gateway().send_telegram(summary_msg)
-    logger.info("fno.orchestrator: daily summary notification sent")
+    logger.info(
+        f"fno.orchestrator: daily summary sent — p1={phase1_passed} p2={phase2_passed} "
+        f"p3_proceed={phase3_proceed} trades={trades_entered} pnl={net_pnl}"
+    )
+
+
+async def _send_morning_brief(run_date: date | None = None) -> None:
+    """Pre-open brief: list every Phase 3 PROCEED candidate for today.
+
+    Pushes to Telegram and stamps a `notifications` row so the runday
+    `checkpoint.morning_brief` check finds it.
+    """
+    from datetime import datetime as _dt
+
+    from sqlalchemy import select
+
+    from src.db import session_scope
+    from src.fno.notifications import format_morning_brief
+    from src.models.fno_candidate import FNOCandidate
+    from src.models.instrument import Instrument
+    from src.models.notification import Notification
+    from src.services.side_effect_gateway import get_gateway
+
+    if run_date is None:
+        run_date = date.today()
+
+    if not _settings.fno_module_enabled:
+        logger.info("fno.orchestrator: F&O disabled — skipping morning brief")
+        return
+
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(
+                FNOCandidate.instrument_id,
+                Instrument.symbol,
+                FNOCandidate.composite_score,
+                FNOCandidate.iv_regime,
+                FNOCandidate.oi_structure,
+                FNOCandidate.llm_thesis,
+            )
+            .join(Instrument, Instrument.id == FNOCandidate.instrument_id)
+            .where(
+                FNOCandidate.run_date == run_date,
+                FNOCandidate.phase == 3,
+                FNOCandidate.llm_decision == "PROCEED",
+                FNOCandidate.dryrun_run_id.is_(None),
+            )
+            .order_by(FNOCandidate.composite_score.desc().nulls_last())
+        )
+        phase3_rows = rows.all()
+
+    # Pull contract-level proposals from the entry engine (chooses strategy +
+    # specific strikes from the live chain). Map them by instrument_id so
+    # we can splice them into each candidate dict below.
+    from src.fno.entry_engine import propose_entries
+    proposals_by_inst: dict[str, "object"] = {}
+    try:
+        proposals = await propose_entries(run_date)
+        proposals_by_inst = {p.instrument_id: p for p in proposals}
+    except Exception as exc:
+        logger.warning(f"morning brief: entry_engine failed: {exc}")
+
+    candidates = []
+    for r in phase3_rows:
+        prop = proposals_by_inst.get(str(r.instrument_id))
+        cand = {
+            "symbol": r.symbol,
+            "direction": _direction_from_oi(r.oi_structure),
+            "strategy": (prop.strategy_name if prop else (r.oi_structure or "tbd")),
+            "composite_score": r.composite_score,
+            "iv_regime": r.iv_regime or "n/a",
+            "thesis": r.llm_thesis or "",
+        }
+        if prop:
+            cand["contract"] = prop.short_label()
+            cand["underlying_ltp"] = prop.underlying_ltp
+            cand["target_premium"] = prop.target_premium
+            cand["stop_premium"] = prop.stop_premium
+        candidates.append(cand)
+
+    msg = format_morning_brief(run_date=run_date.isoformat(), candidates=candidates)
+
+    # Append a digest of currently-open paper positions (carried over from
+    # prior sessions or freshly opened earlier today). Adds MTM context so
+    # the operator sees the full book at the same time as new candidates.
+    try:
+        from src.fno.position_manager import (
+            format_position_digest,
+            open_positions_summary,
+        )
+        positions = await open_positions_summary()
+        if positions:
+            msg = msg + "\n\n" + format_position_digest(positions)
+    except Exception as exc:
+        logger.warning(f"morning brief: position digest failed: {exc}")
+
+    await get_gateway().send_telegram(msg)
+
+    async with session_scope() as session:
+        session.add(
+            Notification(
+                type="system",
+                priority="medium",
+                title=f"F&O Morning Brief ({run_date.isoformat()})",
+                body=msg,
+                is_pushed=True,
+                pushed_at=_dt.now(tz=timezone.utc),
+                push_channel="telegram",
+            )
+        )
+    logger.info(f"fno.orchestrator: morning brief sent — {len(candidates)} candidate(s)")
+
+
+def _direction_from_oi(oi_structure: str | None) -> str:
+    """Map oi_structure / strategy hint to a coarse bullish/bearish/neutral tag."""
+    if not oi_structure:
+        return "neutral"
+    s = oi_structure.lower()
+    if "bull" in s or "long" in s:
+        return "bullish"
+    if "bear" in s or "short" in s:
+        return "bearish"
+    return "neutral"

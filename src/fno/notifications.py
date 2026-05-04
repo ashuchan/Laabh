@@ -142,3 +142,49 @@ def format_daily_summary(
         f"Trades entered: {_escape(str(trades_entered))}\n"
         f"Net P&L: {pnl_sign}{_escape(str(net_pnl))}"
     )
+
+
+def format_morning_brief(
+    run_date: str,
+    candidates: list[dict],
+) -> str:
+    """Format the pre-open morning brief listing PROCEED candidates.
+
+    Each candidate dict needs: symbol, direction, strategy, composite_score,
+    iv_regime, thesis. Optionally:
+      - contract: pre-formatted leg label (e.g. "BUY CE 1700 @ ₹42.50 (exp 26-May)")
+      - underlying_ltp, target_premium, stop_premium for richer rendering.
+    List may be empty (no Phase 3 PROCEEDs that day).
+    """
+    header = f"🌅 *F&O Morning Brief \\({_escape(run_date)}\\)*\n"
+    if not candidates:
+        return header + "_No Phase 3 PROCEED candidates for today\\._"
+
+    lines = [header, f"{_escape(str(len(candidates)))} candidate\\(s\\) ready:"]
+    for i, c in enumerate(candidates, 1):
+        emoji = _direction_emoji(c.get("direction", "neutral"))
+        sym = _escape(str(c.get("symbol", "?")))
+        strat = _escape(str(c.get("strategy", "")).replace("_", " ").title())
+        score = _escape(f"{float(c.get('composite_score') or 0):.1f}")
+        iv = _escape(str(c.get("iv_regime", "n/a")))
+        thesis = _escape(str(c.get("thesis", ""))[:140])
+
+        block = (
+            f"\n*{_escape(str(i))}\\. {emoji} {sym}*  "
+            f"\\(score: {score}, IV: {iv}\\)\n"
+            f"  Strategy: {strat}\n"
+        )
+        if c.get("contract"):
+            block += f"  Contract: `{_escape(str(c['contract']))}`\n"
+            tgt = c.get("target_premium")
+            stop = c.get("stop_premium")
+            if tgt and stop:
+                block += (
+                    f"  Target: ₹{_escape(str(tgt))} \\| "
+                    f"Stop: ₹{_escape(str(stop))}\n"
+                )
+        if c.get("underlying_ltp"):
+            block += f"  Underlying: ₹{_escape(str(c['underlying_ltp']))}\n"
+        block += f"  _{thesis}_"
+        lines.append(block)
+    return "".join(lines)

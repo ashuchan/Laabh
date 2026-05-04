@@ -177,11 +177,11 @@ async def _get_instrument(session, instrument_id: str) -> Instrument | None:
 async def _get_headlines(session, instrument_id: str, lookback_hours: int) -> list[str]:
     cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
     result = await session.execute(
-        select(Signal.summary)
+        select(Signal.reasoning)
         .where(
             Signal.instrument_id == instrument_id,
             Signal.created_at >= cutoff,
-            Signal.summary.isnot(None),
+            Signal.reasoning.isnot(None),
         )
         .order_by(Signal.created_at.desc())
         .limit(5)
@@ -308,8 +308,10 @@ async def run_phase3(run_date: date | None = None) -> list[ThesisResult]:
             if instrument is None:
                 continue
 
-            # Derive iv_regime from iv_rank (simplified — no live VIX needed)
-            iv_rank = float(cand.iv_rank_52w or 50)
+            # Derive iv_regime from iv_rank (simplified — no live VIX needed).
+            # FNOCandidate doesn't carry iv_rank_52w; iv_history would supply it
+            # but for now fall back to a neutral mid-range default.
+            iv_rank = float(getattr(cand, "iv_rank_52w", None) or 50)
             iv_regime = "high" if iv_rank > 70 else ("low" if iv_rank < 30 else "neutral")
 
             # OI structure from chain PCR (stubbed to unknown if no data)
@@ -324,7 +326,7 @@ async def run_phase3(run_date: date | None = None) -> list[ThesisResult]:
                 symbol=instrument.symbol,
                 sector=instrument.sector,
                 underlying_price=float(instrument.market_cap_cr or 0),
-                iv_rank=float(cand.iv_rank_52w or 50),
+                iv_rank=iv_rank,
                 iv_regime=iv_regime,
                 oi_structure=oi_structure,
                 days_to_expiry=days_to_expiry,

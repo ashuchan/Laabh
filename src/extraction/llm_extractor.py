@@ -21,9 +21,90 @@ from src.extraction.prompts import (
     SYSTEM_PROMPT,
 )
 from src.models.content import RawContent
+from src.models.instrument import Instrument
 from src.models.llm_audit_log import LLMAuditLog
 from src.models.signal import Signal
 from src.models.source import DataSource
+
+# Map LLM-emitted sector phrases to canonical Instrument.sector values.
+# Keys are lowercased, hyphen/space-tolerant. Values must match the strings
+# stored in instruments.sector for the F&O universe.
+_SECTOR_ALIASES: dict[str, str] = {
+    # Financials — DB uses "Financials" for all banks + NBFCs + insurance
+    "psu bank": "Financials",
+    "psu banks": "Financials",
+    "public sector bank": "Financials",
+    "public sector banks": "Financials",
+    "private bank": "Financials",
+    "private banks": "Financials",
+    "bank": "Financials",
+    "banks": "Financials",
+    "banking": "Financials",
+    "financial": "Financials",
+    "financials": "Financials",
+    "financial services": "Financials",
+    "nbfc": "Financials",
+    "insurance": "Financials",
+    # IT
+    "it": "IT",
+    "it services": "IT",
+    "technology": "IT",
+    "tech": "IT",
+    # Auto
+    "auto": "Auto",
+    "auto components": "Auto",
+    "automotive": "Auto",
+    "automobile": "Auto",
+    "automobiles": "Auto",
+    # Pharma & Healthcare — DB has both "Pharma" and "Healthcare" separately
+    "pharma": "Pharma",
+    "pharmaceutical": "Pharma",
+    "pharmaceuticals": "Pharma",
+    "healthcare": "Healthcare",
+    "hospitals": "Healthcare",
+    # FMCG
+    "fmcg": "FMCG",
+    "consumer goods": "FMCG",
+    "consumer staples": "FMCG",
+    # Energy
+    "energy": "Energy",
+    "oil and gas": "Energy",
+    "oil & gas": "Energy",
+    "oil": "Energy",
+    # Materials — DB uses "Materials" (steel + cement + mining + chemicals)
+    "metals": "Materials",
+    "metal": "Materials",
+    "steel": "Materials",
+    "mining": "Materials",
+    "cement": "Materials",
+    "chemicals": "Materials",
+    "materials": "Materials",
+    # Industrials / Capital Goods
+    "industrial equipment": "Industrials",
+    "industrials": "Industrials",
+    "engineering": "Industrials",
+    "capital goods": "Industrials",
+    "infrastructure": "Industrials",
+    "infra": "Industrials",
+    # Utilities — power
+    "power": "Utilities",
+    "utilities": "Utilities",
+    "electricity": "Utilities",
+    # Consumer Discretionary
+    "consumer discretionary": "Consumer Discretionary",
+    "retail": "Consumer Discretionary",
+    "consumer": "Consumer Discretionary",
+    # Telecom
+    "telecom": "Telecom",
+    "telecommunications": "Telecom",
+}
+
+
+def _canonicalise_sector(raw: str) -> str | None:
+    if not raw:
+        return None
+    key = raw.strip().lower().replace("-", " ")
+    return _SECTOR_ALIASES.get(key)
 
 
 class LLMExtractor:
@@ -95,6 +176,14 @@ class LLMExtractor:
             tokens=tokens_in + tokens_out if tokens_in and tokens_out else None,
         )
 
+        created = await self._persist_stock_signals(content, extraction)
+        created += await self._fan_out_sector_signals(content, extraction)
+        return created
+
+    async def _persist_stock_signals(
+        self, content: RawContent, extraction: dict | None
+    ) -> int:
+        """Write per-stock signals from the LLM's `signals` array."""
         signals = (extraction or {}).get("signals") or []
         if not signals:
             return 0
@@ -122,6 +211,65 @@ class LLMExtractor:
                     analyst_name_raw=sig.get("analyst_name"),
                 ))
                 created += 1
+        return created
+
+    async def _fan_out_sector_signals(
+        self, content: RawContent, extraction: dict | None
+    ) -> int:
+        """Generate weak per-instrument signals when an article is policy/macro-related.
+
+        Triggered when the LLM tags the article with `is_policy_related=true` and
+        names sectors. Every F&O instrument in those sectors gets a low-confidence
+        signal whose action mirrors `market_sentiment` — bullish → BULLISH, bearish
+        → BEARISH, neutral → no fan-out.
+        """
+        if not extraction or not extraction.get("is_policy_related"):
+            return 0
+
+        sentiment = (extraction.get("market_sentiment") or "").strip().lower()
+        if sentiment not in ("bullish", "bearish"):
+            return 0
+        # signal_action enum is {BUY, SELL, HOLD, WATCH}; map sentiment to BUY/SELL
+        action = "BUY" if sentiment == "bullish" else "SELL"
+
+        raw_sectors = extraction.get("sectors_mentioned") or []
+        canonical = {
+            s for s in (_canonicalise_sector(str(x)) for x in raw_sectors) if s
+        }
+        if not canonical:
+            return 0
+
+        reasoning = (
+            f"Policy/election fan-out: {sentiment} bias on sector(s) "
+            f"{sorted(canonical)} from article '{(content.title or '')[:120]}'"
+        )
+
+        created = 0
+        async with session_scope() as session:
+            result = await session.execute(
+                select(Instrument.id).where(
+                    Instrument.is_fno == True,  # noqa: E712
+                    Instrument.is_active == True,  # noqa: E712
+                    Instrument.sector.in_(list(canonical)),
+                )
+            )
+            inst_ids = [row[0] for row in result.all()]
+            for inst_id in inst_ids:
+                session.add(Signal(
+                    content_id=content.id,
+                    instrument_id=inst_id,
+                    source_id=content.source_id,
+                    action=action,
+                    timeframe="short_term",
+                    confidence=0.35,  # weak by design
+                    reasoning=reasoning[:2000],
+                ))
+                created += 1
+        if created:
+            logger.info(
+                f"extractor: sector fan-out — {created} signals across {sorted(canonical)} "
+                f"({action}) from content_id={content.id}"
+            )
         return created
 
     def _build_prompt(

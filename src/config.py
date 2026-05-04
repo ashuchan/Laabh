@@ -46,19 +46,38 @@ class Settings(BaseSettings):
     market_open_time: str = Field(default="09:15", alias="MARKET_OPEN_TIME")
     market_close_time: str = Field(default="15:30", alias="MARKET_CLOSE_TIME")
 
+    # --- Whisper pipeline (Phase 3 podcast transcription) ---
+    # Empty = whisper jobs skipped at scheduler boot.
+    whisper_model: str = Field(default="", alias="WHISPER_MODEL")
+    whisper_device: str = Field(default="", alias="WHISPER_DEVICE")
+    whisper_data_dir: str = Field(default="/data/whisper", alias="WHISPER_DATA_DIR")
+    audio_retention_days: int = Field(default=7, alias="AUDIO_RETENTION_DAYS")
+
     # --- F&O Module ---
     fno_module_enabled: bool = Field(default=False, alias="FNO_MODULE_ENABLED")
 
     # F&O Phase 1 (Universe filter)
     fno_phase1_min_atm_oi: int = Field(default=50000, alias="FNO_PHASE1_MIN_ATM_OI")
-    fno_phase1_max_atm_spread_pct: float = Field(default=0.005, alias="FNO_PHASE1_MAX_ATM_SPREAD_PCT")
+    # Mid-cap (Tier 2) OI threshold — Tier 2 underlyings have ~10x lower
+    # ATM OI than Tier 1 large-caps, so a single Nifty-50-calibrated
+    # threshold rejects them all. Use a lower bar for Tier 2.
+    fno_phase1_min_atm_oi_tier2: int = Field(default=5000, alias="FNO_PHASE1_MIN_ATM_OI_TIER2")
+    # Spread = (ask-bid)/mid as decimal. Real-world ATM bid-ask on liquid
+    # index/large-cap options is 0.1-2%; mid-caps run 2-5%. Default 0.05 (5%)
+    # admits everything except genuinely illiquid contracts.
+    fno_phase1_max_atm_spread_pct: float = Field(default=0.05, alias="FNO_PHASE1_MAX_ATM_SPREAD_PCT")
+    # Tier 1 large-caps face a tighter 2% bar; tier 2 keeps the 5% bar.
+    fno_phase1_max_atm_spread_pct_tier1: float = Field(default=0.02, alias="FNO_PHASE1_MAX_ATM_SPREAD_PCT_TIER1")
     fno_phase1_min_avg_volume_5d: int = Field(default=10000, alias="FNO_PHASE1_MIN_AVG_VOLUME_5D")
     fno_phase1_max_days_to_expiry: int = Field(default=3, alias="FNO_PHASE1_MAX_DAYS_TO_EXPIRY")
     fno_phase1_target_output: int = Field(default=50, alias="FNO_PHASE1_TARGET_OUTPUT")
 
     # F&O Phase 2 (Catalyst scoring)
     fno_phase2_news_lookback_hours: int = Field(default=18, alias="FNO_PHASE2_NEWS_LOOKBACK_HOURS")
-    fno_phase2_min_composite_score: float = Field(default=10.0, alias="FNO_PHASE2_MIN_COMPOSITE_SCORE")
+    # Composite is bounded [0, 10]; 10 is unreachable. 6.0 = "above neutral
+    # with at least one bullish dimension". Calibrated against the synthetic
+    # April 30 chain: this admits ~12-15% of evaluated candidates.
+    fno_phase2_min_composite_score: float = Field(default=6.0, alias="FNO_PHASE2_MIN_COMPOSITE_SCORE")
     fno_phase2_target_output: int = Field(default=20, alias="FNO_PHASE2_TARGET_OUTPUT")
     fno_phase2_weight_news: float = Field(default=1.0, alias="FNO_PHASE2_WEIGHT_NEWS")
     fno_phase2_weight_sentiment: float = Field(default=1.0, alias="FNO_PHASE2_WEIGHT_SENTIMENT")
@@ -67,7 +86,7 @@ class Settings(BaseSettings):
     fno_phase2_weight_convergence: float = Field(default=1.5, alias="FNO_PHASE2_WEIGHT_CONVERGENCE")
 
     # F&O Phase 3 (Thesis synthesis)
-    fno_phase3_target_output: int = Field(default=10, alias="FNO_PHASE3_TARGET_OUTPUT")
+    fno_phase3_target_output: int = Field(default=30, alias="FNO_PHASE3_TARGET_OUTPUT")
     fno_phase3_llm_model: str = Field(
         default="claude-sonnet-4-20250514", alias="FNO_PHASE3_LLM_MODEL"
     )
