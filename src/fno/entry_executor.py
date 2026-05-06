@@ -105,9 +105,35 @@ async def _already_entered_today(
 
 
 async def _enter_one(proposal: EntryProposal, run_date: date) -> bool:
-    """Open one paper position from a proposal. Returns True if newly entered."""
+    """Open one paper position from a proposal. Returns True if newly entered.
+
+    Capital sizing is governed by the *unified strategy budget*: the morning
+    LLM brain decides what fraction of the common pool each F&O bucket gets,
+    and the sizer is fed only that bucket's remaining headroom (cap minus
+    today's already-deployed premium). This replaces a long-standing bug
+    where a missing ``default_capital`` setting silently fell back to ₹10
+    lakh and made every F&O fill 10× the size of equity ones.
+    """
+    from src.trading.budget_allocator import (
+        bucket_for_fno_strategy,
+        fno_premium_deployed_today,
+        today_allocations,
+    )
+
     settings = get_settings()
-    cfg_capital = Decimal(str(getattr(settings, "default_capital", 1_000_000)))
+    plan = await today_allocations()
+    bucket = bucket_for_fno_strategy(proposal.strategy_name)
+    bucket_cap = Decimal(str(plan.rupee_caps.get(bucket, 0.0)))
+    deployed = Decimal(str(await fno_premium_deployed_today(bucket)))
+    remaining = bucket_cap - deployed
+    if remaining <= 0:
+        logger.info(
+            f"entry_executor: {proposal.symbol} {proposal.strategy_name} "
+            f"skipped — bucket {bucket} exhausted "
+            f"(cap=Rs{bucket_cap:,.0f} deployed=Rs{deployed:,.0f})"
+        )
+        return False
+    cfg_capital = remaining
     lot_size = _lot_size_for(proposal.symbol)
 
     async with session_scope() as session:
@@ -219,7 +245,7 @@ async def _enter_one(proposal: EntryProposal, run_date: date) -> bool:
         target_price=proposal.target_premium or fill0.fill_price * Decimal("1.30"),
     )
     try:
-        await get_gateway().send_telegram(msg)
+        await get_gateway().send_telegram(msg, parse_mode="MarkdownV2")
     except Exception as exc:
         logger.warning(f"entry_executor: telegram send failed for {proposal.symbol}: {exc}")
 
@@ -243,6 +269,78 @@ async def auto_enter(run_date: date | None = None) -> dict:
         logger.info("entry_executor: no proposals to enter")
         return {"proposed": 0, "entered": 0, "skipped": 0}
 
+    # Strategy gate: block naked-long entries in high-VIX, enforce stop
+    # discipline, and reject duplicates / opposing legs against the open
+    # F&O book. Failures here count toward "skipped" so the metric reflects
+    # gate-rejections separately from entry-time skips (no chain, etc.).
+    try:
+        from sqlalchemy import select as _select
+
+        from src.fno.vix_collector import latest_vix
+        from src.models.fno_candidate import FNOCandidate
+        from src.trading.strategy_gate import (
+            FNOProposalView,
+            filter_fno_proposals,
+        )
+        vix = await latest_vix()
+
+        # Per-candidate iv_regime — used by the gate as a regime fallback
+        # when the live VIX read is missing (replay or pre-9:00 dryrun).
+        # One round-trip suffices: pull the iv_regime for every PROCEED
+        # candidate today, indexed by instrument_id.
+        iv_regime_by_inst: dict[str, str] = {}
+        try:
+            async with session_scope() as session:
+                rows = list((await session.execute(
+                    _select(FNOCandidate.instrument_id, FNOCandidate.iv_regime)
+                    .where(
+                        FNOCandidate.run_date == run_date,
+                        FNOCandidate.phase == 3,
+                        FNOCandidate.llm_decision == "PROCEED",
+                    )
+                )).all())
+            iv_regime_by_inst = {
+                str(r[0]): (r[1] or "") for r in rows
+            }
+        except Exception as exc:
+            logger.debug(f"entry_executor: iv_regime lookup failed: {exc}")
+
+        views = [
+            FNOProposalView(
+                instrument_id=p.instrument_id,
+                symbol=p.symbol,
+                expiry_date=p.expiry_date,
+                strategy_name=p.strategy_name,
+                entry_premium=p.entry_premium,
+                stop_premium=p.stop_premium,
+                direction=p.direction,
+                iv_regime=iv_regime_by_inst.get(p.instrument_id),
+            )
+            for p in proposals
+        ]
+        accepted_views, rejected = await filter_fno_proposals(
+            views,
+            vix_value=float(vix.vix_value) if vix is not None else None,
+            iv_regime=None,
+        )
+        accepted_ids = {v.instrument_id for v in accepted_views}
+        gate_skipped = len(rejected)
+        proposals = [p for p in proposals if p.instrument_id in accepted_ids]
+        if rejected:
+            logger.info(
+                f"entry_executor: gate rejected {gate_skipped} proposal(s): "
+                f"{[(v.symbol, code) for v, code in rejected]}"
+            )
+    except Exception as exc:
+        # Defense-in-depth gate failed — entries pass through unchecked.
+        # WARNING level + repr ensures the failure is grep-able in logs and
+        # visible in the next EOD digest if the digest scans for warnings.
+        logger.warning(
+            f"entry_executor: F&O gate raised — failing OPEN "
+            f"(proposals pass through unchecked): {exc!r}"
+        )
+        gate_skipped = 0
+
     entered = skipped = 0
     for prop in proposals:
         try:
@@ -254,8 +352,15 @@ async def auto_enter(run_date: date | None = None) -> dict:
             logger.warning(f"entry_executor: {prop.symbol} entry failed: {exc}")
             skipped += 1
 
+    total_skipped = skipped + gate_skipped
+    total_proposed = len(proposals) + gate_skipped
     logger.info(
-        f"entry_executor: done — entered={entered} skipped={skipped} "
-        f"of {len(proposals)} proposals"
+        f"entry_executor: done — entered={entered} skipped={total_skipped} "
+        f"(gate={gate_skipped}, runtime={skipped}) of {total_proposed} proposals"
     )
-    return {"proposed": len(proposals), "entered": entered, "skipped": skipped}
+    return {
+        "proposed": total_proposed,
+        "entered": entered,
+        "skipped": total_skipped,
+        "gate_skipped": gate_skipped,
+    }

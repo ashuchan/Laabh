@@ -31,7 +31,7 @@ def classify_regime(vix_value: float) -> str:
 async def _fetch_vix_from_angel_one() -> float:
     """Fetch current India VIX value via Angel One REST API."""
     import pyotp
-    from smartapi import SmartConnect  # type: ignore[import]
+    from SmartApi import SmartConnect  # type: ignore[import]
 
     settings = get_settings()
     if not settings.angel_one_api_key:

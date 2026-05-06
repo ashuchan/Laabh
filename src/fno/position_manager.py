@@ -30,6 +30,7 @@ from sqlalchemy import func, select, update
 
 from src.config import get_settings
 from src.db import session_scope
+from src.fno import LIVE_FNO_STATUSES
 from src.fno.intraday_manager import OpenPosition, apply_tick, update_trailing_stop
 from src.fno.notifications import (
     _escape,
@@ -43,7 +44,10 @@ from src.models.instrument import Instrument
 from src.services.side_effect_gateway import get_gateway
 
 
-_LIVE_STATUSES = ("paper_filled", "active", "scaled_out_50")
+# Module-level alias kept for backwards-compatibility with any caller that
+# imports ``_LIVE_STATUSES`` directly. The canonical source is
+# ``src.fno.LIVE_FNO_STATUSES``.
+_LIVE_STATUSES = LIVE_FNO_STATUSES
 
 
 # Lot-size table mirrors entry_executor; keep in sync.
@@ -260,7 +264,7 @@ async def manage_tick() -> dict:
             else format_stop_alert(symbol, current, pos.entry_price, pnl)
         )
         try:
-            await get_gateway().send_telegram(msg)
+            await get_gateway().send_telegram(msg, parse_mode="MarkdownV2")
         except Exception as exc:
             logger.warning(f"position_manager: telegram failed for {symbol}: {exc}")
 
@@ -275,6 +279,75 @@ async def manage_tick() -> dict:
         "trailing": trailing,
         "held": held,
         "skipped": skipped,
+    }
+
+
+async def close_fno_signal(
+    signal_id: uuid.UUID | str, *, reason: str = "manual_close"
+) -> dict:
+    """Manually close one open FNOSignal — used by the equity strategist.
+
+    Mirrors ``manage_tick``'s close path but is triggered by an LLM SELL
+    decision rather than a stop/target. Stamps ``status='closed_manual'``
+    and emits a Telegram alert. Returns a dict with the symbol, exit
+    price, P&L, and status — or ``{"skipped": <reason>}`` when the
+    signal can't be closed (already closed, no chain price, etc.).
+
+    Idempotent: if the signal is no longer in a LIVE state, returns
+    ``skipped='not_live'`` rather than raising.
+    """
+    sig_uuid = uuid.UUID(str(signal_id))
+    async with session_scope() as session:
+        row = await session.execute(
+            select(FNOSignal, Instrument.symbol)
+            .join(Instrument, Instrument.id == FNOSignal.underlying_id)
+            .where(FNOSignal.id == sig_uuid)
+        )
+        result = row.one_or_none()
+    if result is None:
+        return {"skipped": "not_found", "signal_id": str(sig_uuid)}
+    sig, symbol = result
+    if sig.status not in _LIVE_STATUSES:
+        return {"skipped": "not_live", "symbol": symbol, "status": sig.status}
+
+    pos = _signal_to_open_position(sig, symbol)
+    if pos is None:
+        return {"skipped": "bad_legs", "symbol": symbol}
+
+    async with session_scope() as session:
+        current = await _latest_premium(
+            session, sig.underlying_id, sig.expiry_date,
+            pos.strike, pos.option_type,
+        )
+    exit_price = current if current is not None else pos.entry_price
+    leg0 = (sig.legs or [{}])[0]
+    side = leg0.get("action", "BUY")
+    pnl = _compute_pnl(pos.entry_price, exit_price, pos.lots, pos.lot_size, side)
+    await _close_signal(
+        sig.id, status="closed_manual",
+        exit_price=exit_price, final_pnl=pnl, new_stop=None,
+    )
+
+    try:
+        # Re-use the stop alert formatter for visual consistency; the body
+        # text on the runner side names this as a manual close.
+        await get_gateway().send_telegram(
+            format_stop_alert(symbol, exit_price, pos.entry_price, pnl),
+            parse_mode="MarkdownV2",
+        )
+    except Exception as exc:
+        logger.warning(f"position_manager: manual-close telegram failed for {symbol}: {exc}")
+
+    logger.info(
+        f"position_manager: MANUAL CLOSE {symbol} @ Rs{exit_price} "
+        f"P&L=Rs{pnl} (reason: {reason})"
+    )
+    return {
+        "symbol": symbol,
+        "exit_price": float(exit_price),
+        "entry_price": float(pos.entry_price),
+        "pnl": float(pnl),
+        "status": "closed_manual",
     }
 
 
@@ -316,7 +389,8 @@ async def hard_exit_all() -> dict:
         closed += 1
         try:
             await get_gateway().send_telegram(
-                format_hard_exit_alert(symbol, exit_price, pos.entry_price, pnl)
+                format_hard_exit_alert(symbol, exit_price, pos.entry_price, pnl),
+                parse_mode="MarkdownV2",
             )
         except Exception as exc:
             logger.warning(f"position_manager: hard-exit telegram failed for {symbol}: {exc}")
@@ -372,6 +446,8 @@ async def open_positions_summary() -> list[dict]:
             "stop": pos.stop_price,
             "target": pos.target_price,
             "lots": pos.lots,
+            "lot_size": pos.lot_size,
+            "side": side,
             "mtm": mtm,
             "status": sig.status,
         })
@@ -404,7 +480,7 @@ async def send_position_digest() -> int:
     positions = await open_positions_summary()
     msg = format_position_digest(positions)
     try:
-        await get_gateway().send_telegram(msg)
+        await get_gateway().send_telegram(msg, parse_mode="MarkdownV2")
     except Exception as exc:
         logger.warning(f"position_manager: digest send failed: {exc}")
     return len(positions)

@@ -68,6 +68,49 @@ class RiskManager:
             f"risk check passed: buy {quantity}×₹{price} total=₹{total_cost}"
         )
 
+    async def max_buy_qty(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        price: Decimal,
+    ) -> int:
+        """Largest integer qty buyable without tripping cash or position-cap checks.
+
+        Returns 0 when even one share would breach a constraint, letting the
+        caller decide between skip and clamp. A 1% padding on price covers the
+        brokerage/STT/stamp-duty charges that ``validate_buy`` factors into
+        ``total_cost`` — without it, ``floor(cash/price)`` can still raise
+        ``RiskError`` once charges are added.
+        """
+        if price <= 0:
+            return 0
+        padded = price * Decimal("1.01")
+        async with session_scope() as session:
+            portfolio = await session.get(Portfolio, portfolio_id)
+            if portfolio is None:
+                return 0
+            cash = Decimal(str(portfolio.current_cash or 0))
+            portfolio_total = cash + Decimal(str(portfolio.invested_value or 0))
+            max_position = portfolio_total * self.MAX_POSITION_PCT
+
+            result = await session.execute(
+                select(Holding).where(
+                    Holding.portfolio_id == portfolio_id,
+                    Holding.instrument_id == instrument_id,
+                )
+            )
+            holding = result.scalar_one_or_none()
+            existing_value = (
+                Decimal(str(holding.invested_value)) if holding else Decimal("0")
+            )
+
+        cap_room = max_position - existing_value
+        if cap_room <= 0 or cash <= 0:
+            return 0
+        qty_cash = int(cash // padded)
+        qty_position = int(cap_room // padded)
+        return max(0, min(qty_cash, qty_position))
+
     async def validate_sell(
         self,
         portfolio_id: str,

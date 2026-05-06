@@ -23,14 +23,32 @@ class ReportGenerator:
         self._notifier = NotificationService()
 
     async def send_daily_report(self) -> None:
-        """Build and send today's portfolio + signal summary via Telegram."""
+        """Build and send today's portfolio + signal summary via Telegram.
+
+        The report opens with the unified P&L block (same shape as the 15:40
+        IST F&O EOD message) so both messages reconcile to the same numbers.
+        Sent with legacy Markdown so the monospaced bucket table renders.
+        """
         report = await self._build_report()
-        await self._notifier._send_telegram(report)
+        await self._notifier._send_telegram(report, parse_mode="Markdown")
         logger.info("daily report sent")
 
     async def _build_report(self) -> str:
+        from src.services.pnl_aggregator import daily_pnl_snapshot
+        from src.services.report_formatter import format_combined_eod_report
+
         today = date.today()
-        lines: list[str] = [f"📊 Laabh Daily Report — {today.strftime('%d %b %Y')}", ""]
+
+        # Lead with the unified equity + F&O P&L block. This is the single
+        # source of truth shared with the 15:40 F&O EOD message; both
+        # numbers will line up because they read from the same aggregator.
+        snap = await daily_pnl_snapshot(today=today)
+        lines: list[str] = [
+            format_combined_eod_report(
+                snap, title=f"Laabh Daily Report — {today:%d %b %Y}"
+            ),
+            "",
+        ]
 
         # Portfolio summary
         async with session_scope() as session:

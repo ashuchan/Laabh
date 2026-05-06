@@ -155,7 +155,17 @@ class Settings(BaseSettings):
     # --- Dhan chain source ---
     dhan_client_id: str = Field(default="", alias="DHAN_CLIENT_ID")
     dhan_access_token: str = Field(default="", alias="DHAN_ACCESS_TOKEN")
+    # TOTP-based programmatic login. When DHAN_PIN + DHAN_TOTP_SECRET are set,
+    # src.auth.dhan_token mints a fresh 24h access token automatically and
+    # DHAN_ACCESS_TOKEN above becomes a manual override only.
+    dhan_pin: str = Field(default="", alias="DHAN_PIN")
+    dhan_totp_secret: str = Field(default="", alias="DHAN_TOTP_SECRET")
     dhan_request_interval_sec: float = Field(default=3.0, alias="DHAN_REQUEST_INTERVAL_SEC")
+    # Comma-separated "OLD=NEW" pairs to remap a universe symbol to the trading
+    # symbol Dhan's instrument master actually publishes. Use this to handle
+    # post-corporate-action renames (e.g. demergers) without code changes.
+    # Example: "TATAMOTORS=TATAMOTORS-EQ,IDEA=IDEA-EQ"
+    dhan_symbol_aliases: str = Field(default="", alias="DHAN_SYMBOL_ALIASES")
 
     # --- GitHub review-loop issue filer ---
     github_repo: str = Field(default="ashuchan/Laabh", alias="GITHUB_REPO")
@@ -220,6 +230,28 @@ class Settings(BaseSettings):
     # Hard cap on intraday LLM calls per day to bound API cost.
     equity_strategy_max_intraday_calls: int = Field(
         default=8, alias="EQUITY_STRATEGY_MAX_INTRADAY_CALLS"
+    )
+
+    # --- Unified strategy budget (lumpsum, carry-forward) ---
+    # Single common pool of paper capital shared across the equity LLM brain
+    # and the four F&O strategy buckets. Capital carries forward day to day:
+    # P&L flows through Portfolio.current_cash and rolls into tomorrow's pool.
+    # The morning equity strategist (09:10 IST) picks today's per-bucket
+    # allocation based on the market regime — the values below are the
+    # fallback used when no allocation row exists for today (bootstrap, LLM
+    # failure, equity strategy disabled).
+    strategy_total_budget: float = Field(default=20000.0, alias="STRATEGY_TOTAL_BUDGET")
+    strategy_default_alloc_equity: float = Field(
+        default=0.50, alias="STRATEGY_DEFAULT_ALLOC_EQUITY"
+    )
+    strategy_default_alloc_fno_directional: float = Field(
+        default=0.25, alias="STRATEGY_DEFAULT_ALLOC_FNO_DIRECTIONAL"
+    )
+    strategy_default_alloc_fno_spread: float = Field(
+        default=0.15, alias="STRATEGY_DEFAULT_ALLOC_FNO_SPREAD"
+    )
+    strategy_default_alloc_fno_volatility: float = Field(
+        default=0.10, alias="STRATEGY_DEFAULT_ALLOC_FNO_VOLATILITY"
     )
 
     # --- Dry-run replay ---

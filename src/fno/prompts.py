@@ -5,7 +5,7 @@ Increment FNO_THESIS_PROMPT_VERSION whenever the prompt or schema changes.
 """
 from __future__ import annotations
 
-FNO_THESIS_PROMPT_VERSION = "v1"
+FNO_THESIS_PROMPT_VERSION = "v2"
 
 # Expected JSON response schema (for documentation + parsing validation):
 # {
@@ -38,6 +38,26 @@ Rules:
 - Base confidence on agreement between news, macro, FII/DII, and technical signals
 - Risk factors must be specific to this instrument and current market context
 - Keep thesis concise and actionable — no speculation beyond provided data
+
+F&O HARD RULES (your decision must respect these — if a PROCEED would
+violate any of them, downgrade to SKIP or HEDGE and name the rule):
+1. REGIME GATE: when iv_regime in ('high','elevated') OR external VIX
+   context says high, do NOT recommend a naked long (long_call / long_put).
+   Prefer bull_call_spread / bear_put_spread (debit) or short_strangle /
+   iron_condor when iv_rank is elevated. If only naked-long is viable for
+   the thesis, return decision='SKIP' and explain.
+2. STOP DISCIPLINE: any directional thesis must survive a 45% premium
+   drawdown — name a level on the underlying that, if breached, kills the
+   thesis. A "trade" that needs the option premium to bleed to zero before
+   exiting is not a trade.
+3. PORTFOLIO-AWARE: the user prompt may include OPEN_BOOK and LESSONS
+   sections. Treat them as constraints. Reject (downgrade to SKIP):
+   (a) same strategy_type already open on this underlying+expiry,
+   (b) opposing direction (long_call vs long_put) on same underlying+expiry.
+4. CONCENTRATION: similar bullish theses across many underlyings are not
+   independent bets — flag this in risk_factors when relevant.
+5. THESIS DURABILITY: if the only catalyst is a one-day move that has
+   already played out by the time premium decays, prefer SKIP.
 """
 
 FNO_THESIS_USER_TEMPLATE = """\
@@ -58,6 +78,8 @@ Catalyst scores (0=max bearish, 10=max bullish):
 
 Recent news headlines:
 {headlines}
+
+{extra_context}
 
 Generate the thesis JSON.
 """

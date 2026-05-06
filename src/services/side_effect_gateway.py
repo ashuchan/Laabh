@@ -29,8 +29,13 @@ from typing import Protocol, runtime_checkable
 class SideEffectGateway(Protocol):
     """Single seam through which all external side-effects flow."""
 
-    async def send_telegram(self, msg: str) -> str:
-        """Send a Telegram message. Returns a synthetic or real message ID."""
+    async def send_telegram(self, msg: str, *, parse_mode: str = "Markdown") -> str:
+        """Send a Telegram message. Returns a synthetic or real message ID.
+
+        ``parse_mode`` defaults to legacy ``Markdown``. Callers that emit
+        MarkdownV2-escaped text (FNO formatters) must pass ``"MarkdownV2"``;
+        HTML-formatted text must pass ``"HTML"``.
+        """
         ...
 
     async def file_github_issue(
@@ -57,10 +62,10 @@ class LiveGateway:
     def __init__(self) -> None:
         self._captures: list[dict] = []  # always empty for live
 
-    async def send_telegram(self, msg: str) -> str:
+    async def send_telegram(self, msg: str, *, parse_mode: str = "Markdown") -> str:
         from src.services.notification_service import NotificationService
         svc = NotificationService()
-        await svc.send_text(msg)
+        await svc.send_text(msg, parse_mode=parse_mode)
         return "live"
 
     async def file_github_issue(
@@ -89,8 +94,8 @@ class NoOpGateway:
     def __init__(self) -> None:
         self._log: list[dict] = []
 
-    async def send_telegram(self, msg: str) -> str:
-        entry = {"type": "telegram", "msg": msg}
+    async def send_telegram(self, msg: str, *, parse_mode: str = "Markdown") -> str:
+        entry = {"type": "telegram", "msg": msg, "parse_mode": parse_mode}
         self._log.append(entry)
         return f"noop-{len(self._log)}"
 

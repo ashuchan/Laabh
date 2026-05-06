@@ -9,6 +9,7 @@ import httpx
 from loguru import logger
 from sqlalchemy import text
 
+from src.auth.dhan_token import DhanAuthError, get_dhan_headers
 from src.db import get_engine
 from src.runday.checks.base import CheckResult, Severity
 from src.runday.config import RundaySettings
@@ -312,22 +313,20 @@ class DhanCheck:
 
     async def run(self) -> CheckResult:
         s = self._settings
-        if not s.dhan_client_id or not s.dhan_access_token:
+        try:
+            headers = await get_dhan_headers()
+        except DhanAuthError as exc:
             return CheckResult(
                 name=self.name,
                 severity=Severity.FAIL,
-                message="Dhan credentials not configured",
+                message=str(exc),
             )
         t0 = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.post(
                     "https://api.dhan.co/v2/optionchain",
-                    headers={
-                        "access-token": s.dhan_access_token,
-                        "client-id": s.dhan_client_id,
-                        "Content-Type": "application/json",
-                    },
+                    headers=headers,
                     json={
                         "UnderlyingScrip": 13,
                         "UnderlyingSegment": "IDX_I",

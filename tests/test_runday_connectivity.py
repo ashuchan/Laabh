@@ -223,10 +223,16 @@ async def test_nse_check_fail(settings):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_dhan_check_no_credentials():
-    s = RundaySettings(dhan_client_id="", dhan_access_token="")
-    check = DhanCheck(s)
-    result = await check.run()
+async def test_dhan_check_no_credentials(settings):
+    """Auth resolution lives in src.auth.dhan_token; DhanCheck just surfaces its error."""
+    from src.auth.dhan_token import DhanAuthError
+    # Patch where the symbol is looked up (in connectivity), not where it's defined.
+    with patch(
+        "src.runday.checks.connectivity.get_dhan_headers",
+        AsyncMock(side_effect=DhanAuthError("Dhan auth not configured")),
+    ):
+        check = DhanCheck(settings)
+        result = await check.run()
     assert result.severity == Severity.FAIL
     assert "not configured" in result.message
 
@@ -240,7 +246,10 @@ async def test_dhan_check_pass(settings):
     mock_client.__aexit__ = AsyncMock(return_value=False)
     mock_client.post = AsyncMock(return_value=mock_response)
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    fake_headers = {"access-token": "tok", "client-id": "cid", "Content-Type": "application/json"}
+    with patch("httpx.AsyncClient", return_value=mock_client), patch(
+        "src.runday.checks.connectivity.get_dhan_headers", AsyncMock(return_value=fake_headers)
+    ):
         check = DhanCheck(settings)
         result = await check.run()
 

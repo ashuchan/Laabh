@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -71,15 +72,40 @@ class AngelOneCollector(BaseCollector):
         return await asyncio.to_thread(_login)
 
     async def _load_watchlist_tokens(self) -> list[dict[str, str]]:
-        """Return list of {exchangeType, tokens} from watchlist instruments."""
+        """Return list of {exchangeType, tokens} for instruments to stream.
+
+        Pulls the union of:
+
+        * ``WatchlistItem`` rows — user-tracked instruments.
+        * Open ``Holding`` rows — anything the strategy is currently
+          holding, so live ticks flow for positions the LLM opened that
+          aren't on the watchlist. Without this, ``PriceService`` would
+          serve stale ticks (or fall back to yfinance, which is slower
+          and less reliable than the WebSocket) for active positions.
+        """
+        from src.models.portfolio import Holding
         async with session_scope() as session:
-            rows = await session.execute(
+            watch_rows = await session.execute(
                 select(Instrument)
                 .join(WatchlistItem, WatchlistItem.instrument_id == Instrument.id)
                 .where(Instrument.angel_one_token.is_not(None))
                 .distinct()
             )
-            instruments = list(rows.scalars())
+            watch = list(watch_rows.scalars())
+            held_rows = await session.execute(
+                select(Instrument)
+                .join(Holding, Holding.instrument_id == Instrument.id)
+                .where(Instrument.angel_one_token.is_not(None))
+                .distinct()
+            )
+            held = list(held_rows.scalars())
+        seen: set[uuid.UUID] = set()
+        instruments: list[Instrument] = []
+        for inst in watch + held:
+            if inst.id in seen:
+                continue
+            seen.add(inst.id)
+            instruments.append(inst)
 
         self._instruments_by_token = {i.angel_one_token: i for i in instruments if i.angel_one_token}
 

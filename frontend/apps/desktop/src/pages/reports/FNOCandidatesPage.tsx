@@ -112,7 +112,7 @@ export function FNOCandidatesPage() {
   const opts = {
     phase: search.phase,
     passed_only: search.passed === 'true',
-    limit: 500,
+    limit: 200,
   };
 
   const { data, isLoading, isError } = useFNOCandidates(opts);

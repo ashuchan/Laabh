@@ -74,19 +74,26 @@ def test_segment_for_equity():
 # Auth header validation
 # ---------------------------------------------------------------------------
 
-def test_headers_raises_auth_error_when_token_missing(monkeypatch):
+@pytest.mark.asyncio
+async def test_headers_raises_auth_error_when_token_missing(monkeypatch):
     src = DhanSource()
     monkeypatch.setattr(src._settings, "dhan_access_token", "")
     monkeypatch.setattr(src._settings, "dhan_client_id", "")
+    monkeypatch.setattr(src._settings, "dhan_pin", "")
+    monkeypatch.setattr(src._settings, "dhan_totp_secret", "")
     with pytest.raises(AuthError):
-        src._headers()
+        await src._headers()
 
 
-def test_headers_includes_access_token(monkeypatch):
+@pytest.mark.asyncio
+async def test_headers_includes_access_token(monkeypatch):
+    """Static-token fallback path — used when PIN/TOTP aren't configured."""
     src = DhanSource()
     monkeypatch.setattr(src._settings, "dhan_access_token", "mytoken")
     monkeypatch.setattr(src._settings, "dhan_client_id", "myclientid")
-    headers = src._headers()
+    monkeypatch.setattr(src._settings, "dhan_pin", "")
+    monkeypatch.setattr(src._settings, "dhan_totp_secret", "")
+    headers = await src._headers()
     assert headers["access-token"] == "mytoken"
     assert headers["client-id"] == "myclientid"
 
@@ -180,6 +187,8 @@ async def test_fetch_returns_snapshot_on_200(monkeypatch):
     src = DhanSource()
     monkeypatch.setattr(src._settings, "dhan_access_token", "tok")
     monkeypatch.setattr(src._settings, "dhan_client_id", "cid")
+    monkeypatch.setattr(src._settings, "dhan_pin", "")
+    monkeypatch.setattr(src._settings, "dhan_totp_secret", "")
     monkeypatch.setattr(src._settings, "dhan_request_interval_sec", 0.0)
 
     mock_resp = MagicMock()
@@ -197,6 +206,8 @@ async def test_fetch_401_raises_auth_error(monkeypatch):
     src = DhanSource()
     monkeypatch.setattr(src._settings, "dhan_access_token", "tok")
     monkeypatch.setattr(src._settings, "dhan_client_id", "cid")
+    monkeypatch.setattr(src._settings, "dhan_pin", "")
+    monkeypatch.setattr(src._settings, "dhan_totp_secret", "")
     monkeypatch.setattr(src._settings, "dhan_request_interval_sec", 0.0)
 
     mock_resp = MagicMock()
@@ -215,6 +226,8 @@ async def test_fetch_429_raises_rate_limit_error(monkeypatch):
     src = DhanSource()
     monkeypatch.setattr(src._settings, "dhan_access_token", "tok")
     monkeypatch.setattr(src._settings, "dhan_client_id", "cid")
+    monkeypatch.setattr(src._settings, "dhan_pin", "")
+    monkeypatch.setattr(src._settings, "dhan_totp_secret", "")
     monkeypatch.setattr(src._settings, "dhan_request_interval_sec", 0.0)
 
     mock_resp = MagicMock()

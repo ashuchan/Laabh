@@ -106,6 +106,7 @@ def build_user_prompt(
     dii_net_cr: float,
     macro_drivers: list[str],
     headlines: list[str],
+    extra_context: str = "",
 ) -> str:
     headlines_text = "\n".join(f"  - {h}" for h in headlines[:5]) or "  (no recent headlines)"
     return FNO_THESIS_USER_TEMPLATE.format(
@@ -129,6 +130,7 @@ def build_user_prompt(
         dii_net_cr=f"{dii_net_cr:+.0f}",
         macro_drivers=", ".join(macro_drivers) or "N/A",
         headlines=headlines_text,
+        extra_context=extra_context or "",
     )
 
 
@@ -295,6 +297,39 @@ async def run_phase3(run_date: date | None = None) -> list[ThesisResult]:
         logger.warning("fno.thesis: no Phase-2 candidates to synthesize")
         return []
 
+    # Build the per-session enrichment block once — it's identical across
+    # all candidates this run and pulling open_book/lessons/outcomes 12 times
+    # would be wasteful. The portfolio_id below is the equity-strategy
+    # portfolio (single F&O book in this codebase); when multi-portfolio F&O
+    # lands, parametrise this. Failures degrade to empty so a missing table
+    # never blocks Phase 3.
+    extra_context = ""
+    try:
+        from sqlalchemy import text as _text
+
+        from src.models.portfolio import Portfolio
+        from src.trading.prompt_context import build_full_enrichment
+
+        async with session_scope() as session:
+            row = (await session.execute(
+                _text(
+                    "SELECT id FROM portfolios WHERE is_active "
+                    "ORDER BY (name = 'Equity Strategy') DESC, created_at ASC "
+                    "LIMIT 1"
+                )
+            )).first()
+        eq_pid = row[0] if row else None
+        if eq_pid is not None:
+            extra_context = await build_full_enrichment(
+                portfolio_id=eq_pid,
+                asset_class="FNO",
+                outcomes_window_days=10,
+                lessons_lookback_days=60,
+                lessons_limit=8,
+            )
+    except Exception as exc:
+        logger.debug(f"fno.thesis: enrichment block skipped: {exc}")
+
     results: list[ThesisResult] = []
 
     for cand in candidates:
@@ -343,6 +378,7 @@ async def run_phase3(run_date: date | None = None) -> list[ThesisResult]:
                 dii_net_cr=dii_net,
                 macro_drivers=macro_drivers,
                 headlines=headlines,
+                extra_context=extra_context,
             )
 
             raw_response, tokens_in, tokens_out, latency_ms = _call_claude(

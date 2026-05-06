@@ -347,7 +347,16 @@ async def _write_heartbeat() -> None:
     tmp = target.with_suffix(".tmp")
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     tmp.write_text(stamp + "\n", encoding="utf-8")
-    os.replace(tmp, target)
+    # On Windows, os.replace can lose a race with a watchdog or AV process
+    # holding the target open for read. Retry briefly before failing the job.
+    for attempt in range(3):
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(0.2 * (attempt + 1))
 
 
 def _on_job_error(event: JobExecutionEvent) -> None:
@@ -424,7 +433,9 @@ def build_scheduler() -> AsyncIOScheduler:
     # Code is the source of truth for the job set. Wipe whatever the previous
     # process left in the persistent jobstore before re-adding from code, so
     # renamed/removed jobs don't linger and id collisions can't raise.
-    sched.remove_all_jobs()
+    # Call the jobstore directly: BaseScheduler.remove_all_jobs() is a no-op
+    # against the DB before scheduler.start() — it only clears _pending_jobs.
+    default_store.remove_all_jobs()
 
     # --- Phase 1: Data collection ---
     sched.add_job(_run_rss, IntervalTrigger(minutes=5), id="rss", max_instances=1, coalesce=True)

@@ -20,6 +20,7 @@ from typing import ClassVar
 import httpx
 from loguru import logger
 
+from src.auth.dhan_token import DhanAuthError, get_dhan_headers
 from src.config import get_settings
 from src.fno.sources.base import BaseChainSource, ChainSnapshot, StrikeRow
 from src.fno.sources.exceptions import AuthError, SourceUnavailableError
@@ -59,16 +60,11 @@ class DhanHistoricalSource(BaseChainSource):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _headers(self) -> dict[str, str]:
-        token = _SETTINGS.dhan_access_token
-        client_id = _SETTINGS.dhan_client_id
-        if not token or not client_id:
-            raise AuthError("DHAN_ACCESS_TOKEN or DHAN_CLIENT_ID not configured")
-        return {
-            "access-token": token,
-            "client-id": client_id,
-            "Content-Type": "application/json",
-        }
+    async def _headers(self, *, force_refresh: bool = False) -> dict[str, str]:
+        try:
+            return await get_dhan_headers(force_refresh=force_refresh)
+        except DhanAuthError as exc:
+            raise AuthError(str(exc)) from exc
 
     def _client_instance(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -195,12 +191,25 @@ class DhanHistoricalSource(BaseChainSource):
         }
         async with self._semaphore:
             client = self._client_instance()
+            headers = await self._headers()
             resp = await client.post(
                 _DHAN_INTRADAY_URL,
-                headers=self._headers(),
+                headers=headers,
                 json=payload,
                 timeout=20,
             )
+            if resp.status_code == 401:
+                # Token may have been revoked server-side. Mint fresh, retry once.
+                logger.warning(
+                    "dhan_historical: 401 from Dhan, refreshing token and retrying once"
+                )
+                headers = await self._headers(force_refresh=True)
+                resp = await client.post(
+                    _DHAN_INTRADAY_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=20,
+                )
         if resp.status_code in (401, 403):
             raise AuthError(f"Dhan auth failed: {resp.status_code}")
         if resp.status_code != 200:

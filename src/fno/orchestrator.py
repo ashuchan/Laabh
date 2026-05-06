@@ -18,7 +18,6 @@ and periodically checkpointed to `fno_signals` table.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from decimal import Decimal
 
 from loguru import logger
 
@@ -140,79 +139,29 @@ async def run_eod_tasks(run_date: date | None = None) -> None:
 
 
 async def _send_daily_summary(run_date: date) -> None:
-    from sqlalchemy import func, select
+    """15:40 IST EOD message — unified equity + F&O P&L view.
 
-    from src.db import session_scope
-    from src.fno.notifications import format_daily_summary
-    from src.models.fno_candidate import FNOCandidate
-    from src.models.fno_signal import FNOSignal
+    Replaces the old phase-counts-and-net-pnl-only digest with the combined
+    snapshot from ``pnl_aggregator``: per-strategy bucket P&L (equity LLM,
+    FNO directional/spread/volatility), realized vs unrealized split, every
+    closed trade today (winners + losers), pipeline context (P1/P2/P3
+    counts), and the capital pool position. The message is sent with legacy
+    Markdown so the per-bucket code-block table renders monospaced.
+    """
+    from src.services.pnl_aggregator import daily_pnl_snapshot
+    from src.services.report_formatter import format_combined_eod_report
     from src.services.side_effect_gateway import get_gateway
 
-    async with session_scope() as session:
-        # Phase 1/2 = candidates that passed liquidity / had a composite score
-        p1_row = await session.execute(
-            select(func.count()).where(
-                FNOCandidate.run_date == run_date,
-                FNOCandidate.phase == 1,
-                FNOCandidate.passed_liquidity == True,  # noqa: E712
-                FNOCandidate.dryrun_run_id.is_(None),
-            )
-        )
-        phase1_passed = p1_row.scalar() or 0
-
-        p2_row = await session.execute(
-            select(func.count()).where(
-                FNOCandidate.run_date == run_date,
-                FNOCandidate.phase == 2,
-                FNOCandidate.composite_score.is_not(None),
-                FNOCandidate.dryrun_run_id.is_(None),
-            )
-        )
-        phase2_passed = p2_row.scalar() or 0
-
-        p3_row = await session.execute(
-            select(func.count()).where(
-                FNOCandidate.run_date == run_date,
-                FNOCandidate.phase == 3,
-                FNOCandidate.llm_decision == "PROCEED",
-                FNOCandidate.dryrun_run_id.is_(None),
-            )
-        )
-        phase3_proceed = p3_row.scalar() or 0
-
-        trades_row = await session.execute(
-            select(func.count()).where(
-                func.date(FNOSignal.proposed_at) == run_date,
-                FNOSignal.status.in_(
-                    ["paper_filled", "active", "scaled_out_50",
-                     "closed_target", "closed_stop", "closed_time"]
-                ),
-                FNOSignal.dryrun_run_id.is_(None),
-            )
-        )
-        trades_entered = trades_row.scalar() or 0
-
-        pnl_row = await session.execute(
-            select(func.coalesce(func.sum(FNOSignal.final_pnl), 0)).where(
-                func.date(FNOSignal.proposed_at) == run_date,
-                FNOSignal.final_pnl.is_not(None),
-                FNOSignal.dryrun_run_id.is_(None),
-            )
-        )
-        net_pnl = Decimal(str(pnl_row.scalar() or 0))
-
-    summary_msg = format_daily_summary(
-        run_date=run_date.isoformat(),
-        phase1_passed=phase1_passed,
-        phase2_passed=phase2_passed,
-        phase3_proceed=phase3_proceed,
-        trades_entered=trades_entered,
-        net_pnl=net_pnl,
+    snap = await daily_pnl_snapshot(today=run_date)
+    summary_msg = format_combined_eod_report(
+        snap, title=f"Laabh EOD — {run_date:%d %b %Y}"
     )
-    await get_gateway().send_telegram(summary_msg)
+    await get_gateway().send_telegram(summary_msg, parse_mode="Markdown")
     logger.info(
-        f"fno.orchestrator: daily summary sent — p1={phase1_passed} p2={phase2_passed} "
-        f"p3_proceed={phase3_proceed} trades={trades_entered} pnl={net_pnl}"
+        f"fno.orchestrator: daily summary sent — pnl={snap.day_pnl_total:,.2f} "
+        f"(realized={snap.realized_pnl_total:,.2f}, "
+        f"open={snap.unrealized_pnl_total:,.2f}) p1={snap.fno_phase1_passed} "
+        f"p2={snap.fno_phase2_passed} p3_proceed={snap.fno_phase3_proceed}"
     )
 
 
@@ -306,7 +255,7 @@ async def _send_morning_brief(run_date: date | None = None) -> None:
     except Exception as exc:
         logger.warning(f"morning brief: position digest failed: {exc}")
 
-    await get_gateway().send_telegram(msg)
+    await get_gateway().send_telegram(msg, parse_mode="MarkdownV2")
 
     async with session_scope() as session:
         session.add(

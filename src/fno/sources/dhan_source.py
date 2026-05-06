@@ -16,6 +16,7 @@ from typing import Any, ClassVar
 import httpx
 from loguru import logger
 
+from src.auth.dhan_token import DhanAuthError, get_dhan_headers
 from src.config import get_settings
 from src.fno.sources.base import BaseChainSource, ChainSnapshot, StrikeRow
 from src.fno.sources.exceptions import (
@@ -70,16 +71,11 @@ class DhanSource(BaseChainSource):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _headers(self) -> dict[str, str]:
-        token = self._settings.dhan_access_token
-        client_id = self._settings.dhan_client_id
-        if not token or not client_id:
-            raise AuthError("DHAN_ACCESS_TOKEN or DHAN_CLIENT_ID not configured")
-        return {
-            "access-token": token,
-            "client-id": client_id,
-            "Content-Type": "application/json",
-        }
+    async def _headers(self, *, force_refresh: bool = False) -> dict[str, str]:
+        try:
+            return await get_dhan_headers(force_refresh=force_refresh)
+        except DhanAuthError as exc:
+            raise AuthError(str(exc)) from exc
 
     def _client_instance(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -145,6 +141,21 @@ class DhanSource(BaseChainSource):
                     continue
             logger.info(f"dhan_source: cached {count} NSE equity security_ids")
 
+    def _alias_map(self) -> dict[str, str]:
+        raw = self._settings.dhan_symbol_aliases
+        if not raw:
+            return {}
+        out: dict[str, str] = {}
+        for pair in raw.split(","):
+            if "=" not in pair:
+                continue
+            old, new = pair.split("=", 1)
+            old = old.strip().upper()
+            new = new.strip().upper()
+            if old and new:
+                out[old] = new
+        return out
+
     async def _security_id_for(self, symbol: str) -> int | None:
         sym = symbol.upper()
         if sym in _INDEX_SECURITY_IDS:
@@ -155,7 +166,17 @@ class DhanSource(BaseChainSource):
             except Exception as exc:
                 logger.warning(f"dhan_source: master load failed: {exc}")
                 return None
-        return _EQUITY_SECID_CACHE.get(sym)
+        lookup = self._alias_map().get(sym, sym)
+        sid = _EQUITY_SECID_CACHE.get(lookup)
+        if sid is None:
+            # Surface near-matches so an operator can configure DHAN_SYMBOL_ALIASES.
+            prefix = lookup[:4]
+            near = [k for k in _EQUITY_SECID_CACHE if k.startswith(prefix)][:8]
+            logger.warning(
+                f"dhan_source: no security_id for {sym!r} "
+                f"(lookup={lookup!r}); near-matches: {near}"
+            )
+        return sid
 
     @staticmethod
     def _parse_decimal(v: Any) -> Decimal | None:
@@ -254,7 +275,7 @@ class DhanSource(BaseChainSource):
         """Fetch and parse the Dhan option chain for (symbol, expiry_date)."""
         await self._throttle_for(symbol)
 
-        headers = self._headers()  # raises AuthError if not configured
+        headers = await self._headers()  # raises AuthError if not configured
 
         # Dhan's Data API expects an integer security_id, not the ticker string.
         sec_id = await self._security_id_for(symbol)
@@ -273,6 +294,18 @@ class DhanSource(BaseChainSource):
             resp = await client.post(_DHAN_CHAIN_URL, headers=headers, json=payload)
         except httpx.RequestError as exc:
             raise SourceUnavailableError(f"Dhan network error: {exc}") from exc
+
+        if resp.status_code == 401:
+            # Token may have been revoked server-side mid-life. Mint a fresh one
+            # and retry exactly once before giving up — bad credentials still
+            # surface as AuthError below if the second attempt also 401s.
+            logger.warning("dhan_source: 401 from Dhan, refreshing token and retrying once")
+            await self._throttle_for(symbol)
+            headers = await self._headers(force_refresh=True)
+            try:
+                resp = await client.post(_DHAN_CHAIN_URL, headers=headers, json=payload)
+            except httpx.RequestError as exc:
+                raise SourceUnavailableError(f"Dhan network error on retry: {exc}") from exc
 
         if resp.status_code in (401, 403):
             raise AuthError(f"Dhan returned {resp.status_code} — check credentials")
@@ -303,7 +336,7 @@ class DhanSource(BaseChainSource):
     async def health_check(self) -> bool:
         """Lightweight probe — hit the Dhan market status endpoint."""
         try:
-            headers = self._headers()
+            headers = await self._headers()
             client = self._client_instance()
             resp = await client.get(_DHAN_HEALTH_URL, headers=headers)
             return resp.status_code < 400

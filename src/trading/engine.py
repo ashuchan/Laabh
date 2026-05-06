@@ -170,6 +170,23 @@ class TradingEngine:
                         )
                         holding.last_trade_date = datetime.now(timezone.utc)
 
+            # On a SELL, link FIFO to open BUY legs so realized P&L lands on
+            # ``trades.pnl`` and the SELL row carries ``status=closed`` once
+            # consumed. Without this the trades table cannot answer "how did
+            # the portfolio do today" — every leg stays ``open`` and
+            # ``pnl_pct`` never populates. Done inline within the same
+            # session_scope so the close-links commit atomically with the
+            # SELL trade itself.
+            if trade_type == "SELL":
+                await self._link_sell_to_open_buys(
+                    session,
+                    portfolio_id=portfolio_id,
+                    instrument_id=instrument_id,
+                    sell_trade=trade,
+                    sell_price=price,
+                    sell_qty=quantity,
+                )
+
             await session.flush()
             await session.refresh(trade)
 
@@ -192,3 +209,151 @@ class TradingEngine:
 
         logger.info(f"trade executed: {trade_type} {quantity}×{symbol} @ ₹{price}")
         return trade
+
+    async def _link_sell_to_open_buys(
+        self,
+        session,
+        *,
+        portfolio_id: uuid.UUID,
+        instrument_id: uuid.UUID,
+        sell_trade: Trade,
+        sell_price: Decimal,
+        sell_qty: int,
+    ) -> None:
+        """FIFO-link a SELL leg to its open BUY legs and close them.
+
+        Downstream consumer note (audited 2026-05-06):
+          - ``pnl_aggregator._equity_bucket_rollup`` iterates all trade rows
+            for a day and aggregates BUYs by qty + cost. Partial-consume
+            creates a closed slice + reduces the surviving open row by the
+            same proportion, so totals are preserved.
+          - ``equity_strategist._enrich_holding`` queries the still-open
+            BUY for ``entry_reason``; the surviving partial keeps
+            status='open' so this still returns the opening leg.
+          - No API route filters trades by ``status`` directly.
+        Reaudit if a new caller relies on ``status='open'`` to enumerate
+        all historical entry legs.
+
+        Walks through open BUY trades for ``(portfolio, instrument)`` in
+        execution order, consuming up to ``sell_qty`` shares. Each consumed
+        BUY row has ``status='closed'``, ``closed_at``, ``closing_trade_id``
+        set; ``pnl`` is realized P&L on the consumed slice net of both
+        legs' proportional brokerage+STT. ``holding_days`` is the difference
+        between the SELL and BUY ``executed_at`` dates.
+
+        If the open BUY quantity is greater than the remaining SELL slice,
+        the BUY row is *partially* consumed: a new closed Trade row carries
+        the consumed slice's P&L and the original BUY row is reduced by
+        that slice. This keeps `holdings` reconciled with leg-level history.
+        """
+        sell_id = sell_trade.id
+        sell_at = sell_trade.executed_at
+        # Spread the SELL leg's costs proportionally over consumed quantity.
+        sell_cost_per_share = (
+            (Decimal(str(sell_trade.brokerage or 0))
+             + Decimal(str(sell_trade.stt or 0)))
+            / Decimal(max(sell_qty, 1))
+        )
+
+        result = await session.execute(
+            select(Trade)
+            .where(
+                Trade.portfolio_id == portfolio_id,
+                Trade.instrument_id == instrument_id,
+                Trade.trade_type == "BUY",
+                Trade.status == "open",
+            )
+            .order_by(Trade.executed_at.asc())
+        )
+        open_buys: list[Trade] = list(result.scalars().all())
+
+        remaining = sell_qty
+        for buy in open_buys:
+            if remaining <= 0:
+                break
+            buy_qty = int(buy.quantity)
+            consume = min(buy_qty, remaining)
+            buy_price = Decimal(str(buy.price))
+            buy_cost_per_share = (
+                (Decimal(str(buy.brokerage or 0))
+                 + Decimal(str(buy.stt or 0)))
+                / Decimal(max(buy_qty, 1))
+            )
+
+            # Realized P&L on the consumed slice, net of both legs' costs.
+            slice_pnl = _round(
+                (sell_price - buy_price) * Decimal(consume)
+                - (buy_cost_per_share + sell_cost_per_share) * Decimal(consume)
+            )
+            slice_basis = buy_price * Decimal(consume)
+            slice_pnl_pct = (
+                _round(slice_pnl / slice_basis * Decimal(100))
+                if slice_basis > 0 else None
+            )
+            holding_days = (
+                (sell_at.date() - buy.executed_at.date()).days
+                if sell_at and buy.executed_at else 0
+            )
+
+            if consume == buy_qty:
+                # Full consumption — close the BUY row in place.
+                buy.status = "closed"
+                buy.closed_at = sell_at
+                buy.closing_trade_id = sell_id
+                buy.pnl = float(slice_pnl)
+                buy.pnl_pct = (
+                    float(slice_pnl_pct) if slice_pnl_pct is not None else None
+                )
+                buy.holding_days = holding_days
+            else:
+                # Partial consumption — split the BUY row. Costs on the
+                # consumed slice are split proportionally between brokerage
+                # and STT to preserve historical breakdown (matters for tax
+                # reporting; P&L itself is unaffected since both legs feed
+                # ``slice_pnl`` via the per-share cost combined upstream).
+                buy_brokerage = Decimal(str(buy.brokerage or 0))
+                buy_stt = Decimal(str(buy.stt or 0))
+                slice_share = Decimal(consume) / Decimal(buy_qty)
+                slice_brokerage = buy_brokerage * slice_share
+                slice_stt = buy_stt * slice_share
+                consumed_slice = Trade(
+                    portfolio_id=portfolio_id,
+                    instrument_id=instrument_id,
+                    signal_id=buy.signal_id,
+                    trade_type="BUY",
+                    order_type=buy.order_type,
+                    quantity=consume,
+                    price=float(buy_price),
+                    brokerage=float(slice_brokerage),
+                    stt=float(slice_stt),
+                    total_cost=float(
+                        buy_price * Decimal(consume)
+                        + slice_brokerage + slice_stt
+                    ),
+                    status="closed",
+                    closing_trade_id=sell_id,
+                    pnl=float(slice_pnl),
+                    pnl_pct=float(slice_pnl_pct) if slice_pnl_pct is not None else None,
+                    holding_days=holding_days,
+                    entry_reason=buy.entry_reason,
+                    executed_at=buy.executed_at,
+                    closed_at=sell_at,
+                )
+                session.add(consumed_slice)
+                buy.quantity = buy_qty - consume
+                # Reduce the surviving open row's cost and turnover proportionally.
+                ratio = (Decimal(buy_qty - consume) / Decimal(buy_qty))
+                buy.brokerage = float(Decimal(str(buy.brokerage or 0)) * ratio)
+                buy.stt = float(Decimal(str(buy.stt or 0)) * ratio)
+                buy.total_cost = float(Decimal(str(buy.total_cost or 0)) * ratio)
+
+            remaining -= consume
+
+        if remaining > 0:
+            # Sold more than we had open — likely from a manual reconciliation
+            # gap. Log loudly so the operator can investigate; do not fail
+            # the trade since the SELL is already executed and persisted.
+            logger.warning(
+                f"engine: SELL {sell_qty} {instrument_id} consumed only "
+                f"{sell_qty - remaining} from open BUYs; {remaining} unmatched"
+            )

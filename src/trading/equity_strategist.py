@@ -48,19 +48,64 @@ DECISION_MORNING = "morning_allocation"
 DECISION_INTRADAY = "intraday_action"
 DECISION_EOD = "eod_squareoff"
 
+# Hard cap on equity candidates fed to the LLM. Past ~40 names the prompt
+# bloats faster than decision quality improves, and a wide universe was the
+# reason the FNO block originally fell off the truncation cliff.
+_CANDIDATE_LIMIT = 30
 
-SYSTEM_PROMPT = """You are an Indian equity paper-trading strategist (BSE/NSE).
 
-You decide how to deploy a small daily cash budget across stocks based on
-fresh BUY/SELL signals, current holdings, market regime, and a risk dial.
+def _rank_score(c: dict[str, Any]) -> tuple[int, int, float, float]:
+    """Sort key for candidate filtering.
+
+    Source priority dominates so signal-driven names always beat watchlist
+    fillers; within a source, higher convergence (``distinct_sources_48h``)
+    wins, then analyst credibility, then raw confidence. None values are
+    treated as zero — a missing field is weaker than an explicit low value.
+    """
+    src_priority = {
+        "signal": 3,
+        "watchlist": 2,
+        "default_universe": 1,
+    }.get(c.get("source") or "", 0)
+    return (
+        src_priority,
+        int(c.get("distinct_sources_48h") or 0),
+        float(c.get("top_analyst_credibility") or 0.0),
+        float(c.get("confidence") or 0.0),
+    )
+
+
+SYSTEM_PROMPT = """You are an Indian markets paper-trading strategist (BSE/NSE).
+
+You manage ONE common pool of paper capital that funds FOUR strategy
+buckets (the "brains"):
+
+  - ``equity``           — your own equity LLM brain (BUY/SELL on stocks)
+  - ``fno_directional``  — long_call, long_put (single-leg directional)
+  - ``fno_spread``       — bull_call_spread, bear_put_spread, iron_condor
+  - ``fno_volatility``   — straddle (volatility-selling/buying)
+
+Your morning job (decision_type='morning_allocation') has TWO outputs:
+(1) a per-bucket capital ALLOCATION (fractions of the pool that sum to 1.0)
+based on today's market regime; (2) the usual list of executable actions.
+Both must appear in your JSON. The allocation determines today's per-
+strategy ceilings — F&O entries at 09:15 IST size against their bucket's
+slice. Diversification is not optional: an equity-only allocation when
+fno_candidates contain composite_score≥60 setups is a failure mode.
 
 CONTEXT YOU WILL RECEIVE
 - ``market`` — VIX value+regime, NIFTY 50 day change %, FII/DII net flow.
 - ``portfolio_context`` — sector exposure breakdown, pending limit/SL orders,
   today's realised P&L so far, count of open intraday positions.
-- ``candidates`` — for each: ltp, source (signal/watchlist/default), signal
+- ``candidates`` — equity buys: ltp, source (signal/watchlist/default), signal
   confidence + convergence count, top analyst credibility, recent news titles
   (≤3, last 7 days), 5-day return %, distance from 200-DMA %.
+- ``fno_candidates`` — Phase 3 PROCEED options ideas for today: underlying
+  symbol, direction, strategy (long_call/long_put/spread/iron_condor/straddle),
+  composite_score (0-100), iv_regime, contract label, target/stop premiums,
+  one-line llm_thesis. These are auto-executed at 09:15 IST by a separate
+  job, so your role is to surface them in a unified plan and reserve cash
+  if you want to add more on top.
 - ``holdings`` — for each: avg_buy_price, ltp, pnl_pct, days_held,
   is_intraday flag, original entry_reason, recent news.
 
@@ -83,17 +128,52 @@ DECISION FRAMEWORK
    - balanced   → deploy ≤85% of cash, ≤5 positions, OK with convergence_count≥2
    - aggressive → deploy ≤100% of cash, ≤6 positions, OK with single-source signals
 
+HARD RULES (any action that violates these is auto-skipped by the gate;
+self-skip rather than waste a slot — name the rule in your reasoning):
+A. SUB-SCALE FRICTION — when ``cash_available`` < Rs 200,000:
+   - Required confidence to ENTER >= 0.75 (no exceptions).
+   - Required expected move (target-entry)/entry >= 2.0% AT ENTRY price.
+   - At Rs 40K, costs alone are ~1.5% per round-trip; the math doesn't work
+     for sub-2% setups, so don't take them.
+B. HIGH-VIX REGIME — when vix_regime='high' OR vix_value >= 17:
+   - Equity entries: max 2 per morning_allocation, confidence >= 0.75.
+   - The thesis must survive an overnight gap. If you intend to flatten at
+     EOD, do not enter — costs ~1.5% per round-trip eat the edge.
+   - F&O: do NOT propose naked long_call / long_put; prefer debit spreads
+     (bull_call_spread / bear_put_spread) or short_strangle / iron_condor.
+C. EOD POLICY (replaces the old blanket high-VIX flatten):
+   - SELL only positions where confidence < 0.75 OR pnl_pct in [-0.5%, +1%].
+   - HOLD positions where confidence >= 0.80 AND multi-session catalyst
+     intact AND no adverse news today; set overnight stop = entry * 0.985.
+D. PORTFOLIO-AWARE: never propose a BUY for a symbol already in
+   ``holdings`` (use the existing position) and never propose a SELL for a
+   symbol you do not hold. F&O: reject same-strategy duplicates and
+   opposing directional legs (long_call vs long_put) on same underlying.
+E. CONCENTRATION: when proposing >6 single-leg long F&O calls with similar
+   bullish theses, replace with one NIFTY/BANKNIFTY call of equivalent
+   notional — independent ideas, not 6 copies of one trade.
+
 OUTPUT RULES
 1. Output ONLY valid JSON. No markdown, no preamble.
-2. Quantities must be integers; qty * approx_price must respect
-   ``per_position_cap_rupees`` and remaining cash.
-3. Only act on instruments that appear in the candidates list with non-null
-   ltp. Do not invent symbols. ``instrument_id`` is mandatory.
+2. Each action has ``asset_class``: "EQUITY" or "FNO".
+   - EQUITY: ``instrument_id`` is mandatory and must come from ``candidates``.
+     Quantities are integers; qty * approx_price must respect
+     ``per_position_cap_rupees`` and remaining cash. The risk layer will
+     clamp oversize qty down — but try to stay within the cap on first try.
+   - FNO: surface options ideas from ``fno_candidates``. Use ``symbol`` =
+     underlying symbol, ``qty`` = number of lots, and put the strategy +
+     contract label in ``reason``. ``instrument_id`` is optional. These are
+     informational — Phase 4 entry job executes them — so listing them
+     unifies the morning view.
+3. Aim for a MIX when both lists have substance: at least one FNO action
+   when ``fno_candidates`` is non-empty and contains a composite_score ≥ 60
+   item. Equity-only output on a day with strong option setups is wrong.
 4. Skipping a marginal trade is preferred over a forced one. Empty actions
    array is a valid decision when no edge is clear.
 5. Reasoning per action: one sentence naming the dominant driver
-   (convergence / news catalyst / momentum / mean-reversion / risk).
-6. ``reasoning`` (top-level): 2-4 sentences linking regime → strategy → picks.
+   (convergence / news catalyst / momentum / mean-reversion / risk / IV).
+6. ``reasoning`` (top-level): 2-4 sentences linking regime → strategy →
+   equity vs options balance → picks.
 """
 
 
@@ -188,11 +268,41 @@ class EquityStrategist:
         run_id = dryrun_run_id if dryrun_run_id is not None else get_dryrun_run_id()
 
         snapshot = await self._build_input_snapshot(portfolio_id, decision_type, as_of_eff)
-        prompt = self._build_prompt(decision_type, snapshot)
+        prompt = await self._build_prompt(
+            decision_type, snapshot, portfolio_id=portfolio_id, as_of=as_of_eff
+        )
 
         parsed, tokens_in, tokens_out, latency_ms, raw = await self._call_llm(prompt, model)
         actions = self._normalise_actions(parsed)
         reasoning = (parsed or {}).get("reasoning") or ""
+
+        # Defense-in-depth: re-check every action against the same hard
+        # rules described in the prompt. Violations are downgraded to HOLD
+        # and tagged with ``gate_violation`` so the runner sees them but
+        # does not execute them. The mismatch rate (LLM proposed → gate
+        # blocked) is a quality signal for prompt iteration.
+        # The gate is defense-in-depth — if it raises we MUST notice. Logging
+        # at WARNING is the floor; the EOD digest also surfaces gate-error
+        # counts for the day so a regression is visible inside one session
+        # rather than sitting silent until the next post-mortem.
+        gate_error: str | None = None
+        try:
+            from src.trading.strategy_gate import filter_equity_actions
+            outcome = await filter_equity_actions(
+                actions,
+                snapshot=snapshot,
+                portfolio_id=portfolio_id,
+                decision_type=decision_type,
+            )
+            actions = outcome.merge_into_actions()
+            actions_skipped = len(outcome.skipped)
+        except Exception as exc:
+            logger.warning(
+                f"strategist: equity gate raised — failing OPEN "
+                f"(actions pass through unchecked): {exc!r}"
+            )
+            gate_error = repr(exc)
+            actions_skipped = 0
 
         await self._write_audit_log(
             caller_ref_id=portfolio_id,
@@ -205,6 +315,21 @@ class EquityStrategist:
             model=model,
         )
 
+        # Persist the LLM-decided per-bucket allocation block so the F&O
+        # entry executor at 09:15 IST can read it back when sizing trades.
+        # Defaults are filled in when the morning brain didn't return a
+        # well-formed allocation — keeps the downstream contract stable.
+        actions_json: dict[str, Any] = {"actions": actions, "reasoning": reasoning}
+        if gate_error:
+            actions_json["gate_error"] = gate_error
+        if decision_type == DECISION_MORNING:
+            from src.trading.budget_allocator import (
+                stamp_allocations_into_actions_json,
+            )
+            actions_json = stamp_allocations_into_actions_json(
+                actions_json, (parsed or {}).get("allocations")
+            )
+
         decision_id: uuid.UUID | None = None
         async with session_scope() as session:
             row = StrategyDecision(
@@ -216,7 +341,8 @@ class EquityStrategist:
                 input_summary=snapshot,
                 llm_model=model,
                 llm_reasoning=reasoning[:8000] if reasoning else None,
-                actions_json={"actions": actions, "reasoning": reasoning},
+                actions_json=actions_json,
+                actions_skipped=actions_skipped,
                 dryrun_run_id=run_id,
             )
             session.add(row)
@@ -263,6 +389,9 @@ class EquityStrategist:
 
         market = await self._market_context(as_of)
         portfolio_context = await self._portfolio_context(portfolio_id, as_of)
+        fno_candidates = await self._fno_phase3_candidates(as_of)
+        fno_open_positions = await self._fno_open_positions(as_of)
+        today_equity_trades = await self._today_equity_trades(portfolio_id, as_of)
 
         # Holdings with LTPs + enrichment
         holdings_view: list[dict[str, Any]] = []
@@ -411,6 +540,19 @@ class EquityStrategist:
                     "check price_ticks/price_daily and watchlist contents"
                 )
 
+        # Pre-filter: rank then take top-N. Done after enrichment so the
+        # ranker can read distinct_sources_48h / analyst credibility from
+        # the enriched dict. Keeps the LLM input bounded regardless of
+        # signal volume on a noisy news day.
+        if len(candidates) > _CANDIDATE_LIMIT:
+            candidates.sort(key=_rank_score, reverse=True)
+            dropped = len(candidates) - _CANDIDATE_LIMIT
+            candidates = candidates[:_CANDIDATE_LIMIT]
+            logger.info(
+                f"strategist: trimmed candidates to top {_CANDIDATE_LIMIT} "
+                f"(dropped {dropped})"
+            )
+
         mode = self.settings.equity_strategy_mode
         if mode == "lumpsum":
             pos_cap_pct = self.settings.equity_strategy_pos_cap_pct_lumpsum
@@ -419,6 +561,35 @@ class EquityStrategist:
             pos_cap_pct = self.settings.equity_strategy_pos_cap_pct_sip
             cap_basis = max(self.settings.equity_strategy_daily_budget, cash)
 
+        # Unified strategy budget block — shows the LLM the common pool size
+        # and the *previous* day's allocation (if any) so today's split is
+        # an informed choice rather than blind. Defaults fill in on day-one
+        # before any allocation row exists.
+        from src.trading.budget_allocator import default_plan, today_allocations
+        try:
+            prior_plan = await today_allocations(as_of)
+        except Exception:
+            prior_plan = default_plan()
+        strategy_budget = {
+            "total_pool": prior_plan.total_budget,
+            "previous_allocations": prior_plan.allocations,
+            "previous_rupee_caps": prior_plan.rupee_caps,
+            "previous_source": prior_plan.source,
+            "buckets": [
+                "equity",
+                "fno_directional",
+                "fno_spread",
+                "fno_volatility",
+            ],
+        }
+
+        # Order matters: prompt JSON is hard-truncated at the byte budget in
+        # _build_prompt to keep token cost bounded. Put short, mandatory
+        # context (regime, portfolio, holdings, fno_candidates) BEFORE the
+        # long ``candidates`` list, so a fat equity universe can never push
+        # the FNO block off the end. We learned this the hard way: the
+        # original layout had fno_candidates last, the equity list ate the
+        # 24k budget, and the LLM correctly reported "no FNO candidates".
         return {
             "as_of": as_of.isoformat(),
             "decision_type": decision_type,
@@ -429,12 +600,16 @@ class EquityStrategist:
             "current_value": current_value,
             "day_pnl": day_pnl,
             "daily_budget": self.settings.equity_strategy_daily_budget,
+            "strategy_budget": strategy_budget,
             "per_position_cap_pct": pos_cap_pct,
             "per_position_cap_rupees": round(cap_basis * pos_cap_pct, 2),
             "max_intraday_calls": self.settings.equity_strategy_max_intraday_calls,
             "market": market,
             "portfolio_context": portfolio_context,
             "holdings": holdings_view,
+            "today_equity_trades": today_equity_trades,
+            "fno_open_positions": fno_open_positions,
+            "fno_candidates": fno_candidates,
             "candidates": candidates,
         }
 
@@ -587,6 +762,139 @@ class EquityStrategist:
 
         return ctx
 
+    async def _fno_phase3_candidates(self, as_of: datetime) -> list[dict[str, Any]]:
+        """Today's PROCEED options ideas for the LLM to balance against equities.
+
+        Pulled directly from ``fno_candidates`` rather than going through
+        ``entry_engine.propose_entries`` — that path requires a populated
+        live chain and is the source of truth for the 09:15 auto-fire. Here
+        we only need enough signal for the LLM to surface them in the
+        morning plan.
+        """
+        out: list[dict[str, Any]] = []
+        try:
+            async with session_scope() as session:
+                rows = list((await session.execute(
+                    text(
+                        "SELECT i.symbol, fc.composite_score, fc.iv_regime, "
+                        "       fc.oi_structure, fc.llm_thesis, fc.run_date "
+                        "FROM fno_candidates fc JOIN instruments i "
+                        "  ON i.id = fc.instrument_id "
+                        "WHERE fc.run_date = :rd "
+                        "  AND fc.phase = 3 "
+                        "  AND fc.llm_decision = 'PROCEED' "
+                        "  AND fc.dryrun_run_id IS NULL "
+                        "ORDER BY fc.composite_score DESC NULLS LAST "
+                        "LIMIT 20"
+                    ),
+                    {"rd": as_of.date()},
+                )).all())
+                for r in rows:
+                    out.append({
+                        "underlying": r[0],
+                        "composite_score": float(r[1]) if r[1] is not None else None,
+                        "iv_regime": r[2] or "n/a",
+                        "oi_structure": r[3] or "tbd",
+                        "thesis": (r[4] or "")[:240],
+                    })
+        except Exception as exc:
+            logger.debug(f"fno_phase3_candidates failed: {exc}")
+        return out
+
+    async def _fno_open_positions(self, as_of: datetime) -> list[dict[str, Any]]:
+        """Live F&O paper book — every position the LLM can decide to close.
+
+        Pulled from ``fno_signals`` with status in the LIVE set used by
+        Phase 4's position manager. Each row carries the ``signal_id``;
+        the LLM must echo it back in an FNO SELL action so the runner
+        knows which position to close. We deliberately surface the
+        per-leg structure (strikes/option_type/lots) and the net
+        entry/target/stop premiums so the model can reason about both
+        directional move and time decay without a separate MTM call.
+        """
+        out: list[dict[str, Any]] = []
+        try:
+            async with session_scope() as session:
+                rows = list((await session.execute(
+                    text(
+                        "SELECT fs.id, i.symbol, fs.strategy_type, fs.expiry_date, "
+                        "       fs.legs, fs.entry_premium_net, fs.target_premium_net, "
+                        "       fs.stop_premium_net, fs.status, fs.proposed_at, "
+                        "       fs.filled_at "
+                        "FROM fno_signals fs JOIN instruments i "
+                        "  ON i.id = fs.underlying_id "
+                        "WHERE fs.status IN ('paper_filled','active','scaled_out_50') "
+                        "  AND fs.dryrun_run_id IS NULL "
+                        "ORDER BY fs.filled_at DESC NULLS LAST "
+                        "LIMIT 30"
+                    ),
+                )).all())
+                for r in rows:
+                    filled_at = r[10] or r[9]
+                    days_held = None
+                    if filled_at is not None:
+                        days_held = (as_of.date() - filled_at.date()).days
+                    out.append({
+                        "signal_id": str(r[0]),
+                        "symbol": r[1],
+                        "strategy": r[2],
+                        "expiry_date": r[3].isoformat() if r[3] else None,
+                        "legs": r[4] or [],
+                        "entry_premium_net": float(r[5]) if r[5] is not None else None,
+                        "target_premium_net": float(r[6]) if r[6] is not None else None,
+                        "stop_premium_net": float(r[7]) if r[7] is not None else None,
+                        "status": r[8],
+                        "filled_at": filled_at.isoformat() if filled_at else None,
+                        "days_held": days_held,
+                        "is_today": (filled_at.date() == as_of.date()) if filled_at else False,
+                    })
+        except Exception as exc:
+            logger.debug(f"_fno_open_positions failed: {exc}")
+        return out
+
+    async def _today_equity_trades(
+        self, portfolio_id: uuid.UUID, as_of: datetime
+    ) -> list[dict[str, Any]]:
+        """Today's equity executions for this portfolio — the intraday LLM's ledger.
+
+        ``holdings`` already shows net positions, but the intraday LLM also
+        needs the per-trade record (especially when it has rebalanced — a
+        BUY followed by a SELL same-day collapses in holdings). Each row
+        names ``trade_id`` so a future SELL action could reference it.
+        """
+        out: list[dict[str, Any]] = []
+        try:
+            async with session_scope() as session:
+                rows = list((await session.execute(
+                    text(
+                        "SELECT t.id, i.symbol, t.trade_type, t.quantity, "
+                        "       t.price, t.total_cost, t.executed_at, t.entry_reason "
+                        "FROM trades t JOIN instruments i "
+                        "  ON i.id = t.instrument_id "
+                        "WHERE t.portfolio_id = :pid "
+                        "  AND date(t.executed_at) = :asof_date "
+                        "ORDER BY t.executed_at ASC"
+                    ),
+                    {
+                        "pid": str(portfolio_id),
+                        "asof_date": as_of.date(),
+                    },
+                )).all())
+                for r in rows:
+                    out.append({
+                        "trade_id": str(r[0]),
+                        "symbol": r[1],
+                        "side": r[2],
+                        "qty": int(r[3]),
+                        "price": float(r[4]) if r[4] is not None else None,
+                        "total_cost": float(r[5]) if r[5] is not None else None,
+                        "executed_at": r[6].isoformat() if r[6] else None,
+                        "entry_reason": (r[7] or "")[:200],
+                    })
+        except Exception as exc:
+            logger.debug(f"_today_equity_trades failed: {exc}")
+        return out
+
     async def _enrich_candidate(
         self, instrument_id: uuid.UUID, ltp: float, as_of: datetime
     ) -> dict[str, Any]:
@@ -725,89 +1033,173 @@ class EquityStrategist:
 
         return out
 
-    def _build_prompt(self, decision_type: str, snapshot: dict[str, Any]) -> str:
+    async def _build_prompt(
+        self,
+        decision_type: str,
+        snapshot: dict[str, Any],
+        *,
+        portfolio_id: uuid.UUID | None = None,
+        as_of: datetime | None = None,
+    ) -> str:
         if decision_type == DECISION_MORNING:
             instruction = (
-                "ROLE: Pre-market allocator. The market opens at 09:15 IST. "
-                "Decide how much of `cash_available` to deploy now and how to "
-                "split it across BUY candidates.\n\n"
-                "DECISION CHECKLIST:\n"
-                "1. Read `market` first. If vix_regime='high' or "
-                "   nifty_change_pct < -0.8, lean cautious (deploy ≤60%). If "
-                "   vix_regime='low' and FII flow positive, lean fuller "
-                "   (deploy ≥80% in balanced/aggressive).\n"
-                "2. Rank candidates by (distinct_sources_48h DESC, "
+                "ROLE: Pre-market allocator AND budget splitter. Market opens "
+                "at 09:15 IST. You produce TWO things in one JSON output:\n"
+                " (A) `allocations` — fractions of the common capital pool "
+                "(sum to 1.0) for the four buckets {equity, fno_directional, "
+                "fno_spread, fno_volatility} based on today's regime.\n"
+                " (B) `actions` — the BUY/HOLD calls to execute now.\n\n"
+                "ALLOCATION CHECKLIST (decide first, before actions):\n"
+                "1. VIX regime drives the spread/directional/volatility split:\n"
+                "   - high   → tilt to fno_spread (defined-risk) and equity, "
+                "     trim fno_directional, allow fno_volatility for premium "
+                "     selling (straddle).\n"
+                "   - neutral → balanced split, your discretion.\n"
+                "   - low    → favour fno_directional + equity momentum, "
+                "     trim spread/volatility (low IV makes premium selling poor).\n"
+                "2. Catalyst supply: if `fno_candidates` is empty, push the "
+                "   F&O share toward zero and concentrate in equity. If 5+ "
+                "   strong fno_candidates exist, allow F&O share up to 60%.\n"
+                "3. NIFTY day move: > +0.8% with FII inflow → bullish, lean "
+                "   fno_directional + equity. < -0.8% with DII selling → "
+                "   risk-off, lean fno_spread (defined risk).\n"
+                "4. Floor: every bucket gets at least 0.05 unless its catalyst "
+                "   pool is empty. Cap: no single bucket > 0.65.\n\n"
+                "ACTION CHECKLIST:\n"
+                "5. Rank equity candidates by (distinct_sources_48h DESC, "
                 "   top_analyst_credibility DESC, confidence DESC). Prefer "
-                "   names with concrete recent_news catalysts over vague "
-                "   commentary.\n"
-                "3. Trend filter: if pct_from_200dma < -15 AND only 1 source, "
-                "   skip (falling-knife risk). If return_5d_pct > +12 with no "
-                "   fresh catalyst, skip (chase risk).\n"
-                "4. Sector cap: do not push any sector (incl. existing "
-                "   `portfolio_context.sector_exposure`) above 35% (60% "
-                "   aggressive).\n"
-                "5. Set `deploy_now_pct` ∈ [0,1] = your chosen deployment "
-                "   ratio. Reserve cash is fine — name it in `reasoning`.\n\n"
-                "OUTPUT: BUY actions only. qty is integer; qty*ltp ≤ "
-                "per_position_cap_rupees. Empty actions array is acceptable "
-                "if no candidate clears the bar."
+                "   names with concrete recent_news catalysts.\n"
+                "6. Trend filter: if pct_from_200dma < -15 AND only 1 source, "
+                "   skip (falling-knife). If return_5d_pct > +12 with no fresh "
+                "   catalyst, skip (chase risk).\n"
+                "7. Sector cap: do not push any sector above 35% of NAV "
+                "   (60% if risk_profile='aggressive').\n"
+                "8. Set `deploy_now_pct` ∈ [0,1]. Reserve cash is fine.\n"
+                "9. Options mix: when `fno_candidates` has any item with "
+                "   composite_score ≥ 60, INCLUDE at least one FNO action. "
+                "   Use underlying symbol, qty=lots (default 1), strategy in "
+                "   `reason`. Phase 4 entry job at 09:15 executes them.\n\n"
+                "OUTPUT: `allocations` block + `actions` list. Empty actions "
+                "array is acceptable if no candidate clears the bar — but "
+                "`allocations` is mandatory and must always sum to ~1.0."
             )
         elif decision_type == DECISION_INTRADAY:
             instruction = (
-                "ROLE: Intraday risk manager + opportunistic trader. Market "
-                "is open. Re-evaluate every holding and any fresh signal.\n\n"
+                "ROLE: Intraday risk manager + opportunistic trader across "
+                "BOTH books — equity holdings AND open F&O option positions. "
+                "Market is open. You manage the unified book made of:\n"
+                "  - `holdings` (equity, with avg_buy_price + ltp + pnl_pct)\n"
+                "  - `today_equity_trades` (every BUY/SELL since 00:00 IST)\n"
+                "  - `fno_open_positions` (every paper-filled options trade "
+                "    still live, with signal_id, legs, entry/target/stop "
+                "    premiums, days_held)\n"
+                "  - new equity `candidates` and `fno_candidates` you can add\n\n"
                 "DECISION CHECKLIST:\n"
-                "1. For each holding: SELL if pnl_pct ≥ +3% AND no fresh "
-                "   bullish news (lock in); SELL if pnl_pct ≤ -2% AND "
+                "1. EQUITY holdings: SELL if pnl_pct >= +3% AND no fresh "
+                "   bullish news (lock in); SELL if pnl_pct <= -2% AND "
                 "   latest_headline turns bearish or thesis broken (cut "
                 "   loss); else HOLD.\n"
-                "2. Rotation: if a NEW candidate has distinct_sources_48h ≥ "
+                "2. F&O OPEN POSITIONS: review every fno_open_positions row. "
+                "   Propose SELL (asset_class='FNO', signal_id=<row.signal_id>) "
+                "   when: (a) the underlying has reversed against the option "
+                "   direction with >0.8% intraday move AND iv_regime has "
+                "   spiked, (b) days_held >= 1 with no further catalyst (theta "
+                "   bleed on long premium), or (c) a stronger fno_candidate "
+                "   on the same underlying replaces the thesis. SELL is a "
+                "   manual close; the runner stamps status='closed_manual'. "
+                "   For multi-leg strategies (iron_condor/straddle/spreads) "
+                "   close the whole position via the leg-1 signal_id.\n"
+                "3. Rotation: if a NEW candidate has distinct_sources_48h >= "
                 "   3 AND a holding is flat/red AND swap improves convergence "
                 "   weighted exposure, propose SELL old + BUY new.\n"
-                "3. Re-deploy reserve cash from morning ONLY when a higher "
+                "4. Re-deploy reserve cash from morning ONLY when a higher "
                 "   conviction setup appears (multi-source + recent_news "
                 "   catalyst). Never spend reserve on watchlist-only items "
                 "   intraday.\n"
-                "4. Honour pending_orders — do not duplicate them.\n"
-                "5. Avoid churn: if no edge changed since last decision, "
-                "   return empty actions.\n\n"
-                "OUTPUT: HOLD/SELL/BUY actions. SELL needs instrument_id+qty; "
-                "BUY needs instrument_id+qty+approx_price. Empty array OK."
+                "5. Honour pending_orders — do not duplicate them.\n"
+                "6. Avoid churn: if no edge changed since last decision, "
+                "   return empty actions. But ALWAYS scan fno_open_positions "
+                "   — silently holding a position that meets a SELL trigger "
+                "   is a failure.\n\n"
+                "OUTPUT: HOLD/SELL/BUY actions across asset_class IN "
+                "{EQUITY, FNO}. EQUITY SELL needs instrument_id+qty; "
+                "EQUITY BUY needs instrument_id+qty+approx_price; "
+                "FNO SELL needs signal_id (from fno_open_positions); "
+                "FNO BUY (informational, Phase 4 auto-fires) needs symbol. "
+                "Empty array is acceptable but only after explicit review."
             )
         else:  # EOD
             instruction = (
                 "ROLE: Square-off arbiter. It is ~15:20 IST, 10 min before "
                 "close. Decide which intraday positions to close and which "
                 "to convert to delivery (hold overnight).\n\n"
-                "DECISION CHECKLIST:\n"
-                "1. Default by `risk_profile`:\n"
-                "   - safe       → CLOSE all is_intraday=true positions.\n"
-                "   - balanced   → CLOSE losers (pnl_pct < 0) and small "
-                "     winners (<+1%); hold only conviction picks (entry_reason "
-                "     cites multi-source/strong catalyst).\n"
-                "   - aggressive → CLOSE only clearly broken theses; hold "
-                "     anything still trending with the thesis intact.\n"
-                "2. Override down (more selling) if vix_regime='high' OR "
-                "   nifty_change_pct < -0.8 today (overnight gap risk).\n"
-                "3. Override up (more holding) if a fresh strong bullish "
-                "   catalyst landed in latest_headline within last 2h.\n"
-                "4. Non-intraday holdings (is_intraday=false) are out of "
+                "REVISED EOD POLICY (post-2026-05-05 review — "
+                "do NOT blanket-flatten on high-VIX):\n"
+                "1. SELL when (a) confidence < 0.75 OR (b) pnl_pct in "
+                "   [-0.5%, +1%] (noise band — costs eat the edge) OR "
+                "   (c) the entry catalyst has been invalidated today.\n"
+                "2. HOLD when (a) confidence >= 0.80 AND (b) catalyst is "
+                "   multi-session (Brent thesis, sectoral rotation, M&A) "
+                "   AND (c) no adverse news today. For these, set the "
+                "   overnight mental stop at entry * 0.985 (-1.5%).\n"
+                "3. risk_profile influences only the borderline cases:\n"
+                "   - safe       → tilt toward SELL on borderline holds.\n"
+                "   - balanced   → use the rules above as-is.\n"
+                "   - aggressive → tilt toward HOLD on borderline holds.\n"
+                "4. High-VIX is CONTEXT, not an automatic flatten trigger. "
+                "   The previous override that closed all intraday positions "
+                "   in high-VIX paired with same-day entries was a policy "
+                "   bug — entries already require >=0.75 confidence; "
+                "   accepted entries should be allowed to ride if the "
+                "   thesis holds.\n"
+                "5. Non-intraday holdings (is_intraday=false) are out of "
                 "   scope — leave them alone.\n\n"
                 "OUTPUT: SELL actions only for positions to close. "
-                "qty=current quantity. `reasoning` should explicitly cite "
-                "risk_profile and which override (if any) was applied."
+                "qty=current quantity. `reasoning` should cite which clause "
+                "(1a/1b/1c, 2, etc.) drove the decision per position."
             )
 
-        return (
-            f"{instruction}\n\n"
+        # Dynamic prompt enrichment: open book + recent self-track-record +
+        # versioned lessons. Built fresh per call so the LLM always sees
+        # current positions and the most recent post-mortems. The block is
+        # appended AFTER the instructions but BEFORE the JSON-shape and
+        # snapshot — that keeps the directive text on top while still giving
+        # the model a chance to read the gates before it commits to actions.
+        enrichment_block = ""
+        if portfolio_id is not None:
+            try:
+                from src.trading.prompt_context import build_full_enrichment
+                enrichment_block = await build_full_enrichment(
+                    portfolio_id=portfolio_id,
+                    asset_class="EQUITY",
+                    as_of=as_of,
+                    outcomes_window_days=10,
+                    lessons_lookback_days=60,
+                    lessons_limit=8,
+                )
+            except Exception as exc:
+                logger.debug(f"strategist: enrichment block skipped: {exc}")
+
+        head = f"{instruction}\n\n"
+        if enrichment_block:
+            head = f"{head}{enrichment_block}\n\n"
+        return head + (
             "Return JSON of shape:\n"
             "{\n"
             "  \"reasoning\": \"2-4 sentences on overall plan and risk view\",\n"
             "  \"deploy_now_pct\": 0.0,  // morning only; omit for intraday/eod\n"
+            "  \"allocations\": {        // morning only; fractions sum to 1.0\n"
+            "      \"equity\": 0.50,\n"
+            "      \"fno_directional\": 0.25,\n"
+            "      \"fno_spread\": 0.15,\n"
+            "      \"fno_volatility\": 0.10\n"
+            "  },\n"
             "  \"actions\": [\n"
             "    {\n"
-            "      \"instrument_id\": \"uuid\",\n"
-            "      \"symbol\": \"NSE symbol\",\n"
+            "      \"asset_class\": \"EQUITY|FNO\",\n"
+            "      \"instrument_id\": \"uuid (required for EQUITY)\",\n"
+            "      \"signal_id\": \"uuid (required for FNO SELL)\",\n"
+            "      \"symbol\": \"NSE symbol or FNO underlying\",\n"
             "      \"action\": \"BUY|SELL|HOLD\",\n"
             "      \"qty\": 0,\n"
             "      \"approx_price\": 0.0,\n"
@@ -816,7 +1208,7 @@ class EquityStrategist:
             "  ]\n"
             "}\n\n"
             "Inputs:\n"
-            f"{json.dumps(snapshot, default=str)[:24000]}"
+            f"{json.dumps(snapshot, default=str)[:120000]}"
         )
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=20))
@@ -826,11 +1218,23 @@ class EquityStrategist:
         # Opus 4.7 deprecated `temperature` — omit it and let the model use
         # its default. Sonnet/Haiku still accept it but the marginal benefit
         # of temperature=0.2 here is negligible vs. portability.
+        #
+        # System prompt is wrapped in a cache_control block so retries within
+        # the 5-minute TTL skip re-billing the system tokens. The user-side
+        # prompt is dynamic (snapshot changes per call) so it is NOT cached.
+        # The win is small for our cadence (one morning + ~6 intraday calls
+        # 30+ min apart) but the cost of adding it is one extra dict layer.
         t0 = time.monotonic()
         msg = await self.client.messages.create(
             model=model,
             max_tokens=2000,
-            system=SYSTEM_PROMPT,
+            system=[
+                {
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             messages=[{"role": "user", "content": prompt}],
         )
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -848,7 +1252,13 @@ class EquityStrategist:
 
     @staticmethod
     def _normalise_actions(parsed: dict[str, Any] | None) -> list[dict[str, Any]]:
-        """Coerce the LLM's actions into a clean, executable shape."""
+        """Coerce the LLM's actions into a clean, executable shape.
+
+        Accepts ``asset_class`` ∈ {EQUITY, FNO}. EQUITY actions need a
+        non-empty ``instrument_id`` (the runner executes them via the
+        equity engine). FNO actions are informational — the runner appends
+        them to the digest only — so an empty ``instrument_id`` is fine.
+        """
         if not parsed:
             return []
         out: list[dict[str, Any]] = []
@@ -858,16 +1268,20 @@ class EquityStrategist:
             action = (raw.get("action") or "").upper()
             if action not in ("BUY", "SELL", "HOLD"):
                 continue
+            asset_class = (raw.get("asset_class") or "EQUITY").upper()
+            if asset_class not in ("EQUITY", "FNO"):
+                asset_class = "EQUITY"
             qty = raw.get("qty")
             try:
                 qty_int = int(qty) if qty is not None else 0
             except (TypeError, ValueError):
                 qty_int = 0
-            if action != "HOLD" and qty_int <= 0:
+            if action != "HOLD" and qty_int <= 0 and asset_class == "EQUITY":
                 continue
             out.append({
                 "instrument_id": str(raw.get("instrument_id") or "").strip(),
                 "symbol": (raw.get("symbol") or "").strip(),
+                "asset_class": asset_class,
                 "action": action,
                 "qty": qty_int,
                 "approx_price": _float_or_none(raw.get("approx_price")),
