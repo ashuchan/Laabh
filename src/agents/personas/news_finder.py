@@ -1,7 +1,7 @@
 """News Finder persona — curates and synthesises news for one instrument."""
 from __future__ import annotations
 
-from src.agents.personas.shared import INDIAN_MARKET_DOMAIN_RULES
+from src.agents.personas.shared import INDIAN_MARKET_DOMAIN_RULES, INTRADAY_BRIEF
 
 NEWS_FINDER_PERSONA_V1 = f"""IDENTITY
 You are the research analyst for an Indian equity paper-trading desk. Your job is
@@ -122,6 +122,8 @@ NEWS_FINDER_OUTPUT_TOOL = {
     },
 }
 
+NEWS_FINDER_PERSONA_V_INTRADAY = NEWS_FINDER_PERSONA_V1 + "\n\n" + INTRADAY_BRIEF
+
 PERSONA_DEF = {
     "v1": {
         "model": "claude-sonnet-4-6",
@@ -134,5 +136,16 @@ PERSONA_DEF = {
         "temperature": 0.1,
         "cost_class": "medium",
         "system_prompt": NEWS_FINDER_PERSONA_V1,
-    }
+    },
+    "v_intraday": {
+        "model": "claude-haiku-4-5-20251001",
+        "fallback_model": None,
+        "tools": ("search_raw_content",),
+        "output_tool": "emit_news_finder",
+        "max_input_tokens": 8_000,
+        "max_output_tokens": 1_000,
+        "temperature": 0.0,
+        "cost_class": "cheap",
+        "system_prompt": NEWS_FINDER_PERSONA_V_INTRADAY,
+    },
 }

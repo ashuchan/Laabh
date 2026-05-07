@@ -1,14 +1,22 @@
 """Explorer-related tool executors: get_price_aggregates, get_past_predictions,
-get_sentiment_history.
-"""
+get_sentiment_history."""
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from src.agents.tools._helpers import (
+    is_missing_table,
+    parse_dt,
+    resolve_instrument_id,
+)
+
 if TYPE_CHECKING:
     from src.agents.tools.registry import ToolContext
+
+log = logging.getLogger(__name__)
 
 # Window definitions: (days_back, granularity_minutes)
 _WINDOW_MAP = {
@@ -20,25 +28,28 @@ _WINDOW_MAP = {
 
 async def execute_get_price_aggregates(params: dict, ctx: "ToolContext") -> dict:
     """Fetch OHLCV aggregates for one instrument over a pre-defined window."""
-    instrument_id = params["instrument_id"]
-    window = params["window"]
-
+    window = params.get("window", "1d_daily_60")
     days_back, bucket_minutes = _WINDOW_MAP.get(window, (60, 1440))
 
-    if bucket_minutes >= 1440:
-        # Use price_daily for daily+ granularity
-        try:
-            async with ctx.db() as db:
+    try:
+        async with ctx.db() as db:
+            iid = await resolve_instrument_id(db, params.get("instrument_id"))
+            if iid is None:
+                return {"result": [],
+                        "error": f"instrument_id {params.get('instrument_id')!r} did not resolve"}
+
+            if bucket_minutes >= 1440:
+                # Cast `:days` so PG can subtract it from CURRENT_DATE.
                 result = await db.execute(
                     text("""
                         SELECT date, open, high, low, close, volume, vwap, change_pct
                         FROM price_daily
                         WHERE instrument_id = :iid
-                          AND date >= CURRENT_DATE - :days
+                          AND date >= CURRENT_DATE - (:days)::int
                         ORDER BY date ASC
                         LIMIT 120
                     """),
-                    {"iid": str(instrument_id), "days": days_back},
+                    {"iid": iid, "days": days_back},
                 )
                 rows = result.fetchall()
                 return {
@@ -58,59 +69,57 @@ async def execute_get_price_aggregates(params: dict, ctx: "ToolContext") -> dict
                     "window": window,
                     "count": len(rows),
                 }
-        except Exception as e:
-            return {"result": [], "error": str(e)}
-    else:
-        # Bucket price_ticks into intervals
-        try:
-            async with ctx.db() as db:
-                result = await db.execute(
-                    text("""
-                        SELECT
-                            date_trunc('minute', timestamp) -
-                                INTERVAL '1 minute' * (EXTRACT(MINUTE FROM timestamp)::int % :bucket) AS bucket,
-                            FIRST_VALUE(ltp) OVER w AS open,
-                            MAX(high) OVER w AS high,
-                            MIN(low) OVER w AS low,
-                            LAST_VALUE(ltp) OVER w AS close,
-                            SUM(volume) OVER w AS volume
-                        FROM price_ticks
-                        WHERE instrument_id = :iid
-                          AND timestamp >= NOW() - :days * INTERVAL '1 day'
-                        WINDOW w AS (
-                            PARTITION BY date_trunc('minute', timestamp) -
-                                INTERVAL '1 minute' * (EXTRACT(MINUTE FROM timestamp)::int % :bucket)
-                            ORDER BY timestamp
-                            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-                        )
-                        ORDER BY bucket ASC
-                        LIMIT 500
-                    """),
-                    {"iid": str(instrument_id), "days": days_back, "bucket": bucket_minutes},
-                )
-                rows = result.fetchall()
-                return {
-                    "result": [
-                        {
-                            "ts": str(r[0]),
-                            "open": float(r[1] or 0),
-                            "high": float(r[2] or 0),
-                            "low": float(r[3] or 0),
-                            "close": float(r[4] or 0),
-                            "volume": int(r[5] or 0),
-                        }
-                        for r in rows
-                    ],
-                    "window": window,
-                    "count": len(rows),
-                }
-        except Exception as e:
-            return {"result": [], "error": str(e)}
+            # Intraday bucket — cast :days and use INTERVAL multiplication.
+            result = await db.execute(
+                text("""
+                    SELECT
+                        date_trunc('minute', timestamp) -
+                            INTERVAL '1 minute' * (EXTRACT(MINUTE FROM timestamp)::int % :bucket) AS bucket,
+                        FIRST_VALUE(ltp) OVER w AS open,
+                        MAX(high) OVER w AS high,
+                        MIN(low) OVER w AS low,
+                        LAST_VALUE(ltp) OVER w AS close,
+                        SUM(volume) OVER w AS volume
+                    FROM price_ticks
+                    WHERE instrument_id = :iid
+                      AND timestamp >= NOW() - (:days)::int * INTERVAL '1 day'
+                    WINDOW w AS (
+                        PARTITION BY date_trunc('minute', timestamp) -
+                            INTERVAL '1 minute' * (EXTRACT(MINUTE FROM timestamp)::int % :bucket)
+                        ORDER BY timestamp
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                    )
+                    ORDER BY bucket ASC
+                    LIMIT 500
+                """),
+                {"iid": iid, "days": days_back, "bucket": bucket_minutes},
+            )
+            rows = result.fetchall()
+            return {
+                "result": [
+                    {
+                        "ts": str(r[0]),
+                        "open": float(r[1] or 0),
+                        "high": float(r[2] or 0),
+                        "low": float(r[3] or 0),
+                        "close": float(r[4] or 0),
+                        "volume": int(r[5] or 0),
+                    }
+                    for r in rows
+                ],
+                "window": window,
+                "count": len(rows),
+            }
+    except Exception as e:
+        return {"result": [], "error": f"{type(e).__name__}: {e}"}
 
 
 async def execute_get_past_predictions(params: dict, ctx: "ToolContext") -> dict:
-    """Retrieve resolved past agent_predictions for an instrument or sector."""
-    instrument_id = params.get("instrument_id")
+    """Retrieve resolved past agent_predictions for an instrument or sector.
+
+    Returns a "no_history" structured payload when the agent_predictions table
+    isn't yet present (pre-migration-0009 environments).
+    """
     sector = params.get("sector")
     lookback_days = int(params.get("lookback_days", 90))
     only_resolved = bool(params.get("only_resolved", True))
@@ -121,23 +130,29 @@ async def execute_get_past_predictions(params: dict, ctx: "ToolContext") -> dict
         else "LEFT JOIN agent_predictions_outcomes apo ON apo.prediction_id = ap.id"
     )
 
-    bind: dict = {"days": lookback_days}
-    where_clauses = ["ap.created_at >= NOW() - :days * INTERVAL '1 day'"]
-
-    if instrument_id:
-        where_clauses.append("ap.symbol_or_underlying = (SELECT symbol FROM instruments WHERE id = :iid LIMIT 1)")
-        bind["iid"] = str(instrument_id)
-    elif sector:
-        where_clauses.append(
-            "ap.symbol_or_underlying IN "
-            "(SELECT symbol FROM instruments WHERE sector ILIKE :sector)"
-        )
-        bind["sector"] = f"%{sector}%"
-
-    where_sql = " AND ".join(where_clauses)
-
     try:
         async with ctx.db() as db:
+            iid = None
+            if params.get("instrument_id"):
+                iid = await resolve_instrument_id(db, params["instrument_id"])
+
+            bind: dict = {"days": lookback_days}
+            where_clauses = ["ap.created_at >= NOW() - (:days)::int * INTERVAL '1 day'"]
+
+            if iid:
+                where_clauses.append(
+                    "ap.symbol_or_underlying = (SELECT symbol FROM instruments WHERE id = :iid LIMIT 1)"
+                )
+                bind["iid"] = iid
+            elif sector:
+                where_clauses.append(
+                    "ap.symbol_or_underlying IN "
+                    "(SELECT symbol FROM instruments WHERE sector ILIKE :sector)"
+                )
+                bind["sector"] = f"%{sector}%"
+
+            where_sql = " AND ".join(where_clauses)
+
             result = await db.execute(
                 text(f"""
                     SELECT ap.id, ap.symbol_or_underlying, ap.decision,
@@ -174,37 +189,56 @@ async def execute_get_past_predictions(params: dict, ctx: "ToolContext") -> dict
                 "count": len(rows),
             }
     except Exception as e:
-        return {"result": [], "error": str(e)}
+        if is_missing_table(e):
+            # Roll the failed transaction back so the next tool call in this
+            # session doesn't inherit the InFailedSQLTransactionError state.
+            try:
+                async with ctx.db() as _db:
+                    await _db.rollback()
+            except Exception:
+                pass
+            return {
+                "result": [],
+                "count": 0,
+                "note": "agent_predictions table not yet migrated — no historical predictions to read.",
+            }
+        return {"result": [], "error": f"{type(e).__name__}: {e}"}
 
 
 async def execute_get_sentiment_history(params: dict, ctx: "ToolContext") -> dict:
     """Fetch daily sentiment score time-series for one instrument."""
-    instrument_id = params["instrument_id"]
-    since = params["since"]
-    granularity = params.get("granularity", "daily")
+    since_dt = parse_dt(params.get("since"))
+    if since_dt is None:
+        return {"result": [], "error": "since: invalid or missing datetime"}
 
+    granularity = params.get("granularity", "daily")
     trunc = "day" if granularity == "daily" else "week"
 
     try:
         async with ctx.db() as db:
+            iid = await resolve_instrument_id(db, params.get("instrument_id"))
+            if iid is None:
+                return {"result": [],
+                        "error": f"instrument_id {params.get('instrument_id')!r} did not resolve"}
+
             result = await db.execute(
                 text(f"""
                     SELECT
                         date_trunc('{trunc}', s.signal_date) AS period,
                         COUNT(*) AS n_signals,
-                        AVG(CASE WHEN s.action = 'BUY' THEN s.confidence
-                                 WHEN s.action = 'SELL' THEN -s.confidence
+                        AVG(CASE WHEN s.action::text = 'BUY' THEN s.confidence
+                                 WHEN s.action::text = 'SELL' THEN -s.confidence
                                  ELSE 0 END) AS sentiment_score,
-                        SUM(CASE WHEN s.action = 'BUY' THEN 1 ELSE 0 END) AS n_buy,
-                        SUM(CASE WHEN s.action = 'SELL' THEN 1 ELSE 0 END) AS n_sell,
-                        SUM(CASE WHEN s.action = 'HOLD' THEN 1 ELSE 0 END) AS n_hold
+                        SUM(CASE WHEN s.action::text = 'BUY' THEN 1 ELSE 0 END) AS n_buy,
+                        SUM(CASE WHEN s.action::text = 'SELL' THEN 1 ELSE 0 END) AS n_sell,
+                        SUM(CASE WHEN s.action::text = 'HOLD' THEN 1 ELSE 0 END) AS n_hold
                     FROM signals s
                     WHERE s.instrument_id = :iid
                       AND s.signal_date >= :since
                     GROUP BY period
                     ORDER BY period ASC
                 """),
-                {"iid": str(instrument_id), "since": since},
+                {"iid": iid, "since": since_dt},
             )
             rows = result.fetchall()
             return {
@@ -222,4 +256,4 @@ async def execute_get_sentiment_history(params: dict, ctx: "ToolContext") -> dic
                 "granularity": granularity,
             }
     except Exception as e:
-        return {"result": [], "error": str(e)}
+        return {"result": [], "error": f"{type(e).__name__}: {e}"}

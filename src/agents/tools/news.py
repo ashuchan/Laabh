@@ -1,7 +1,13 @@
 """News-related tool executors: search_raw_content, get_filings, search_transcript_chunks,
 get_analyst_track_record.
 
-These replace the stub executors in registry.py when TOOLS_BACKEND=sql.
+All executors:
+  * accept `instrument_id` as UUID *or* symbol — `_helpers.resolve_instrument_id`
+    normalises before binding, so the LLM can pass either form;
+  * parse ISO datetime strings into datetime objects before binding (asyncpg
+    refuses to coerce strings on its own);
+  * never raise — return `{"result": [], "error": <msg>}` on failure so the
+    LLM sees a structured error and can adapt.
 """
 from __future__ import annotations
 
@@ -9,50 +15,56 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from src.agents.tools._helpers import (
+    parse_dt,
+    resolve_analyst_id,
+    resolve_instrument_id,
+)
+
 if TYPE_CHECKING:
     from src.agents.tools.registry import ToolContext
 
 
 async def execute_search_raw_content(params: dict, ctx: "ToolContext") -> dict:
     """Search raw_content for one instrument over a time window."""
-    instrument_id = params["instrument_id"]
-    since = params["since"]
-    until = params.get("until")
+    since_dt = parse_dt(params.get("since"))
+    until_dt = parse_dt(params.get("until"))
+    if since_dt is None:
+        return {"result": [], "error": "since: invalid or missing datetime"}
+
     limit = min(int(params.get("limit", 25)), 50)
     min_credibility = float(params.get("min_credibility", 0.0))
     include_types = params.get("include_types") or []
 
-    type_filter = ""
-    bind: dict = {
-        "instrument_id": str(instrument_id),
-        "since": since,
-        "limit": limit,
-        "min_cred": min_credibility,
-    }
-
-    if until:
-        date_filter = "AND rc.published_at < :until"
-        bind["until"] = until
-    else:
-        date_filter = ""
-
-    if include_types:
-        type_filter = "AND rc.media_type = ANY(:include_types)"
-        bind["include_types"] = include_types
-
-    credibility_join = (
-        "LEFT JOIN data_sources ds ON ds.id = rc.source_id"
-        if min_credibility > 0
-        else "LEFT JOIN data_sources ds ON ds.id = rc.source_id"
-    )
-    credibility_where = (
-        "AND COALESCE((ds.extraction_schema->>'credibility_weight')::numeric, 0.5) >= :min_cred"
-        if min_credibility > 0
-        else ""
-    )
-
     try:
         async with ctx.db() as db:
+            iid = await resolve_instrument_id(db, params.get("instrument_id"))
+            if iid is None:
+                return {"result": [],
+                        "error": f"instrument_id {params.get('instrument_id')!r} did not resolve to a known UUID or symbol"}
+
+            bind: dict = {
+                "instrument_id": iid,
+                "since": since_dt,
+                "limit": limit,
+                "min_cred": min_credibility,
+            }
+            date_filter = ""
+            if until_dt is not None:
+                date_filter = "AND rc.published_at < :until"
+                bind["until"] = until_dt
+
+            type_filter = ""
+            if include_types:
+                type_filter = "AND rc.media_type = ANY(:include_types)"
+                bind["include_types"] = include_types
+
+            credibility_where = (
+                "AND COALESCE((ds.extraction_schema->>'credibility_weight')::numeric, 0.5) >= :min_cred"
+                if min_credibility > 0
+                else ""
+            )
+
             result = await db.execute(
                 text(f"""
                     SELECT rc.id, rc.title, rc.content_text, rc.url, rc.author,
@@ -60,7 +72,7 @@ async def execute_search_raw_content(params: dict, ctx: "ToolContext") -> dict:
                            COALESCE((ds.extraction_schema->>'credibility_weight')::numeric, 0.5) AS credibility_weight,
                            ds.name AS source_name
                     FROM raw_content rc
-                    {credibility_join}
+                    LEFT JOIN data_sources ds ON ds.id = rc.source_id
                     WHERE rc.published_at >= :since
                       {date_filter}
                       {type_filter}
@@ -98,24 +110,30 @@ async def execute_search_raw_content(params: dict, ctx: "ToolContext") -> dict:
             ]
             return {"result": items, "count": len(items)}
     except Exception as e:
-        return {"result": [], "error": str(e)}
+        return {"result": [], "error": f"{type(e).__name__}: {e}"}
 
 
 async def execute_get_filings(params: dict, ctx: "ToolContext") -> dict:
     """Retrieve SEBI/BSE/NSE regulatory filings for one instrument."""
-    instrument_id = params["instrument_id"]
-    since = params["since"]
+    since_dt = parse_dt(params.get("since"))
+    if since_dt is None:
+        return {"result": [], "error": "since: invalid or missing datetime"}
+
     filing_types = params.get("filing_types") or []
-
-    type_filter = ""
-    bind: dict = {"instrument_id": str(instrument_id), "since": since, "limit": 20}
-
-    if filing_types:
-        type_filter = "AND rc.media_type = ANY(:filing_types)"
-        bind["filing_types"] = filing_types
 
     try:
         async with ctx.db() as db:
+            iid = await resolve_instrument_id(db, params.get("instrument_id"))
+            if iid is None:
+                return {"result": [],
+                        "error": f"instrument_id {params.get('instrument_id')!r} did not resolve"}
+
+            bind: dict = {"instrument_id": iid, "since": since_dt, "limit": 20}
+            type_filter = ""
+            if filing_types:
+                type_filter = "AND rc.media_type = ANY(:filing_types)"
+                bind["filing_types"] = filing_types
+
             result = await db.execute(
                 text(f"""
                     SELECT rc.id, rc.title, rc.content_text, rc.url,
@@ -149,13 +167,18 @@ async def execute_get_filings(params: dict, ctx: "ToolContext") -> dict:
                 "count": len(rows),
             }
     except Exception as e:
-        return {"result": [], "error": str(e)}
+        return {"result": [], "error": f"{type(e).__name__}: {e}"}
 
 
 async def execute_search_transcript_chunks(params: dict, ctx: "ToolContext") -> dict:
     """Search analyst podcast/video transcript chunks by symbol."""
-    symbol = params["symbol"]
-    since = params["since"]
+    since_dt = parse_dt(params.get("since"))
+    if since_dt is None:
+        return {"result": [], "error": "since: invalid or missing datetime"}
+
+    symbol = params.get("symbol")
+    if not symbol:
+        return {"result": [], "error": "symbol is required"}
     limit = min(int(params.get("limit", 10)), 25)
 
     try:
@@ -172,7 +195,7 @@ async def execute_search_transcript_chunks(params: dict, ctx: "ToolContext") -> 
                     ORDER BY rc.published_at DESC
                     LIMIT :limit
                 """),
-                {"symbol_pat": f"%{symbol}%", "since": since, "limit": limit},
+                {"symbol_pat": f"%{symbol}%", "since": since_dt, "limit": limit},
             )
             rows = result.fetchall()
             return {
@@ -190,15 +213,17 @@ async def execute_search_transcript_chunks(params: dict, ctx: "ToolContext") -> 
                 "count": len(rows),
             }
     except Exception as e:
-        return {"result": [], "error": str(e)}
+        return {"result": [], "error": f"{type(e).__name__}: {e}"}
 
 
 async def execute_get_analyst_track_record(params: dict, ctx: "ToolContext") -> dict:
     """Retrieve an analyst's historical credibility score and prediction accuracy."""
-    analyst_id = params["analyst_id"]
-
     try:
         async with ctx.db() as db:
+            aid = await resolve_analyst_id(db, params.get("analyst_id"))
+            if aid is None:
+                return {"result": None, "error": "analyst not found"}
+
             result = await db.execute(
                 text("""
                     SELECT name, organization, designation,
@@ -208,7 +233,7 @@ async def execute_get_analyst_track_record(params: dict, ctx: "ToolContext") -> 
                     FROM analysts
                     WHERE id = :analyst_id
                 """),
-                {"analyst_id": str(analyst_id)},
+                {"analyst_id": aid},
             )
             row = result.fetchone()
             if not row:
@@ -229,4 +254,4 @@ async def execute_get_analyst_track_record(params: dict, ctx: "ToolContext") -> 
                 }
             }
     except Exception as e:
-        return {"result": None, "error": str(e)}
+        return {"result": None, "error": f"{type(e).__name__}: {e}"}

@@ -68,5 +68,16 @@ PERSONA_DEF = {
         "temperature": 0.0,
         "cost_class": "medium",
         "system_prompt": EXPLORER_SENTIMENT_DRIFT_PERSONA_V1,
-    }
+    },
+    "v_intraday": {
+        "model": "claude-haiku-4-5-20251001",
+        "fallback_model": None,
+        "tools": ("get_sentiment_history",),
+        "output_tool": "emit_explorer_sentiment_drift",
+        "max_input_tokens": 4_000,
+        "max_output_tokens": 700,
+        "temperature": 0.0,
+        "cost_class": "cheap",
+        "system_prompt": EXPLORER_SENTIMENT_DRIFT_PERSONA_V1,
+    },
 }

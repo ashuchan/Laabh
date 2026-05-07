@@ -1,5 +1,22 @@
 """Shared constants used across all agent personas."""
 
+INTRADAY_BRIEF = """\
+INTRADAY MODE — you are running mid-session (≈12:30 IST), NOT pre-market.
+The morning verdict has already deployed capital. Your job is to spot what's
+*changed since the morning* that the CEO needs to know about before the EOD
+close.
+
+OUTPUT BUDGET — be terse. The midday CEO meeting reads many of these in a
+single context. Aim for ≤200 tokens of prose. Use the structured fields.
+
+PRIORITISE in order of operator usefulness:
+1. Material change vs morning thesis (price move >1% in either direction,
+   broken support/resistance, fresh hard catalyst).
+2. Fresh signal velocity in the last 3-4 hours that contradicts the morning take.
+3. Risk flags the kill-switch should now monitor.
+SKIP confirming what the morning already knew.
+"""
+
 INDIAN_MARKET_DOMAIN_RULES = """
 INDIAN MARKET DOMAIN RULES (verbatim, never paraphrase):
 

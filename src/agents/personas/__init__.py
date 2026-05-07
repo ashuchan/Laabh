@@ -57,6 +57,14 @@ from src.agents.personas.shadow_evaluator import (
     PERSONA_DEF as _SHADOW_EVALUATOR,
     SHADOW_EVALUATOR_OUTPUT_TOOL,
 )
+from src.agents.personas.smart_report import (
+    PERSONA_DEF as _SMART_REPORT,
+    SMART_REPORT_OUTPUT_TOOL,
+)
+from src.agents.personas.midday_ceo import (
+    PERSONA_DEF as _MIDDAY_CEO,
+    MIDDAY_CEO_OUTPUT_TOOL,
+)
 
 # PERSONA_MANIFEST: {agent_name: {version: persona_def_dict}}
 PERSONA_MANIFEST: dict[str, dict[str, dict]] = {
@@ -74,6 +82,8 @@ PERSONA_MANIFEST: dict[str, dict[str, dict]] = {
     "ceo_bear": _CEO_BEAR,
     "ceo_judge": _CEO_JUDGE,
     "shadow_evaluator": _SHADOW_EVALUATOR,
+    "smart_report": _SMART_REPORT,
+    "midday_ceo": _MIDDAY_CEO,
 }
 
 # OUTPUT_TOOL_SCHEMAS: {tool_name: json_schema_dict}
@@ -92,6 +102,8 @@ OUTPUT_TOOL_SCHEMAS: dict[str, dict] = {
     "emit_ceo_bear": CEO_BEAR_OUTPUT_TOOL,
     "emit_ceo_judge": CEO_JUDGE_OUTPUT_TOOL,
     "emit_shadow_evaluator": SHADOW_EVALUATOR_OUTPUT_TOOL,
+    "emit_smart_report": SMART_REPORT_OUTPUT_TOOL,
+    "emit_midday_ceo": MIDDAY_CEO_OUTPUT_TOOL,
 }
 
 __all__ = ["PERSONA_MANIFEST", "OUTPUT_TOOL_SCHEMAS"]

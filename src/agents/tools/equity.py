@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from src.agents.tools._helpers import resolve_instrument_id
+
 if TYPE_CHECKING:
     from src.agents.tools.registry import ToolContext
 
@@ -18,20 +20,24 @@ async def execute_score_technicals(params: dict, ctx: "ToolContext") -> dict:
     - Volume confirmation: is today's volume > 20-day avg?
     - Breakout: close > 20-day high (flag)
     """
-    instrument_id = params["instrument_id"]
     lookback_days = int(params.get("lookback_days", 60))
 
     try:
         async with ctx.db() as db:
+            iid = await resolve_instrument_id(db, params.get("instrument_id"))
+            if iid is None:
+                return {"score": None,
+                        "error": f"instrument_id {params.get('instrument_id')!r} did not resolve"}
+
             result = await db.execute(
                 text("""
                     SELECT date, close, volume
                     FROM price_daily
                     WHERE instrument_id = :iid
-                      AND date >= CURRENT_DATE - :days
+                      AND date >= CURRENT_DATE - (:days)::int
                     ORDER BY date ASC
                 """),
-                {"iid": str(instrument_id), "days": lookback_days},
+                {"iid": iid, "days": lookback_days},
             )
             rows = result.fetchall()
 
@@ -106,7 +112,7 @@ async def execute_score_technicals(params: dict, ctx: "ToolContext") -> dict:
             "n_days_history": len(rows),
         }
     except Exception as e:
-        return {"score": None, "error": str(e)}
+        return {"score": None, "error": f"{type(e).__name__}: {e}"}
 
 
 async def execute_score_fundamentals(params: dict, ctx: "ToolContext") -> dict:
@@ -115,17 +121,20 @@ async def execute_score_fundamentals(params: dict, ctx: "ToolContext") -> dict:
     Uses instrument metadata (sector, market_cap) as a proxy since full
     financials are not yet in the DB. Returns a neutral score with notes.
     """
-    instrument_id = params["instrument_id"]
-
     try:
         async with ctx.db() as db:
+            iid = await resolve_instrument_id(db, params.get("instrument_id"))
+            if iid is None:
+                return {"score": None,
+                        "error": f"instrument_id {params.get('instrument_id')!r} did not resolve"}
+
             result = await db.execute(
                 text("""
                     SELECT symbol, sector, industry, market_cap_cr, is_fno
                     FROM instruments
                     WHERE id = :iid
                 """),
-                {"iid": str(instrument_id)},
+                {"iid": iid},
             )
             row = result.fetchone()
 
@@ -146,7 +155,7 @@ async def execute_score_fundamentals(params: dict, ctx: "ToolContext") -> dict:
             ),
         }
     except Exception as e:
-        return {"score": None, "error": str(e)}
+        return {"score": None, "error": f"{type(e).__name__}: {e}"}
 
 
 async def execute_position_sizing(params: dict, ctx: "ToolContext") -> dict:

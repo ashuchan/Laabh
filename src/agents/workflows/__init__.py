@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from src.agents.runtime.spec import StageAgent, WorkflowSpec, WorkflowStage
 from src.agents.workflows.predict_today_combined import PREDICT_TODAY_COMBINED_V1
+from src.agents.workflows.midday_review import MIDDAY_REVIEW_V1
 
 # F&O-only variant
 PREDICT_TODAY_FNO_V1 = WorkflowSpec(
@@ -87,7 +88,8 @@ WORKFLOW_REGISTRY: dict[str, WorkflowSpec] = {
     "predict_today_combined": PREDICT_TODAY_COMBINED_V1,
     "predict_today_fno": PREDICT_TODAY_FNO_V1,
     "evaluate_yesterday": EVALUATE_YESTERDAY_V1,
+    "midday_review": MIDDAY_REVIEW_V1,
 }
 
 __all__ = ["WORKFLOW_REGISTRY", "PREDICT_TODAY_COMBINED_V1", "PREDICT_TODAY_FNO_V1",
-           "EVALUATE_YESTERDAY_V1"]
+           "EVALUATE_YESTERDAY_V1", "MIDDAY_REVIEW_V1"]

@@ -56,7 +56,7 @@ SEARCH_RAW_CONTENT_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument_id": {"type": "integer"},
+            "instrument_id": {"type": "string", "description": "Instrument UUID or symbol (e.g. 'RELIANCE')."},
             "since": {"type": "string", "description": "ISO timestamp"},
             "until": {"type": "string", "description": "ISO timestamp (optional)"},
             "limit": {"type": "integer", "default": 25},
@@ -77,7 +77,7 @@ GET_FILINGS_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument_id": {"type": "integer"},
+            "instrument_id": {"type": "string", "description": "Instrument UUID or symbol (e.g. 'RELIANCE')."},
             "since": {"type": "string"},
             "filing_types": {
                 "type": "array",
@@ -109,7 +109,7 @@ GET_ANALYST_TRACK_RECORD_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "analyst_id": {"type": "integer"},
+            "analyst_id": {"type": "string", "description": "Analyst UUID or display name."},
         },
         "required": ["analyst_id"],
     },
@@ -121,7 +121,7 @@ GET_PRICE_AGGREGATES_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument_id": {"type": "integer"},
+            "instrument_id": {"type": "string", "description": "Instrument UUID or symbol (e.g. 'RELIANCE')."},
             "window": {
                 "type": "string",
                 "enum": ["1d_daily_60", "20d_hourly", "5d_intraday_15m"],
@@ -138,7 +138,7 @@ GET_PAST_PREDICTIONS_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument_id": {"type": ["integer", "null"]},
+            "instrument_id": {"type": ["string", "null"], "description": "Instrument UUID or symbol."},
             "sector": {"type": ["string", "null"]},
             "lookback_days": {"type": "integer", "default": 90},
             "only_resolved": {"type": "boolean", "default": True},
@@ -152,7 +152,7 @@ GET_SENTIMENT_HISTORY_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument_id": {"type": "integer"},
+            "instrument_id": {"type": "string", "description": "Instrument UUID or symbol (e.g. 'RELIANCE')."},
             "since": {"type": "string"},
             "granularity": {"type": "string", "enum": ["daily", "weekly"], "default": "daily"},
         },
@@ -166,7 +166,7 @@ GET_OPTIONS_CHAIN_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "underlying_id": {"type": "integer"},
+            "underlying_id": {"type": "string", "description": "Underlying UUID or symbol (e.g. 'NIFTY')."},
             "expiry_date": {"type": "string", "description": "ISO date"},
             "snapshot_at": {"type": ["string", "null"], "description": "ISO timestamp (optional)"},
         },
@@ -180,7 +180,7 @@ GET_IV_CONTEXT_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "underlying_id": {"type": "integer"},
+            "underlying_id": {"type": "string", "description": "Underlying UUID or symbol."},
             "lookback_days": {"type": "integer", "default": 30},
         },
         "required": ["underlying_id"],
@@ -224,7 +224,7 @@ CHECK_BAN_LIST_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument_id": {"type": "integer"},
+            "instrument_id": {"type": "string", "description": "Instrument UUID or symbol (e.g. 'RELIANCE')."},
         },
         "required": ["instrument_id"],
     },
@@ -236,7 +236,7 @@ SCORE_TECHNICALS_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument_id": {"type": "integer"},
+            "instrument_id": {"type": "string", "description": "Instrument UUID or symbol (e.g. 'RELIANCE')."},
             "lookback_days": {"type": "integer", "default": 60},
         },
         "required": ["instrument_id"],
@@ -249,7 +249,7 @@ SCORE_FUNDAMENTALS_SCHEMA = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument_id": {"type": "integer"},
+            "instrument_id": {"type": "string", "description": "Instrument UUID or symbol (e.g. 'RELIANCE')."},
         },
         "required": ["instrument_id"],
     },
@@ -384,3 +384,36 @@ for _name, _schema in _TOOLS_TO_REGISTER:
         timeout_seconds=10,
         cost_class="cheap",
     ))
+
+
+def activate_sql_executors() -> int:
+    """Swap every TOOL_REGISTRY entry to its SQL-backed executor.
+
+    Used when the process started with TOOLS_BACKEND unset (so the registry
+    booted in stub mode) but a caller — typically a backtest — wants the
+    agents to see real DB data for the rest of this run. Returns the number
+    of executors swapped.
+
+    Idempotent: subsequent calls are no-ops once SQL executors are loaded.
+    """
+    global _SQL_EXECUTORS
+    if not _SQL_EXECUTORS:
+        try:
+            _SQL_EXECUTORS = _load_sql_executors()
+        except ImportError as e:
+            log.error("activate_sql_executors: import failed: %s", e)
+            return 0
+    swapped = 0
+    for name, td in TOOL_REGISTRY.items():
+        sql = _SQL_EXECUTORS.get(name)
+        if sql and td.executor is not sql:
+            TOOL_REGISTRY[name] = ToolDefinition(
+                name=td.name,
+                json_schema=td.json_schema,
+                executor=sql,
+                timeout_seconds=td.timeout_seconds,
+                cost_class=td.cost_class,
+            )
+            swapped += 1
+    log.info("activate_sql_executors: swapped %d executors to SQL backend", swapped)
+    return swapped
