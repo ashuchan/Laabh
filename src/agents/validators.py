@@ -108,6 +108,55 @@ class CEOJudgeOutputValidated(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def at_risk_capital_within_drawdown_tolerance(self) -> "CEOJudgeOutputValidated":
+        at_risk = sum(a.capital_pct for a in self.allocation if a.asset_class.lower() != "cash")
+        if at_risk > self.max_drawdown_tolerated_pct:
+            raise ValueError(
+                f"Total at-risk capital {at_risk:.1f}% exceeds max_drawdown_tolerated_pct "
+                f"{self.max_drawdown_tolerated_pct:.1f}%. Reduce position size or raise "
+                f"max_drawdown_tolerated_pct to match actual deployment."
+            )
+        return self
+
+    @field_validator("allocation")
+    @classmethod
+    def fno_legs_match_strategy(cls, v: list[Allocation]) -> list[Allocation]:
+        import re
+        _BULL_SIGNALS = {"bull", "long_call", "buy_call", "bull_call", "bull_put"}
+        _BEAR_SIGNALS = {"bear", "long_put", "buy_put", "bear_call", "bear_put", "short_call"}
+        for alloc in v:
+            if alloc.asset_class.lower() != "fno":
+                continue
+            dec = alloc.decision.lower().replace(" ", "_")
+            has_bull = any(s in dec for s in _BULL_SIGNALS)
+            has_bear = any(s in dec for s in _BEAR_SIGNALS)
+            if has_bull and has_bear:
+                raise ValueError(
+                    f"Allocation for {alloc.underlying_or_symbol!r} has contradictory "
+                    f"direction signals in decision {alloc.decision!r}. "
+                    f"A strategy cannot be simultaneously bullish and bearish."
+                )
+        return v
+
+    @model_validator(mode="after")
+    def kill_switch_triggers_are_concrete(self) -> "CEOJudgeOutputValidated":
+        import re
+        _VAGUE_PATTERNS = [
+            r"\bwatch\b", r"\bmonitor\b", r"\bcheck\b", r"\bif needed\b",
+            r"\bwhen appropriate\b", r"\bconditions change\b",
+        ]
+        _HAS_METRIC = re.compile(r"\d|%|VIX|PCR|OI|delta|gamma|spread|level|above|below|cross", re.I)
+        for ks in self.kill_switches:
+            trigger = ks.trigger
+            for pat in _VAGUE_PATTERNS:
+                if re.search(pat, trigger, re.I) and not _HAS_METRIC.search(trigger):
+                    raise ValueError(
+                        f"Kill-switch trigger {trigger!r} is too vague — must reference a "
+                        f"specific measurable level, price, or metric."
+                    )
+        return self
+
 
 class EquityExpertOutputValidated(BaseModel):
     """Validates an equity expert's recommendation."""

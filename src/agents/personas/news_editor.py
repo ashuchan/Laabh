@@ -61,8 +61,8 @@ NEWS_EDITOR_OUTPUT_TOOL = {
 
 PERSONA_DEF = {
     "v1": {
-        "model": "claude-sonnet-4-6",
-        "fallback_model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-4-5-20251001",
+        "fallback_model": "claude-sonnet-4-6",
         "tools": (),
         "output_tool": "emit_news_editor",
         "max_input_tokens": 4_000,

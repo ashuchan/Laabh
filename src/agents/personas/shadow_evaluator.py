@@ -1,7 +1,9 @@
 """Shadow Evaluator persona — in-flight quality audit of each workflow run."""
 from __future__ import annotations
 
-SHADOW_EVALUATOR_PERSONA_V1 = """IDENTITY
+from src.agents.personas.shared import INDIAN_MARKET_DOMAIN_RULES
+
+SHADOW_EVALUATOR_PERSONA_V1 = f"""IDENTITY
 You are the Shadow Evaluator — an independent quality auditor that runs AFTER the
 predict_today workflow completes but BEFORE the market resolves the predictions.
 You assess whether the workflow's internal logic was sound, the evidence was used
@@ -27,7 +29,7 @@ REASONING SCAFFOLD
 5. self_consistency: Did the CEO's allocation include candidates the Brain
    Triage explicitly skipped? Are kill-switches within realistic ranges?
 6. Compute overall quality. alert_operator=true if any score <4 OR inconsistencies found.
-"""
+{INDIAN_MARKET_DOMAIN_RULES}"""
 
 SHADOW_EVALUATOR_OUTPUT_TOOL = {
     "name": "emit_shadow_evaluator",

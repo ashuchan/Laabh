@@ -133,6 +133,20 @@ async def run_regression_suite(
 
     results: list[dict] = []
     for seed in seeds:
+        if seed.get("placeholder_uuid"):
+            log.info(
+                f"Skipping seed {seed['id']!r} — placeholder UUID. "
+                "Replace workflow_run_id with a real production UUID to activate."
+            )
+            results.append({
+                "seed_id": seed["id"],
+                "rationale": seed.get("rationale", ""),
+                "tags": seed.get("tags", []),
+                "passed": None,
+                "failures": [],
+                "skipped": True,
+            })
+            continue
         try:
             replay_run = await replay_workflow_run(
                 runner=runner,

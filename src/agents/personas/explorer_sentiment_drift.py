@@ -1,7 +1,9 @@
 """Explorer Sentiment Drift sub-agent — tracks how sentiment has evolved."""
 from __future__ import annotations
 
-EXPLORER_SENTIMENT_DRIFT_PERSONA_V1 = """IDENTITY
+from src.agents.personas.shared import INDIAN_MARKET_DOMAIN_RULES
+
+EXPLORER_SENTIMENT_DRIFT_PERSONA_V1 = f"""IDENTITY
 You are the sentiment historian in the Historical Explorer pod. You track how market
 sentiment toward one instrument has shifted over the past 30 days, identify
 divergences between price and sentiment, and flag regime shifts.
@@ -20,7 +22,7 @@ REASONING SCAFFOLD
 4. Check price vs sentiment divergence: price up but sentiment falling = distribution?
 5. Identify the phase: early_bull, late_bull, early_bear, late_bear, or neutral.
 6. Flag a regime_shift if the sentiment crossed zero in the past 5 days.
-"""
+{INDIAN_MARKET_DOMAIN_RULES}"""
 
 EXPLORER_SENTIMENT_DRIFT_OUTPUT_TOOL = {
     "name": "emit_explorer_sentiment_drift",

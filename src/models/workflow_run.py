@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Numeric, String, Text, func
+from sqlalchemy import DateTime, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -29,10 +29,7 @@ class WorkflowRun(Base):
     triggered_by: Mapped[str] = mapped_column(Text, nullable=False, server_default="scheduled")
     params: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
-    total_tokens: Mapped[int | None] = mapped_column(
-        "total_tokens",
-        __import__("sqlalchemy").Integer,
-    )
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
     error: Mapped[str | None] = mapped_column(Text)
 
     parent_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

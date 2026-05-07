@@ -146,7 +146,7 @@ def compute_calibration_drift(week: WeekData) -> dict:
     results = []
     for (lo, hi), outcomes in bin_data.items():
         n = len(outcomes)
-        if n < 2:
+        if n < 3:
             continue
         actual_rate = sum(outcomes) / n
         expected_rate = (lo + hi) / 2
@@ -239,9 +239,16 @@ def render_markdown_report(
         "|---|---|---|---|",
     ]
     for r in regression_results:
-        status = "✅ passed" if r.get("passed") else "⚠️ DEGRADED"
+        if r.get("skipped"):
+            status = "⬜ skipped"
+            notes = "placeholder UUID — add real workflow_run_id to activate"
+        elif r.get("passed"):
+            status = "✅ passed"
+            notes = "—"
+        else:
+            status = "⚠️ DEGRADED"
+            notes = "; ".join(r.get("failures", [])) or "—"
         tags = ", ".join(r.get("tags", []))
-        notes = "; ".join(r.get("failures", [])) or "—"
         lines.append(f"| {r.get('seed_id', '?')} | {tags} | {status} | {notes} |")
 
     if ab_results:

@@ -114,9 +114,9 @@ class WorkflowRunner:
         Returns WorkflowRunResult with status, predictions, cost summary, and
         validator outcomes. Raises BudgetExceeded or DuplicateRun on hard errors.
         """
-        # 1. Idempotency guard
+        # 1. Idempotency guard — check DB first (permanent), then Redis (fast path)
         if idempotency_key and await self._idempotency_taken(idempotency_key):
-            raise DuplicateRun(f"Idempotency key in flight: {idempotency_key!r}")
+            raise DuplicateRun(f"Idempotency key already used: {idempotency_key!r}")
 
         # 2. Merge params
         merged_params: dict[str, Any] = {**workflow_spec.default_params, **(params or {})}
@@ -265,6 +265,20 @@ class WorkflowRunner:
             ctx.cost_so_far_usd += res.cost_usd
             ctx.tokens_so_far += res.input_tokens + res.output_tokens
 
+            # Per-agent post-accumulation budget check (parallel stages can overshoot
+            # a pre-stage projection; catch the breach as early as possible).
+            if ctx.cost_so_far_usd >= ctx.workflow_spec.cost_ceiling_usd:
+                raise BudgetExceeded(
+                    f"Cost ceiling ${ctx.workflow_spec.cost_ceiling_usd} reached "
+                    f"after agent {inv.stage_agent.agent_name} "
+                    f"(actual ${ctx.cost_so_far_usd:.4f})"
+                )
+            if ctx.tokens_so_far >= ctx.workflow_spec.token_ceiling:
+                raise BudgetExceeded(
+                    f"Token ceiling {ctx.workflow_spec.token_ceiling} reached "
+                    f"after agent {inv.stage_agent.agent_name}"
+                )
+
             output_key = inv.stage_agent.output_key or inv.stage_agent.agent_name
             if inv.stage_agent.iteration_source:
                 ctx.stage_outputs.setdefault(output_key, []).append(res.output)
@@ -314,9 +328,6 @@ class WorkflowRunner:
         api_request = self._build_api_request(spec, prompt_messages, ctx)
 
         result = await self._execute_with_retries(spec, api_request, agent_run_id, ctx)
-
-        if result.status == "succeeded" and spec.output_validator:
-            result = await self._validate_output(spec, result, ctx)
 
         if result.status == "succeeded" and spec.name == "shadow_evaluator":
             try:
@@ -391,6 +402,7 @@ class WorkflowRunner:
         _used_fallback = False
 
         while transient_attempt <= spec.max_retries_transient:
+            response = None  # ensure name is bound before any exception can reference it
             try:
                 t0 = time.monotonic()
                 if spec.stream_response and self.anthropic:
@@ -421,7 +433,7 @@ class WorkflowRunner:
                     spec, used_model, api_request_current, response, ctx, agent_run_id
                 )
 
-                return AgentRunResult(
+                candidate = AgentRunResult(
                     agent_run_id=agent_run_id,
                     agent_name=spec.name,
                     persona_version=spec.persona_version,
@@ -438,6 +450,17 @@ class WorkflowRunner:
                     llm_audit_log_id=audit_id,
                 )
 
+                # Run semantic validator inside the retry loop so that rejection
+                # raises OutputValidationError and triggers a repair-and-retry.
+                if spec.output_validator:
+                    validated = await self._validate_output(spec, candidate, ctx)
+                    if validated.status == "rejected_by_guardrail":
+                        raise OutputValidationError(
+                            "; ".join(validated.validation_errors or [str(validated.error)])
+                        )
+
+                return candidate
+
             except OutputValidationError as e:
                 validation_attempt += 1
                 last_error = str(e)
@@ -445,9 +468,9 @@ class WorkflowRunner:
                     return self._make_failed_result(
                         spec, agent_run_id, used_model, last_error, "validation_exhausted"
                     )
-                # Repair-prompt
+                # Repair-prompt — `response` is guaranteed bound (set to None at loop start)
                 api_request_current = self._build_repair_request(
-                    api_request_current, locals().get("response"), e
+                    api_request_current, response, e
                 )
 
             except (asyncio.TimeoutError,) as e:
@@ -1184,9 +1207,27 @@ class WorkflowRunner:
         )
 
     async def _idempotency_taken(self, key: str) -> bool:
+        """Return True if this idempotency_key was already used.
+
+        Checks the DB first (permanent record) then uses Redis as a fast-path
+        lock for in-flight runs. Checking DB first prevents false positives
+        where a legitimate retry within the Redis TTL window is wrongly blocked.
+        """
+        try:
+            async with self.db_session_factory() as db:
+                result = await db.execute(
+                    text("SELECT 1 FROM workflow_runs WHERE idempotency_key = :k LIMIT 1"),
+                    {"k": key},
+                )
+                if result.fetchone():
+                    return True
+        except Exception as e:
+            log.warning(f"Idempotency DB check failed: {e}")
+
+        # Redis fast-path: block duplicate submissions within the same TTL window
         try:
             result = await self.redis.set(f"laabh:idem:{key}", "1", nx=True, ex=300)
-            return result is None  # None means key already exists
+            return result is None  # None → key already existed in Redis
         except Exception:
             return False
 

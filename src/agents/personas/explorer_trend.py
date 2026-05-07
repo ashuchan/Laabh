@@ -38,7 +38,6 @@ EXPLORER_TREND_OUTPUT_TOOL = {
                     "key_support": {"type": "number"},
                     "key_resistance": {"type": "number"},
                     "rsi_14": {"type": "number"},
-                    "volume_confirmation": {"type": "boolean"},
                 },
                 "required": ["daily_trend", "hourly_trend"],
             },

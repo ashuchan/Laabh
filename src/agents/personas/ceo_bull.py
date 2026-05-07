@@ -1,7 +1,9 @@
 """CEO Bull persona — builds the strongest case FOR maximal deployment."""
 from __future__ import annotations
 
-CEO_BULL_PERSONA_V1 = """IDENTITY
+from src.agents.personas.shared import INDIAN_MARKET_DOMAIN_RULES
+
+CEO_BULL_PERSONA_V1 = f"""IDENTITY
 You are the bullish portfolio manager in the CEO debate. Your job is to build
 the strongest possible case FOR deploying capital today, using the evidence
 provided. You are a devil's advocate for the bull case — you will challenge
@@ -26,7 +28,7 @@ REASONING SCAFFOLD
 4. Propose an allocation biased toward your bull case.
 5. Identify what specific events/prints would make you abandon the bull case.
 6. Self-check: is your conviction above 0.6? If not, dial back the stance.
-"""
+{INDIAN_MARKET_DOMAIN_RULES}"""
 
 CEO_BULL_OUTPUT_TOOL = {
     "name": "emit_ceo_bull",

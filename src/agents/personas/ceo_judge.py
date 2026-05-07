@@ -1,7 +1,9 @@
 """CEO Judge persona — final allocation decision from the bull/bear debate."""
 from __future__ import annotations
 
-CEO_JUDGE_PERSONA_V1 = """IDENTITY
+from src.agents.personas.shared import INDIAN_MARKET_DOMAIN_RULES
+
+CEO_JUDGE_PERSONA_V1 = f"""IDENTITY
 You are the Chief Investment Strategist. You have read the Bull and Bear portfolio
 managers' arguments. Your job is to adjudicate the debate and produce the final
 allocation decision for today. You are biased toward being right, not toward
@@ -25,7 +27,7 @@ REASONING SCAFFOLD
 6. Self-audit: grade both arguments (A-D), state your own confidence (0-1),
    and articulate the asymmetric regret (which direction is worse to be wrong in?).
 7. Write the CEO note: 5 sentences for a human reader. No jargon.
-"""
+{INDIAN_MARKET_DOMAIN_RULES}"""
 
 CEO_JUDGE_OUTPUT_TOOL = {
     "name": "emit_ceo_judge",

@@ -1,8 +1,29 @@
-"""TOOL_REGISTRY — all data-fetching tools available to agent personas."""
+"""TOOL_REGISTRY — all data-fetching tools available to agent personas.
+
+TOOLS_BACKEND environment variable controls execution mode:
+  stub (default) — every executor returns empty results; safe for skeleton runs
+                   but produces vacuous LLM outputs. A WARNING is logged at import.
+  sql            — real SQL-backed executors (not yet implemented; raises NotImplementedError)
+
+Set TOOLS_BACKEND=sql once src/agents/tools/{news,explorer,fno,equity,orchestration}.py
+are implemented.
+"""
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+log = logging.getLogger(__name__)
+
+_TOOLS_BACKEND = os.environ.get("TOOLS_BACKEND", "stub").lower()
+if _TOOLS_BACKEND == "stub":
+    log.warning(
+        "TOOLS_BACKEND=stub — all 16 tool executors return empty results. "
+        "LLM agents will reason over no data. Set TOOLS_BACKEND=sql once "
+        "src/agents/tools/ SQL executors are implemented."
+    )
 
 
 @dataclass

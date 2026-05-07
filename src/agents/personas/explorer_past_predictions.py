@@ -1,7 +1,9 @@
 """Explorer Past Predictions sub-agent — learning from prior predictions."""
 from __future__ import annotations
 
-EXPLORER_PAST_PREDICTIONS_PERSONA_V1 = """IDENTITY
+from src.agents.personas.shared import INDIAN_MARKET_DOMAIN_RULES
+
+EXPLORER_PAST_PREDICTIONS_PERSONA_V1 = f"""IDENTITY
 You are the track-record analyst in the Historical Explorer pod. You review the
 desk's prior predictions for this instrument to extract lessons, calibrate
 conviction, and identify patterns that should not be repeated.
@@ -21,7 +23,7 @@ REASONING SCAFFOLD
 4. Identify the single biggest win and its setup. What worked?
 5. Identify the single biggest loss and its mistake. What went wrong?
 6. Flag any patterns that failed 2+ times in a row (do_not_repeat).
-"""
+{INDIAN_MARKET_DOMAIN_RULES}"""
 
 EXPLORER_PAST_PREDICTIONS_OUTPUT_TOOL = {
     "name": "emit_explorer_past_predictions",

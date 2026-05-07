@@ -15,16 +15,18 @@ VALID_JUDGE_OUTPUT = {
     "disagreement_loci": [],
     "allocation": [
         {
+            # 3% premium deployed in a debit spread — max loss = premium = 3%,
+            # which equals max_drawdown_tolerated_pct (passes at_risk validator).
             "asset_class": "fno",
             "underlying_or_symbol": "BANKNIFTY",
-            "capital_pct": 25.0,
+            "capital_pct": 3.0,
             "decision": "BUY_CALL_SPREAD",
             "conviction": 0.78,
         },
         {
             "asset_class": "cash",
             "underlying_or_symbol": "CASH",
-            "capital_pct": 75.0,
+            "capital_pct": 97.0,
             "decision": "HOLD",
         },
     ],
@@ -36,9 +38,9 @@ VALID_JUDGE_OUTPUT = {
         }
     ],
     "ceo_note": "Today's setup is clear. RBI rate-cut chatter is driving IV low. "
-                "We deploy 25% into a debit spread with defined risk. "
+                "We deploy 3% into a debit spread — max loss equals the premium. "
                 "The bear case is the RBI stays on hold, which we hedge via small size. "
-                "Kill-switch is a 2% adverse move in BANKNIFTY. "
+                "Kill-switch is BANKNIFTY falling below 48000. "
                 "This is a workable but not extraordinary setup.",
     "calibration_self_check": {
         "bullish_argument_grade": "B",
@@ -101,10 +103,79 @@ class TestCEOJudgeOutputValidated:
     def test_kill_switches_required_shape(self):
         data = {**VALID_JUDGE_OUTPUT}
         data["kill_switches"] = [
-            {"trigger": "X", "action": "exit_all", "monitoring_metric": "Y"}
+            {"trigger": "NIFTY falls below 22000", "action": "exit_all", "monitoring_metric": "NIFTY spot < 22000"}
         ]
         result = CEOJudgeOutputValidated(**data)
         assert result.kill_switches[0].action == "exit_all"
+
+    # --- at_risk_capital_within_drawdown_tolerance ---
+
+    def test_at_risk_exceeds_drawdown_tolerance_fails(self):
+        data = {**VALID_JUDGE_OUTPUT}
+        # Deploy 8% but max_drawdown is only 3% — should fail
+        data["allocation"] = [
+            {"asset_class": "fno", "underlying_or_symbol": "NIFTY",
+             "capital_pct": 8.0, "decision": "BUY_CALL_SPREAD"},
+            {"asset_class": "cash", "underlying_or_symbol": "CASH",
+             "capital_pct": 92.0, "decision": "HOLD"},
+        ]
+        with pytest.raises(ValidationError, match="at-risk capital"):
+            CEOJudgeOutputValidated(**data)
+
+    def test_at_risk_equals_drawdown_tolerance_passes(self):
+        data = {**VALID_JUDGE_OUTPUT}
+        data["allocation"] = [
+            {"asset_class": "fno", "underlying_or_symbol": "NIFTY",
+             "capital_pct": 3.0, "decision": "BUY_PUT_SPREAD"},
+            {"asset_class": "cash", "underlying_or_symbol": "CASH",
+             "capital_pct": 97.0, "decision": "HOLD"},
+        ]
+        result = CEOJudgeOutputValidated(**data)
+        assert result.max_drawdown_tolerated_pct == 3.0
+
+    # --- fno_legs_match_strategy ---
+
+    def test_contradictory_fno_direction_fails(self):
+        data = {**VALID_JUDGE_OUTPUT}
+        data["allocation"] = [
+            {"asset_class": "fno", "underlying_or_symbol": "NIFTY",
+             "capital_pct": 3.0, "decision": "BULL_BEAR_STRANGLE"},
+            {"asset_class": "cash", "underlying_or_symbol": "CASH",
+             "capital_pct": 97.0, "decision": "HOLD"},
+        ]
+        with pytest.raises(ValidationError, match="contradictory"):
+            CEOJudgeOutputValidated(**data)
+
+    def test_unambiguous_fno_direction_passes(self):
+        data = {**VALID_JUDGE_OUTPUT}
+        data["allocation"] = [
+            {"asset_class": "fno", "underlying_or_symbol": "NIFTY",
+             "capital_pct": 3.0, "decision": "BUY_PUT_SPREAD"},
+            {"asset_class": "cash", "underlying_or_symbol": "CASH",
+             "capital_pct": 97.0, "decision": "HOLD"},
+        ]
+        result = CEOJudgeOutputValidated(**data)
+        assert result.allocation[0].decision == "BUY_PUT_SPREAD"
+
+    # --- kill_switch_triggers_are_concrete ---
+
+    def test_vague_kill_switch_trigger_fails(self):
+        data = {**VALID_JUDGE_OUTPUT}
+        data["kill_switches"] = [
+            {"trigger": "monitor conditions", "action": "reduce_size",
+             "monitoring_metric": "sentiment"}
+        ]
+        with pytest.raises(ValidationError, match="too vague"):
+            CEOJudgeOutputValidated(**data)
+
+    def test_concrete_kill_switch_trigger_passes(self):
+        data = {**VALID_JUDGE_OUTPUT}
+        data["kill_switches"] = [
+            {"trigger": "VIX crosses above 22", "action": "exit_all",
+             "monitoring_metric": "VIX > 22"}
+        ]
+        result = CEOJudgeOutputValidated(**data)
+        assert result.kill_switches[0].trigger == "VIX crosses above 22"
 
 
 class TestEquityExpertOutputValidated:
