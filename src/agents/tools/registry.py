@@ -21,8 +21,8 @@ _TOOLS_BACKEND = os.environ.get("TOOLS_BACKEND", "stub").lower()
 if _TOOLS_BACKEND == "stub":
     log.warning(
         "TOOLS_BACKEND=stub — all 16 tool executors return empty results. "
-        "LLM agents will reason over no data. Set TOOLS_BACKEND=sql once "
-        "src/agents/tools/ SQL executors are implemented."
+        "LLM agents will reason over no data. "
+        "Set TOOLS_BACKEND=sql to activate the SQL-backed executors."
     )
 
 
@@ -284,12 +284,73 @@ GET_FULL_RATIONALE_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
-# Stub executors — replace with real SQL queries in production
+# Executor selection: stub vs SQL
 # ---------------------------------------------------------------------------
 
 async def _stub_executor(params: dict, ctx: Any) -> dict:
     """Placeholder executor — returns an empty result. Override per tool."""
     return {"result": [], "note": "stub executor — no DB query implemented yet"}
+
+
+def _load_sql_executors() -> dict[str, Any]:
+    """Import SQL executors lazily.  Only called when TOOLS_BACKEND=sql."""
+    from src.agents.tools.news import (
+        execute_search_raw_content,
+        execute_get_filings,
+        execute_search_transcript_chunks,
+        execute_get_analyst_track_record,
+    )
+    from src.agents.tools.explorer import (
+        execute_get_price_aggregates,
+        execute_get_past_predictions,
+        execute_get_sentiment_history,
+    )
+    from src.agents.tools.fno import (
+        execute_get_options_chain,
+        execute_get_iv_context,
+        execute_enumerate_eligible_strategies,
+        execute_get_strategy_payoff,
+        execute_check_ban_list,
+    )
+    from src.agents.tools.equity import (
+        execute_score_technicals,
+        execute_score_fundamentals,
+        execute_position_sizing,
+    )
+    from src.agents.tools.orchestration import execute_get_full_rationale
+
+    return {
+        "search_raw_content":          execute_search_raw_content,
+        "get_filings":                 execute_get_filings,
+        "search_transcript_chunks":    execute_search_transcript_chunks,
+        "get_analyst_track_record":    execute_get_analyst_track_record,
+        "get_price_aggregates":        execute_get_price_aggregates,
+        "get_past_predictions":        execute_get_past_predictions,
+        "get_sentiment_history":       execute_get_sentiment_history,
+        "get_options_chain":           execute_get_options_chain,
+        "get_iv_context":              execute_get_iv_context,
+        "enumerate_eligible_strategies": execute_enumerate_eligible_strategies,
+        "get_strategy_payoff":         execute_get_strategy_payoff,
+        "check_ban_list":              execute_check_ban_list,
+        "score_technicals":            execute_score_technicals,
+        "score_fundamentals":          execute_score_fundamentals,
+        "position_sizing":             execute_position_sizing,
+        "get_full_rationale":          execute_get_full_rationale,
+    }
+
+
+_SQL_EXECUTORS: dict[str, Any] = {}
+if _TOOLS_BACKEND == "sql":
+    try:
+        _SQL_EXECUTORS = _load_sql_executors()
+        log.info("TOOLS_BACKEND=sql — loaded %d SQL executors", len(_SQL_EXECUTORS))
+    except ImportError as e:
+        log.error("TOOLS_BACKEND=sql but SQL executor import failed: %s — falling back to stubs", e)
+
+
+def _executor_for(name: str) -> Any:
+    """Return the SQL executor if available, else the stub."""
+    return _SQL_EXECUTORS.get(name, _stub_executor)
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +380,7 @@ for _name, _schema in _TOOLS_TO_REGISTER:
     register_tool(ToolDefinition(
         name=_name,
         json_schema=_schema,
-        executor=_stub_executor,
+        executor=_executor_for(_name),
         timeout_seconds=10,
         cost_class="cheap",
     ))

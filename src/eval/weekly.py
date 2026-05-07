@@ -108,10 +108,55 @@ async def fetch_week_data(start: date, end: date, db_session_factory) -> WeekDat
     return week
 
 
+def _prompt_version_key(prompt_versions: Any) -> str:
+    """Stable string key for a prompt_versions JSONB value."""
+    if not prompt_versions:
+        return "unknown"
+    if isinstance(prompt_versions, str):
+        try:
+            prompt_versions = json.loads(prompt_versions)
+        except (ValueError, TypeError):
+            return str(prompt_versions)
+    if isinstance(prompt_versions, dict):
+        return json.dumps(dict(sorted(prompt_versions.items())), separators=(",", ":"))
+    return str(prompt_versions)
+
+
+def _welch_t_stat(group_a: list[float], group_b: list[float]) -> float | None:
+    """Welch t-statistic comparing two P&L groups. Returns None if insufficient data."""
+    import math
+
+    na, nb = len(group_a), len(group_b)
+    if na < 2 or nb < 2:
+        return None
+    mean_a = sum(group_a) / na
+    mean_b = sum(group_b) / nb
+    var_a = sum((x - mean_a) ** 2 for x in group_a) / (na - 1)
+    var_b = sum((x - mean_b) ** 2 for x in group_b) / (nb - 1)
+    se = math.sqrt(var_a / na + var_b / nb)
+    if se == 0:
+        return None
+    return abs(mean_a - mean_b) / se
+
+
 def compute_pnl_attribution(week: WeekData) -> dict:
-    """Decompose week's P&L into prompt-change buckets vs regime/random."""
+    """Decompose week's P&L into prompt-version buckets.
+
+    Groups resolved predictions by their prompt_versions JSONB fingerprint.
+    For each unique version combo, computes the mean P&L delta versus the
+    baseline (most common prompt version). Uses a Welch t-statistic to flag
+    whether the difference is likely significant (t >= 1.5 at small n).
+    Returns attribution=[] when only one prompt version is in use.
+    """
     if not week.resolved_predictions:
-        return {"week_total_pnl_pct": 0, "attribution": [], "unattributed_pp": 0}
+        return {
+            "week_total_pnl_pct": 0,
+            "n_predictions": 0,
+            "n_wins": 0,
+            "win_rate_pct": 0,
+            "attribution": [],
+            "unattributed_pp": 0,
+        }
 
     total_pnl = sum(
         float(p.get("realised_pnl_pct") or 0)
@@ -121,13 +166,59 @@ def compute_pnl_attribution(week: WeekData) -> dict:
                  if (p.get("realised_pnl_pct") or 0) > 0)
     n_total = len(week.resolved_predictions)
 
+    # Group predictions by prompt_versions fingerprint
+    groups: dict[str, list[float]] = defaultdict(list)
+    for p in week.resolved_predictions:
+        key = _prompt_version_key(p.get("prompt_versions"))
+        groups[key].append(float(p.get("realised_pnl_pct") or 0))
+
+    if len(groups) <= 1:
+        return {
+            "week_total_pnl_pct": total_pnl,
+            "n_predictions": n_total,
+            "n_wins": n_wins,
+            "win_rate_pct": (n_wins / n_total * 100) if n_total else 0,
+            "attribution": [],
+            "unattributed_pp": total_pnl,
+        }
+
+    # Baseline = version used in the most predictions this week
+    baseline_key = max(groups, key=lambda k: len(groups[k]))
+    baseline_pnl = groups[baseline_key]
+    baseline_mean = sum(baseline_pnl) / len(baseline_pnl)
+
+    attribution = []
+    attributed_pp = 0.0
+
+    for key, pnl_list in groups.items():
+        if key == baseline_key:
+            continue
+        version_mean = sum(pnl_list) / len(pnl_list)
+        delta_pp = version_mean - baseline_mean
+        t_stat = _welch_t_stat(pnl_list, baseline_pnl)
+        significant = t_stat is not None and t_stat >= 1.5
+
+        attribution.append({
+            "prompt_version_key": key,
+            "n": len(pnl_list),
+            "mean_pnl_pct": version_mean,
+            "delta_vs_baseline_pp": delta_pp,
+            "t_stat": round(t_stat, 3) if t_stat is not None else None,
+            "likely_significant": significant,
+        })
+        if significant:
+            attributed_pp += delta_pp * len(pnl_list)
+
     return {
         "week_total_pnl_pct": total_pnl,
         "n_predictions": n_total,
         "n_wins": n_wins,
         "win_rate_pct": (n_wins / n_total * 100) if n_total else 0,
-        "attribution": [],   # requires baseline comparison — populated in weekly_postmortem.py
-        "unattributed_pp": total_pnl,
+        "baseline_prompt_key": baseline_key,
+        "baseline_n": len(baseline_pnl),
+        "baseline_mean_pnl_pct": baseline_mean,
+        "attribution": attribution,
+        "unattributed_pp": total_pnl - attributed_pp,
     }
 
 

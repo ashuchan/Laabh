@@ -77,7 +77,7 @@ NEWS_FINDER_OUTPUT_TOOL = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "ref": {"type": "string"},
+                        "ref": {"type": "string", "pattern": "^c\\d+$"},
                         "raw_content_id": {"type": ["integer", "null"]},
                         "weight": {"type": "number"},
                         "analyst_credibility": {"type": "number"},

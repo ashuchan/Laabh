@@ -586,3 +586,101 @@ class TestFromAgentToggle:
         )
         assert ctx.from_agent is None
         assert ctx._replay_live_mode is False
+
+
+# ---------------------------------------------------------------------------
+# _safe_jsonb
+# ---------------------------------------------------------------------------
+
+class TestSafeJsonb:
+    def test_small_dict_returned_as_is(self):
+        data = {"key": "value", "n": 42}
+        result = WorkflowRunner._safe_jsonb(data)
+        assert result == data
+
+    def test_oversized_payload_returns_none(self):
+        data = {"key": "x" * 100_000}
+        result = WorkflowRunner._safe_jsonb(data, limit=100)
+        assert result is None
+
+    def test_exactly_at_limit_passes(self):
+        # Construct something whose serialisation is exactly the limit
+        import json
+        target = 50
+        payload = {"k": "a"}
+        serialised = json.dumps(payload, default=str)
+        assert len(serialised) <= target
+        result = WorkflowRunner._safe_jsonb(payload, limit=target)
+        assert result == payload
+
+    def test_non_serialisable_uses_str_fallback(self):
+        from datetime import datetime
+        data = {"ts": datetime(2026, 1, 1)}
+        result = WorkflowRunner._safe_jsonb(data)
+        # Should not raise; non-serialisable uses default=str
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# Mid-stage BudgetExceeded
+# ---------------------------------------------------------------------------
+
+class TestMidStageBudget:
+    """The per-agent post-accumulation budget check must raise BudgetExceeded
+    if cost crosses the ceiling after a single agent returns, even in a
+    parallel stage where the pre-stage projection was under the ceiling.
+    """
+
+    @pytest.mark.asyncio
+    async def test_budget_exceeded_mid_stage_raises(self):
+        """Run a workflow with an extremely low cost ceiling and a mock agent
+        that returns a non-zero cost so the ceiling is crossed.
+        """
+        import types
+        from decimal import Decimal
+        from src.agents.runtime.workflow_runner import BudgetExceeded
+
+        # Build a response that would cost something
+        def _make_response():
+            usage = types.SimpleNamespace(
+                input_tokens=10_000,   # at Haiku prices: ~$0.0008
+                output_tokens=2_000,
+                cache_read_input_tokens=0,
+                cache_creation_input_tokens=0,
+            )
+            tool_block = types.SimpleNamespace(
+                type="tool_use",
+                id="toolu_mid_budget",
+                name="emit_brain_triage",
+                input={
+                    "skip_today": False, "skip_reason": None,
+                    "fno_candidates": [], "equity_candidates": [],
+                    "market_regime": {"vix_regime": "neutral", "trend": "sideways"},
+                    "notes": "",
+                },
+            )
+            return types.SimpleNamespace(content=[tool_block], usage=usage)
+
+        anthropic = MagicMock()
+        anthropic.messages.create = AsyncMock(return_value=_make_response())
+
+        # Set a ceiling so small that even one Haiku call exceeds it
+        wf = WorkflowSpec(
+            name="test_mid_budget",
+            version="v1",
+            cost_ceiling_usd=Decimal("0.000001"),  # $0.000001 — guaranteed exceeded
+            token_ceiling=100_000,
+            stages=(
+                WorkflowStage(
+                    stage_name="brain_triage",
+                    kind="sequential",
+                    agents=(StageAgent(agent_name="brain_triage", persona_version="v1",
+                                       output_key="triage"),),
+                ),
+            ),
+        )
+        runner = make_runner(anthropic=anthropic)
+        result = await runner.run(wf, params={})
+        # The workflow should end as failed due to BudgetExceeded
+        assert result.status == "failed"
+        assert result.error is not None

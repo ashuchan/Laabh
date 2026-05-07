@@ -43,12 +43,14 @@ def _parse_args() -> argparse.Namespace:
         help="ISO week string (e.g. 2026-W18). Defaults to last completed week.",
     )
     p.add_argument(
-        "--no-ab",
+        "--no-replay-ab",
+        dest="no_ab",
         action="store_true",
         help="Skip A/B prompt-version replay.",
     )
     p.add_argument(
-        "--ab-override",
+        "--ab-versions",
+        dest="ab_override",
         default=[],
         action="append",
         metavar="AGENT=VERSION",

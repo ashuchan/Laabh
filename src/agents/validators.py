@@ -7,6 +7,16 @@ from typing import Any
 from pydantic import BaseModel, field_validator, model_validator
 
 
+class Leg(BaseModel):
+    """One option leg within an F&O strategy."""
+    option_type: str = ""       # CE | PE | FUT
+    strike: float | None = None
+    expiry: str | None = None   # ISO date
+    side: str = ""              # buy | sell
+    qty: int = 1
+    premium: float | None = None
+
+
 class Allocation(BaseModel):
     asset_class: str
     underlying_or_symbol: str = ""
@@ -14,6 +24,42 @@ class Allocation(BaseModel):
     decision: str = ""
     horizon: str | None = None
     conviction: float | None = None
+    legs: list[Leg] = []        # populated for F&O structures; empty for equity/cash
+
+
+def _check_leg_strike_ordering(symbol: str, decision: str, legs: list["Leg"]) -> None:
+    """Validate strike ordering for multi-leg F&O structures.
+
+    For debit spreads, the bought option must be closer-to-money than the sold option:
+    - Bull call spread: buy lower strike CE, sell higher strike CE
+    - Bear put spread: buy higher strike PE, sell lower strike PE
+    """
+    ce_legs = [l for l in legs if l.option_type.upper() == "CE" and l.strike is not None]
+    pe_legs = [l for l in legs if l.option_type.upper() == "PE" and l.strike is not None]
+
+    if "call_spread" in decision or "bull_call" in decision:
+        buy_legs = [l for l in ce_legs if l.side.lower() == "buy"]
+        sell_legs = [l for l in ce_legs if l.side.lower() == "sell"]
+        if buy_legs and sell_legs:
+            buy_strike = min(l.strike for l in buy_legs)  # type: ignore[arg-type]
+            sell_strike = max(l.strike for l in sell_legs)  # type: ignore[arg-type]
+            if buy_strike >= sell_strike:
+                raise ValueError(
+                    f"Bull call spread for {symbol!r}: buy strike ({buy_strike}) must be "
+                    f"< sell strike ({sell_strike})."
+                )
+
+    if "put_spread" in decision or "bear_put" in decision:
+        buy_legs = [l for l in pe_legs if l.side.lower() == "buy"]
+        sell_legs = [l for l in pe_legs if l.side.lower() == "sell"]
+        if buy_legs and sell_legs:
+            buy_strike = max(l.strike for l in buy_legs)  # type: ignore[arg-type]
+            sell_strike = min(l.strike for l in sell_legs)  # type: ignore[arg-type]
+            if buy_strike <= sell_strike:
+                raise ValueError(
+                    f"Bear put spread for {symbol!r}: buy strike ({buy_strike}) must be "
+                    f"> sell strike ({sell_strike})."
+                )
 
 
 class KillSwitch(BaseModel):
@@ -137,6 +183,9 @@ class CEOJudgeOutputValidated(BaseModel):
                     f"direction signals in decision {alloc.decision!r}. "
                     f"A strategy cannot be simultaneously bullish and bearish."
                 )
+            # Structural leg check: if legs are supplied, verify strike ordering
+            if alloc.legs and len(alloc.legs) >= 2:
+                _check_leg_strike_ordering(alloc.underlying_or_symbol, dec, alloc.legs)
         return v
 
     @model_validator(mode="after")

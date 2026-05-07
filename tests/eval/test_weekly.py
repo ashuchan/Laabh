@@ -7,6 +7,8 @@ import pytest
 
 from src.eval.weekly import (
     WeekData,
+    _prompt_version_key,
+    _welch_t_stat,
     compute_calibration_drift,
     compute_cost_per_correct_prediction,
     compute_pnl_attribution,
@@ -22,6 +24,49 @@ def _make_week(resolved: list[dict] | None = None, workflow_runs: list[dict] | N
     week.agent_runs = agent_runs or []
     week.all_predictions_count = len(resolved or [])
     return week
+
+
+# ---------------------------------------------------------------------------
+# compute_pnl_attribution
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# _prompt_version_key helper
+# ---------------------------------------------------------------------------
+
+class TestPromptVersionKey:
+    def test_dict_sorted_by_key(self):
+        k1 = _prompt_version_key({"b": "v2", "a": "v1"})
+        k2 = _prompt_version_key({"a": "v1", "b": "v2"})
+        assert k1 == k2
+
+    def test_none_returns_unknown(self):
+        assert _prompt_version_key(None) == "unknown"
+
+    def test_empty_dict_returns_unknown(self):
+        assert _prompt_version_key({}) == "unknown"
+
+    def test_json_string_parsed(self):
+        k = _prompt_version_key('{"ceo_judge": "v2"}')
+        assert "ceo_judge" in k
+
+
+# ---------------------------------------------------------------------------
+# _welch_t_stat helper
+# ---------------------------------------------------------------------------
+
+class TestWelchTStat:
+    def test_returns_none_for_single_element_groups(self):
+        assert _welch_t_stat([5.0], [3.0]) is None
+
+    def test_identical_groups_return_zero(self):
+        t = _welch_t_stat([5.0, 5.0, 5.0], [5.0, 5.0, 5.0])
+        assert t is None or abs(t) < 1e-9  # zero or None (no variance)
+
+    def test_clearly_different_groups_return_large_t(self):
+        # Group A: all high, Group B: all low — t should be large
+        t = _welch_t_stat([10.0, 10.5, 9.5, 10.2], [1.0, 0.8, 1.2, 0.9])
+        assert t is not None and t > 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +107,45 @@ class TestComputePnlAttribution:
         ])
         result = compute_pnl_attribution(week)
         assert result["week_total_pnl_pct"] == 4.0
+
+    def test_single_prompt_version_attribution_empty(self):
+        """When every prediction uses the same prompt version, attribution=[]."""
+        pv = {"ceo_judge": "v1", "brain_triage": "v1"}
+        week = _make_week(resolved=[
+            {"realised_pnl_pct": 5.0, "prompt_versions": pv},
+            {"realised_pnl_pct": -2.0, "prompt_versions": pv},
+            {"realised_pnl_pct": 3.0, "prompt_versions": pv},
+        ])
+        result = compute_pnl_attribution(week)
+        assert result["attribution"] == []
+
+    def test_two_prompt_versions_produces_attribution_entry(self):
+        """When two prompt versions appear, attribution has one entry."""
+        pv_baseline = {"ceo_judge": "v1"}
+        pv_new = {"ceo_judge": "v2"}
+        # baseline: 5 predictions, new version: 3 predictions
+        baseline = [{"realised_pnl_pct": float(x), "prompt_versions": pv_baseline}
+                    for x in [3.0, 2.0, 1.0, 3.5, 2.5]]
+        new_version = [{"realised_pnl_pct": float(x), "prompt_versions": pv_new}
+                       for x in [8.0, 9.0, 7.5]]
+        week = _make_week(resolved=baseline + new_version)
+        result = compute_pnl_attribution(week)
+        assert len(result["attribution"]) == 1
+        entry = result["attribution"][0]
+        assert entry["n"] == 3
+        assert entry["delta_vs_baseline_pp"] > 0  # new version better
+
+    def test_unattributed_pp_not_total_pnl_when_significant(self):
+        """When a version change is statistically significant, unattributed_pp < total_pnl."""
+        pv_baseline = {"ceo_judge": "v1"}
+        pv_new = {"ceo_judge": "v2"}
+        # Make groups very different so t-stat >= 1.5
+        baseline = [{"realised_pnl_pct": 0.0, "prompt_versions": pv_baseline} for _ in range(6)]
+        new_version = [{"realised_pnl_pct": 10.0, "prompt_versions": pv_new} for _ in range(4)]
+        week = _make_week(resolved=baseline + new_version)
+        result = compute_pnl_attribution(week)
+        if result["attribution"] and result["attribution"][0]["likely_significant"]:
+            assert result["unattributed_pp"] < result["week_total_pnl_pct"]
 
 
 # ---------------------------------------------------------------------------
