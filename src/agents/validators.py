@@ -1,0 +1,243 @@
+"""Cross-agent Pydantic validators for the CEO Judge's output."""
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Any
+
+from pydantic import BaseModel, field_validator, model_validator
+
+
+class Leg(BaseModel):
+    """One option leg within an F&O strategy."""
+    option_type: str = ""       # CE | PE | FUT
+    strike: float | None = None
+    expiry: str | None = None   # ISO date
+    side: str = ""              # buy | sell
+    qty: int = 1
+    premium: float | None = None
+
+
+class Allocation(BaseModel):
+    asset_class: str
+    underlying_or_symbol: str = ""
+    capital_pct: float
+    decision: str = ""
+    horizon: str | None = None
+    conviction: float | None = None
+    legs: list[Leg] = []        # populated for F&O structures; empty for equity/cash
+
+
+def _check_leg_strike_ordering(symbol: str, decision: str, legs: list["Leg"]) -> None:
+    """Validate strike ordering for multi-leg F&O structures.
+
+    For debit spreads, the bought option must be closer-to-money than the sold option:
+    - Bull call spread: buy lower strike CE, sell higher strike CE
+    - Bear put spread: buy higher strike PE, sell lower strike PE
+    """
+    ce_legs = [l for l in legs if l.option_type.upper() == "CE" and l.strike is not None]
+    pe_legs = [l for l in legs if l.option_type.upper() == "PE" and l.strike is not None]
+
+    if "call_spread" in decision or "bull_call" in decision:
+        buy_legs = [l for l in ce_legs if l.side.lower() == "buy"]
+        sell_legs = [l for l in ce_legs if l.side.lower() == "sell"]
+        if buy_legs and sell_legs:
+            buy_strike = min(l.strike for l in buy_legs)  # type: ignore[arg-type]
+            sell_strike = max(l.strike for l in sell_legs)  # type: ignore[arg-type]
+            if buy_strike >= sell_strike:
+                raise ValueError(
+                    f"Bull call spread for {symbol!r}: buy strike ({buy_strike}) must be "
+                    f"< sell strike ({sell_strike})."
+                )
+
+    if "put_spread" in decision or "bear_put" in decision:
+        buy_legs = [l for l in pe_legs if l.side.lower() == "buy"]
+        sell_legs = [l for l in pe_legs if l.side.lower() == "sell"]
+        if buy_legs and sell_legs:
+            buy_strike = max(l.strike for l in buy_legs)  # type: ignore[arg-type]
+            sell_strike = min(l.strike for l in sell_legs)  # type: ignore[arg-type]
+            if buy_strike <= sell_strike:
+                raise ValueError(
+                    f"Bear put spread for {symbol!r}: buy strike ({buy_strike}) must be "
+                    f"> sell strike ({sell_strike})."
+                )
+
+
+class KillSwitch(BaseModel):
+    trigger: str
+    action: str
+    monitoring_metric: str
+
+
+class CalibrationSelfCheck(BaseModel):
+    bullish_argument_grade: str
+    bearish_argument_grade: str
+    confidence_in_allocation: float
+    regret_scenario: str
+
+
+class CEOJudgeOutputValidated(BaseModel):
+    """Validates the CEO Judge's final output before committing agent_predictions.
+
+    Hard validators (capital sums, at-risk cap, direction logic) reject the
+    prediction; soft validators (kill-switch realism) caveat it.
+    """
+
+    decision_summary: str
+    allocation: list[Allocation]
+    kill_switches: list[KillSwitch] = []
+    ceo_note: str
+    calibration_self_check: CalibrationSelfCheck
+    expected_book_pnl_pct: float
+    max_drawdown_tolerated_pct: float
+    disagreement_loci: list[dict[str, Any]] = []
+    stretch_pnl_pct: float | None = None
+
+    @field_validator("allocation")
+    @classmethod
+    def capital_pct_sums_to_at_most_100(cls, v: list[Allocation]) -> list[Allocation]:
+        total = sum(a.capital_pct for a in v)
+        if total > 100.01:
+            raise ValueError(
+                f"Allocation sums to {total:.2f}%, must be ≤100%. "
+                f"Reduce one or more positions."
+            )
+        return v
+
+    @field_validator("allocation")
+    @classmethod
+    def no_single_leg_over_40_pct(cls, v: list[Allocation]) -> list[Allocation]:
+        for alloc in v:
+            if alloc.asset_class.lower() == "cash":
+                continue  # uninvested cash is not a risk position
+            if alloc.capital_pct > 40:
+                raise ValueError(
+                    f"Single position {alloc.underlying_or_symbol!r} is {alloc.capital_pct}% "
+                    f"of capital — exceeds 40% single-position limit."
+                )
+        return v
+
+    @field_validator("allocation")
+    @classmethod
+    def no_duplicate_non_hedge_positions(cls, v: list[Allocation]) -> list[Allocation]:
+        import logging as _log
+        seen: dict[str, list[str]] = {}
+        for alloc in v:
+            sym = alloc.underlying_or_symbol
+            if sym:
+                seen.setdefault(sym, []).append(alloc.asset_class)
+        for sym, classes in seen.items():
+            if len(classes) > 1 and "cash" not in classes:
+                # Both fno and equity on same underlying — log a caveat but allow through.
+                # This is intentional: hedged pairs (e.g. short fno + long equity) are valid.
+                _log.getLogger(__name__).warning(
+                    "Allocation has both %s asset classes for %r — verify this is intentional.",
+                    classes, sym,
+                )
+        return v
+
+    @field_validator("expected_book_pnl_pct")
+    @classmethod
+    def expected_pnl_is_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(
+                f"expected_book_pnl_pct={v} — judge must produce a positive expected P&L. "
+                f"Refuse the trade if the setup is not positive EV."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def kill_switches_match_drawdown(self) -> "CEOJudgeOutputValidated":
+        if self.max_drawdown_tolerated_pct > 10:
+            raise ValueError(
+                f"max_drawdown_tolerated_pct={self.max_drawdown_tolerated_pct} "
+                f"exceeds 10% hard cap."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def at_risk_capital_within_drawdown_tolerance(self) -> "CEOJudgeOutputValidated":
+        at_risk = sum(a.capital_pct for a in self.allocation if a.asset_class.lower() != "cash")
+        if at_risk > self.max_drawdown_tolerated_pct:
+            raise ValueError(
+                f"Total at-risk capital {at_risk:.1f}% exceeds max_drawdown_tolerated_pct "
+                f"{self.max_drawdown_tolerated_pct:.1f}%. Reduce position size or raise "
+                f"max_drawdown_tolerated_pct to match actual deployment."
+            )
+        return self
+
+    @field_validator("allocation")
+    @classmethod
+    def fno_legs_match_strategy(cls, v: list[Allocation]) -> list[Allocation]:
+        import re
+        _BULL_SIGNALS = {"bull", "long_call", "buy_call", "bull_call", "bull_put"}
+        _BEAR_SIGNALS = {"bear", "long_put", "buy_put", "bear_call", "bear_put", "short_call"}
+        for alloc in v:
+            if alloc.asset_class.lower() != "fno":
+                continue
+            dec = alloc.decision.lower().replace(" ", "_")
+            has_bull = any(s in dec for s in _BULL_SIGNALS)
+            has_bear = any(s in dec for s in _BEAR_SIGNALS)
+            if has_bull and has_bear:
+                raise ValueError(
+                    f"Allocation for {alloc.underlying_or_symbol!r} has contradictory "
+                    f"direction signals in decision {alloc.decision!r}. "
+                    f"A strategy cannot be simultaneously bullish and bearish."
+                )
+            # Structural leg check: if legs are supplied, verify strike ordering
+            if alloc.legs and len(alloc.legs) >= 2:
+                _check_leg_strike_ordering(alloc.underlying_or_symbol, dec, alloc.legs)
+        return v
+
+    @model_validator(mode="after")
+    def kill_switch_triggers_are_concrete(self) -> "CEOJudgeOutputValidated":
+        import re
+        _VAGUE_PATTERNS = [
+            r"\bwatch\b", r"\bmonitor\b", r"\bcheck\b", r"\bif needed\b",
+            r"\bwhen appropriate\b", r"\bconditions change\b",
+        ]
+        _HAS_METRIC = re.compile(r"\d|%|VIX|PCR|OI|delta|gamma|spread|level|above|below|cross", re.I)
+        for ks in self.kill_switches:
+            trigger = ks.trigger
+            for pat in _VAGUE_PATTERNS:
+                if re.search(pat, trigger, re.I) and not _HAS_METRIC.search(trigger):
+                    raise ValueError(
+                        f"Kill-switch trigger {trigger!r} is too vague — must reference a "
+                        f"specific measurable level, price, or metric."
+                    )
+        return self
+
+
+class EquityExpertOutputValidated(BaseModel):
+    """Validates an equity expert's recommendation."""
+
+    symbol: str
+    decision: str
+    conviction: float
+    refused: bool
+    entry_zone: dict[str, float] | None = None
+    target: float | None = None
+    stop: float | None = None
+
+    @model_validator(mode="after")
+    def buy_implies_target_above_entry(self) -> "EquityExpertOutputValidated":
+        if self.decision == "BUY" and not self.refused:
+            if self.entry_zone and self.target and self.stop:
+                entry_mid = (self.entry_zone["low"] + self.entry_zone["high"]) / 2
+                if self.target <= entry_mid:
+                    raise ValueError(
+                        f"BUY decision: target {self.target} must be above entry midpoint {entry_mid:.2f}"
+                    )
+                if self.stop >= entry_mid:
+                    raise ValueError(
+                        f"BUY decision: stop {self.stop} must be below entry midpoint {entry_mid:.2f}"
+                    )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# VALIDATOR_REGISTRY: {name: Pydantic class}
+# ---------------------------------------------------------------------------
+VALIDATOR_REGISTRY: dict[str, type[BaseModel]] = {
+    "CEOJudgeOutputValidated": CEOJudgeOutputValidated,
+    "EquityExpertOutputValidated": EquityExpertOutputValidated,
+}

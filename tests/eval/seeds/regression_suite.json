@@ -1,0 +1,68 @@
+{
+  "version": "1.1",
+  "description": "Regression seeds for the weekly postmortem. Each seed replays a prior workflow_run and checks expected behaviour.",
+  "setup_instructions": [
+    "1. Run predict_today_combined for the scenario described in each seed's rationale.",
+    "2. Copy the resulting workflow_run UUID into workflow_run_id below.",
+    "3. Seeds with placeholder_uuid=true are skipped automatically by run_regression_suite().",
+    "Seeds should cover: directional macro day, high-VIX skip, repeat-mistake detection,",
+    "neutral iron-condor regime, FOMC skip, earnings surprise, ban-list enforcement (12-15 total)."
+  ],
+  "seeds": [
+    {
+      "id": "seed_001_banknifty_rate_cut",
+      "workflow_run_id": "00000000-0000-0000-0000-000000000001",
+      "placeholder_uuid": true,
+      "rationale": "Bank Nifty rate-cut day — strong directional setup that worked. Expected: directional long strategy, high expected P&L.",
+      "expected_outcomes": {
+        "ceo_judge_decision_summary_contains": ["BANKNIFTY", "long"],
+        "expected_book_pnl_pct_min": 6,
+        "expected_book_pnl_pct_max": 20,
+        "must_not_be_REFUSED": true
+      },
+      "tags": ["high_conviction", "directional", "macro_catalyst"]
+    },
+    {
+      "id": "seed_002_high_vix_cautious",
+      "workflow_run_id": "00000000-0000-0000-0000-000000000002",
+      "placeholder_uuid": true,
+      "rationale": "VIX 23 day with no clear catalyst — should produce skip_today=true.",
+      "expected_outcomes": {
+        "brain_triage_skip_today": true,
+        "skip_reason_contains": ["VIX"]
+      },
+      "tags": ["regime_skip", "calibration"]
+    },
+    {
+      "id": "seed_003_repeat_mistake_detection",
+      "workflow_run_id": "00000000-0000-0000-0000-000000000003",
+      "placeholder_uuid": true,
+      "rationale": "TATAMOTORS thesis that failed 2 days in a row — should trigger do_not_repeat.",
+      "expected_outcomes": {
+        "explorer_aggregator_do_not_repeat_count_min": 1
+      },
+      "tags": ["novelty", "do_not_repeat"]
+    },
+    {
+      "id": "seed_004_iron_condor_neutral",
+      "workflow_run_id": "00000000-0000-0000-0000-000000000004",
+      "placeholder_uuid": true,
+      "rationale": "Low-volatility sideways day — should recommend iron condor or neutral strategy.",
+      "expected_outcomes": {
+        "must_not_be_REFUSED": true,
+        "ceo_judge_decision_summary_contains": ["condor", "spread"]
+      },
+      "tags": ["neutral_regime", "defined_risk"]
+    },
+    {
+      "id": "seed_005_fomc_skip",
+      "workflow_run_id": "00000000-0000-0000-0000-000000000005",
+      "placeholder_uuid": true,
+      "rationale": "FOMC night — should skip or reduce size significantly.",
+      "expected_outcomes": {
+        "skip_reason_contains": ["FOMC"]
+      },
+      "tags": ["macro_event", "risk_management"]
+    }
+  ]
+}
