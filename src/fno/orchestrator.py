@@ -165,7 +165,7 @@ async def _send_daily_summary(run_date: date) -> None:
     )
 
 
-async def _send_morning_brief(run_date: date | None = None) -> None:
+async def _send_morning_brief(run_date: date | None = None, mode_tag: str = "[AGENTIC]") -> None:
     """Pre-open brief: list every Phase 3 PROCEED candidate for today.
 
     Pushes to Telegram and stamps a `notifications` row so the runday
@@ -239,7 +239,7 @@ async def _send_morning_brief(run_date: date | None = None) -> None:
             cand["stop_premium"] = prop.stop_premium
         candidates.append(cand)
 
-    msg = format_morning_brief(run_date=run_date.isoformat(), candidates=candidates)
+    msg = f"{mode_tag} " + format_morning_brief(run_date=run_date.isoformat(), candidates=candidates)
 
     # Append a digest of currently-open paper positions (carried over from
     # prior sessions or freshly opened earlier today). Adds MTM context so

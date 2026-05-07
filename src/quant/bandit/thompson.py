@@ -1,0 +1,97 @@
+"""Vanilla Thompson Sampling allocator.
+
+Each arm maintains a Normal-Gaussian conjugate posterior over expected
+per-trade return. At each selection the sampler draws one sample per
+candidate arm and returns the arm with the highest sample.
+"""
+from __future__ import annotations
+
+import time
+from typing import TypeAlias
+
+import numpy as np
+
+from src.quant.bandit.posterior import PosteriorState
+
+ArmId: TypeAlias = str
+
+
+class ThompsonSampler:
+    """Thompson Sampling over a fixed set of arms."""
+
+    def __init__(
+        self,
+        arms: list[ArmId],
+        rng: np.random.Generator,
+        *,
+        prior_mean: float = 0.0,
+        prior_var: float = 0.01,
+        obs_var: float | None = None,
+    ) -> None:
+        """Initialise posteriors for all arms at the prior.
+
+        Args:
+            arms: All possible arm IDs in this session.
+            rng: Pre-seeded numpy Generator (caller owns the seed).
+            prior_mean: μ_0 — prior belief about expected per-trade return.
+            prior_var: s_0² — prior variance (uncertainty).
+            obs_var: Observation noise variance. Defaults to prior_var.
+        """
+        self._rng = rng
+        self._prior_var = prior_var
+        self._obs_var = obs_var if obs_var is not None else prior_var
+        self._posteriors: dict[ArmId, PosteriorState] = {
+            arm: PosteriorState(mean=prior_mean, var=prior_var) for arm in arms
+        }
+
+    # ------------------------------------------------------------------
+    # Core API
+    # ------------------------------------------------------------------
+
+    def select(self, signalling_arms: list[ArmId]) -> ArmId | None:
+        """Pick the best arm from those currently signalling.
+
+        Returns None if *signalling_arms* is empty or none match known arms.
+        """
+        candidates = [a for a in signalling_arms if a in self._posteriors]
+        if not candidates:
+            return None
+        samples = {arm: self._posteriors[arm].sample(self._rng) for arm in candidates}
+        return max(samples, key=samples.__getitem__)
+
+    def update(self, arm: ArmId, reward: float) -> None:
+        """Update the posterior for *arm* with observed *reward*."""
+        if arm not in self._posteriors:
+            return
+        self._posteriors[arm] = self._posteriors[arm].update(
+            reward, obs_var=self._obs_var
+        )
+
+    def snapshot(self) -> dict[ArmId, PosteriorState]:
+        """Return a shallow copy of all arm posteriors."""
+        return {arm: PosteriorState(p.mean, p.var, p.n_obs) for arm, p in self._posteriors.items()}
+
+    def restore(self, snapshot: dict[ArmId, PosteriorState]) -> None:
+        """Replace internal posteriors with *snapshot* (exact state)."""
+        self._posteriors = {
+            arm: PosteriorState(p.mean, p.var, p.n_obs) for arm, p in snapshot.items()
+        }
+
+    def apply_forget(self, gamma: float) -> None:
+        """Apply forgetting factor γ to all arm posteriors (call at day-start)."""
+        self._posteriors = {
+            arm: p.apply_forget(gamma) for arm, p in self._posteriors.items()
+        }
+
+    def add_arm(self, arm: ArmId, *, prior_mean: float = 0.0) -> None:
+        """Register a new arm (cold-start at prior)."""
+        if arm not in self._posteriors:
+            self._posteriors[arm] = PosteriorState(mean=prior_mean, var=self._prior_var)
+
+    def posterior_mean(self, arm: ArmId) -> float:
+        """Return the current posterior mean for *arm* (0.0 if unknown)."""
+        return self._posteriors[arm].mean if arm in self._posteriors else 0.0
+
+    def posterior_var(self, arm: ArmId) -> float:
+        """Return the current posterior variance for *arm*."""
+        return self._posteriors[arm].var if arm in self._posteriors else self._prior_var
