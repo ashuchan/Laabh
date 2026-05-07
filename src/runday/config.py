@@ -49,10 +49,13 @@ class RundaySettings(BaseSettings):
     anthropic_api_key: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    angel_one_enabled: bool = True
     angel_one_api_key: str = ""
     angel_one_client_id: str = ""
     angel_one_password: str = ""
     angel_one_totp_secret: str = ""
+    dhan_pin: str = ""
+    dhan_totp_secret: str = ""
     dhan_client_id: str = ""
     dhan_access_token: str = ""
     github_token: str = ""

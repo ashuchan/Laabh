@@ -62,8 +62,14 @@ async def _run() -> None:
     except Exception as exc:
         logger.error(f"reconciler failed: {exc!r}")
 
-    angel = AngelOneCollector()
-    stream_task = asyncio.create_task(angel.run_stream(), name="angel_one_ws")
+    settings = get_settings()
+    angel: AngelOneCollector | None = None
+    stream_task: asyncio.Task[None] | None = None
+    if settings.angel_one_enabled:
+        angel = AngelOneCollector()
+        stream_task = asyncio.create_task(angel.run_stream(), name="angel_one_ws")
+    else:
+        logger.info("Angel One disabled (ANGEL_ONE_ENABLED=false) — WebSocket stream not started")
 
     stop_event = asyncio.Event()
 
@@ -90,12 +96,14 @@ async def _run() -> None:
         logger.info("stopping scheduler + stream (draining in-flight jobs)")
         # wait=True drains running jobs; bounded by NSSM AppStopMethodConsole.
         scheduler.shutdown(wait=True)
-        await angel.stop()
-        stream_task.cancel()
-        try:
-            await stream_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        if angel is not None:
+            await angel.stop()
+        if stream_task is not None:
+            stream_task.cancel()
+            try:
+                await stream_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await dispose_engine()
         logger.info("bye")
 

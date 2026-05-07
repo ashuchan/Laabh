@@ -14,20 +14,29 @@ from src.db import get_engine
 from src.runday.checks.base import CheckResult, Severity
 from src.runday.config import RundaySettings
 
-# Env vars required by each connectivity check. When a check is skipped via
-# --skip, its env vars are dropped from EnvCheck's required list.
-_ENV_VARS_BY_CHECK: dict[str, list[str]] = {
-    "preflight.db_connectivity": ["DATABASE_URL"],
-    "preflight.anthropic": ["ANTHROPIC_API_KEY"],
-    "preflight.telegram": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"],
-    "preflight.angel_one": [
+# Env-var requirements per connectivity check. The value is a list of *groups*;
+# at least ONE group must be fully present (any-of), and within a group all
+# vars must be set (all-of). For checks with a single fixed requirement set,
+# the outer list has one entry. Dhan supports two auth modes — a manual access
+# token, or programmatic PIN+TOTP minting — so it carries two groups.
+_ENV_VARS_BY_CHECK: dict[str, list[list[str]]] = {
+    "preflight.db_connectivity": [["DATABASE_URL"]],
+    "preflight.anthropic": [["ANTHROPIC_API_KEY"]],
+    "preflight.telegram": [["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]],
+    "preflight.angel_one": [[
         "ANGEL_ONE_API_KEY",
         "ANGEL_ONE_CLIENT_ID",
         "ANGEL_ONE_PASSWORD",
         "ANGEL_ONE_TOTP_SECRET",
+    ]],
+    "preflight.dhan": [
+        ["DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN"],
+        ["DHAN_CLIENT_ID", "DHAN_PIN", "DHAN_TOTP_SECRET"],
     ],
-    "preflight.dhan": ["DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN"],
-    "preflight.github": ["GITHUB_TOKEN"],
+    # GITHUB_TOKEN is optional — issue_filer.run() degrades gracefully when
+    # missing (logs a WARN and skips). GitHubCheck still surfaces a WARN if
+    # the token is absent so the operator sees the state without preflight
+    # blocking the trading day.
 }
 
 
@@ -45,23 +54,44 @@ class EnvCheck:
         self._skipped = skipped_checks or set()
 
     async def run(self) -> CheckResult:
-        required: list[str] = []
-        for check_name, env_vars in _ENV_VARS_BY_CHECK.items():
+        # Aggregate "missing" across checks; for any-of groups we report the
+        # group with the fewest unmet vars so the operator sees the closest
+        # path to passing rather than a union of all alternatives.
+        union_missing: list[str] = []
+        seen: set[str] = set()
+        total_groups_evaluated = 0
+
+        for check_name, groups in _ENV_VARS_BY_CHECK.items():
             if check_name in self._skipped:
                 continue
-            required.extend(env_vars)
-        missing = [v for v in required if not os.environ.get(v)]
-        if missing:
+            total_groups_evaluated += 1
+
+            best_missing: list[str] | None = None
+            for group in groups:
+                missing_in_group = [v for v in group if not os.environ.get(v)]
+                if not missing_in_group:
+                    best_missing = []
+                    break
+                if best_missing is None or len(missing_in_group) < len(best_missing):
+                    best_missing = missing_in_group
+
+            if best_missing:
+                for v in best_missing:
+                    if v not in seen:
+                        seen.add(v)
+                        union_missing.append(v)
+
+        if union_missing:
             return CheckResult(
                 name=self.name,
                 severity=Severity.FAIL,
-                message=f"Missing env vars: {', '.join(missing)}",
-                details={"missing": missing},
+                message=f"Missing env vars: {', '.join(union_missing)}",
+                details={"missing": union_missing},
             )
         return CheckResult(
             name=self.name,
             severity=Severity.OK,
-            message=f"All {len(required)} required env vars present",
+            message=f"All {total_groups_evaluated} env requirement(s) satisfied",
         )
 
 
@@ -304,7 +334,12 @@ class NSECheck:
 
 
 class DhanCheck:
-    """POST /v2/optionchain for NIFTY current expiry."""
+    """POST /v2/optionchain/expirylist for NIFTY — light auth-and-reach probe.
+
+    Uses the dedicated expirylist endpoint rather than /v2/optionchain so the
+    probe doesn't depend on a hardcoded expiry date being available; the
+    response just enumerates valid expiries for the underlying.
+    """
 
     name = "preflight.dhan"
 
@@ -324,22 +359,31 @@ class DhanCheck:
         t0 = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
+                # Field names match Dhan v2 spec used by src/fno/sources/dhan_source.py:
+                # UnderlyingScrip (security id, 13 = NIFTY index) + UnderlyingSeg
+                # (NOT "UnderlyingSegment"). Drift between this probe and the
+                # production caller is what made the old version 400 in prod.
                 resp = await client.post(
-                    "https://api.dhan.co/v2/optionchain",
+                    "https://api.dhan.co/v2/optionchain/expirylist",
                     headers=headers,
                     json={
                         "UnderlyingScrip": 13,
-                        "UnderlyingSegment": "IDX_I",
-                        "ExpiryDate": "",
+                        "UnderlyingSeg": "IDX_I",
                     },
                 )
                 resp.raise_for_status()
+                body = resp.json()
             latency_ms = int((time.monotonic() - t0) * 1000)
+            expiries = body.get("data", []) if isinstance(body, dict) else []
             return CheckResult(
                 name=self.name,
                 severity=Severity.OK,
-                message=f"Dhan API reachable ({latency_ms} ms)",
-                details={"latency_ms": latency_ms, "probe": s.runday_dhan_probe_symbol},
+                message=f"Dhan API reachable — {len(expiries)} expiries ({latency_ms} ms)",
+                details={
+                    "latency_ms": latency_ms,
+                    "probe": s.runday_dhan_probe_symbol,
+                    "expiry_count": len(expiries),
+                },
                 duration_ms=latency_ms,
             )
         except Exception as exc:
@@ -366,8 +410,8 @@ class GitHubCheck:
         if not s.github_token:
             return CheckResult(
                 name=self.name,
-                severity=Severity.FAIL,
-                message="GITHUB_TOKEN not configured",
+                severity=Severity.WARN,
+                message="GITHUB_TOKEN not configured — issue_filer will skip",
             )
         t0 = time.monotonic()
         try:

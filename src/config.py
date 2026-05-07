@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     db_password: str = Field(default="laabh", alias="DB_PASSWORD")
 
     # --- Angel One ---
+    # Set ANGEL_ONE_ENABLED=false to skip the WebSocket stream and the
+    # preflight Angel One check entirely (Dhan-only deployment).
+    angel_one_enabled: bool = Field(default=True, alias="ANGEL_ONE_ENABLED")
     angel_one_api_key: str = Field(default="", alias="ANGEL_ONE_API_KEY")
     angel_one_client_id: str = Field(default="", alias="ANGEL_ONE_CLIENT_ID")
     angel_one_password: str = Field(default="", alias="ANGEL_ONE_PASSWORD")

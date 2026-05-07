@@ -265,7 +265,9 @@ async def test_github_check_no_token():
     s = RundaySettings(github_token="")
     check = GitHubCheck(s)
     result = await check.run()
-    assert result.severity == Severity.FAIL
+    # WARN, not FAIL: issue_filer skips gracefully when token is missing,
+    # so missing token shouldn't block preflight.
+    assert result.severity == Severity.WARN
 
 
 @pytest.mark.asyncio

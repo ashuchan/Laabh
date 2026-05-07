@@ -13,7 +13,12 @@ from rich.text import Text
 from src.runday.checks.base import CheckResult, Severity
 
 _IST = pytz.timezone("Asia/Kolkata")
-_CONSOLE = Console()
+# legacy_windows=False forces ANSI escape rendering instead of the Win32
+# Console API path, which on classic conhost.exe crashes with UnicodeEncodeError
+# the moment Rich tries to draw the ✓/✗/⚠ glyphs through the cp1252 codec.
+# Modern Windows terminals (Windows Terminal, VS Code, PowerShell 7+, and
+# even conhost.exe on Win10+ with VT enabled) all handle ANSI correctly.
+_CONSOLE = Console(legacy_windows=False)
 
 _ICONS = {
     Severity.OK: "[bold green]✓[/bold green]",

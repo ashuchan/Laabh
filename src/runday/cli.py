@@ -114,6 +114,12 @@ async def _preflight_async(
     # Normalize skip names: accept either "dhan" or "preflight.dhan".
     skip = {s if s.startswith("preflight.") else f"preflight.{s}" for s in skip}
 
+    # Auto-skip Angel One when disabled in config — keeps env-var checks honest
+    # and avoids a noisy login attempt against an integration the operator has
+    # explicitly turned off.
+    if not settings.angel_one_enabled:
+        skip.add("preflight.angel_one")
+
     if profile == "replay":
         if target_date is None:
             target_date = date.today()
