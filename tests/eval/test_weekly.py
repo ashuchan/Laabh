@@ -16,13 +16,20 @@ from src.eval.weekly import (
 )
 
 
-def _make_week(resolved: list[dict] | None = None, workflow_runs: list[dict] | None = None,
-               agent_runs: list[dict] | None = None) -> WeekData:
+def _make_week(
+    resolved: list[dict] | None = None,
+    workflow_runs: list[dict] | None = None,
+    agent_runs: list[dict] | None = None,
+    prior_4w_workflow_runs: list[dict] | None = None,
+    prior_4w_resolved_predictions: list[dict] | None = None,
+) -> WeekData:
     week = WeekData(start=date(2026, 4, 28), end=date(2026, 5, 2))
     week.resolved_predictions = resolved or []
     week.workflow_runs = workflow_runs or []
     week.agent_runs = agent_runs or []
     week.all_predictions_count = len(resolved or [])
+    week.prior_4w_workflow_runs = prior_4w_workflow_runs or []
+    week.prior_4w_resolved_predictions = prior_4w_resolved_predictions or []
     return week
 
 
@@ -250,6 +257,52 @@ class TestComputeCostPerCorrectPrediction:
         result = compute_cost_per_correct_prediction(week)
         assert abs(result["by_agent"]["ceo_judge"] - 0.50) < 1e-6
         assert abs(result["by_agent"]["brain_triage"] - 0.10) < 1e-6
+
+    def test_trend_4w_none_when_no_prior_wins(self):
+        """trend_4w is None when there are no prior-period wins."""
+        week = _make_week(
+            workflow_runs=[{"cost_usd": 0.50}],
+            resolved=[{"realised_pnl_pct": 5.0}],
+            prior_4w_workflow_runs=[{"cost_usd": 1.00}],
+            prior_4w_resolved_predictions=[{"realised_pnl_pct": -1.0}],  # all losses
+        )
+        result = compute_cost_per_correct_prediction(week)
+        assert result["cost_per_win_usd_trend_4w"] is None
+
+    def test_trend_4w_computed_from_prior_wins(self):
+        """trend_4w = prior cost / prior wins when prior wins > 0."""
+        week = _make_week(
+            workflow_runs=[{"cost_usd": 0.50}],
+            prior_4w_workflow_runs=[{"cost_usd": 2.00}],
+            prior_4w_resolved_predictions=[
+                {"realised_pnl_pct": 5.0},   # win
+                {"realised_pnl_pct": 3.0},   # win
+                {"realised_pnl_pct": -1.0},  # loss
+            ],
+        )
+        result = compute_cost_per_correct_prediction(week)
+        # 2 wins over $2.00 total = $1.00 per win
+        assert result["cost_per_win_usd_trend_4w"] is not None
+        assert abs(result["cost_per_win_usd_trend_4w"] - 1.00) < 1e-6
+
+    def test_trend_4w_in_markdown_report(self):
+        """The rendered report includes the 4-week trend row."""
+        week = _make_week(
+            resolved=[{"realised_pnl_pct": 5.0}],
+            workflow_runs=[{"cost_usd": 0.50}],
+            prior_4w_workflow_runs=[{"cost_usd": 2.00}],
+            prior_4w_resolved_predictions=[{"realised_pnl_pct": 5.0}, {"realised_pnl_pct": 3.0}],
+        )
+        from src.eval.weekly import compute_pnl_attribution, compute_calibration_drift, render_markdown_report
+        cost = compute_cost_per_correct_prediction(week)
+        report = render_markdown_report(
+            week_iso="2026-W18", week=week,
+            pnl_attribution=compute_pnl_attribution(week),
+            calibration_drift=compute_calibration_drift(week),
+            cost_correct=cost,
+            regression_results=[], ab_results=[],
+        )
+        assert "4-week avg cost/win" in report
 
 
 # ---------------------------------------------------------------------------

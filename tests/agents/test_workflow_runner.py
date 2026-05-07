@@ -626,24 +626,22 @@ class TestSafeJsonb:
 # ---------------------------------------------------------------------------
 
 class TestMidStageBudget:
-    """The per-agent post-accumulation budget check must raise BudgetExceeded
-    if cost crosses the ceiling after a single agent returns, even in a
-    parallel stage where the pre-stage projection was under the ceiling.
+    """The per-agent POST-accumulation budget check (workflow_runner.py:270) must raise
+    BudgetExceeded after an agent run's actual cost crosses the ceiling, even when the
+    pre-stage projection check passes (parallel stages can overshoot projections).
     """
 
     @pytest.mark.asyncio
-    async def test_budget_exceeded_mid_stage_raises(self):
-        """Run a workflow with an extremely low cost ceiling and a mock agent
-        that returns a non-zero cost so the ceiling is crossed.
+    async def test_post_accumulation_budget_check_fires(self):
+        """Patch _project_stage_cost to 0 so the pre-stage check is bypassed, then
+        verify the post-accumulation check triggers once the agent returns actual cost.
         """
         import types
         from decimal import Decimal
-        from src.agents.runtime.workflow_runner import BudgetExceeded
 
-        # Build a response that would cost something
         def _make_response():
             usage = types.SimpleNamespace(
-                input_tokens=10_000,   # at Haiku prices: ~$0.0008
+                input_tokens=10_000,   # at Haiku prices: ~$0.009 total
                 output_tokens=2_000,
                 cache_read_input_tokens=0,
                 cache_creation_input_tokens=0,
@@ -664,11 +662,12 @@ class TestMidStageBudget:
         anthropic = MagicMock()
         anthropic.messages.create = AsyncMock(return_value=_make_response())
 
-        # Set a ceiling so small that even one Haiku call exceeds it
+        # Ceiling is non-zero but far below actual Haiku cost (~$0.009).
+        # Pre-stage projection is patched to 0 so it doesn't trip first.
         wf = WorkflowSpec(
             name="test_mid_budget",
             version="v1",
-            cost_ceiling_usd=Decimal("0.000001"),  # $0.000001 — guaranteed exceeded
+            cost_ceiling_usd=Decimal("0.000001"),
             token_ceiling=100_000,
             stages=(
                 WorkflowStage(
@@ -680,7 +679,11 @@ class TestMidStageBudget:
             ),
         )
         runner = make_runner(anthropic=anthropic)
-        result = await runner.run(wf, params={})
-        # The workflow should end as failed due to BudgetExceeded
-        assert result.status == "failed"
+
+        # Bypass pre-stage projection so only the post-accumulation check can fire
+        with patch.object(runner, "_project_stage_cost", return_value=Decimal("0")):
+            result = await runner.run(wf, params={})
+
+        assert result.status == "failed", f"Expected failed, got {result.status}"
         assert result.error is not None
+        assert "Cost ceiling" in result.error or "ceiling" in result.error.lower()

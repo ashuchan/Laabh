@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -131,7 +131,7 @@ class WorkflowRunner:
             await db.commit()
 
         # 4. Build WorkflowContext
-        as_of = merged_params.get("as_of") or datetime.utcnow()
+        as_of = merged_params.get("as_of") or datetime.now(timezone.utc)
         ctx = WorkflowContext(
             workflow_run_id=workflow_run_id,
             workflow_spec=workflow_spec,
@@ -405,8 +405,23 @@ class WorkflowRunner:
             response = None  # ensure name is bound before any exception can reference it
             try:
                 t0 = time.monotonic()
-                if spec.stream_response and self.anthropic:
-                    response = await self._stream_response(spec, api_request_current, agent_run_id)
+                import types as _types
+                _extra_empty = _types.SimpleNamespace(
+                    input_tokens=0, output_tokens=0,
+                    cache_read_input_tokens=0, cache_creation_input_tokens=0,
+                )
+                extra_usage = _extra_empty
+                extra_tool_calls: list[dict] = []
+
+                if spec.tools and self.anthropic:
+                    # Multi-turn: data tool gathering then forced output tool
+                    response, extra_usage, extra_tool_calls = await self._run_data_tool_pre_loop(
+                        spec, api_request_current, agent_run_id, ctx
+                    )
+                elif spec.stream_response and self.anthropic:
+                    response = await self._stream_response(
+                        spec, api_request_current, agent_run_id, ctx
+                    )
                 elif self.anthropic:
                     response = await asyncio.wait_for(
                         self.anthropic.messages.create(**api_request_current),
@@ -428,6 +443,8 @@ class WorkflowRunner:
 
                 usage = response.usage
                 cost = compute_cost(used_model, usage)
+                # Add cost for intermediate data-tool turns
+                cost += compute_cost(used_model, extra_usage)
 
                 audit_id = await self._write_llm_audit_log(
                     spec, used_model, api_request_current, response, ctx, agent_run_id
@@ -442,12 +459,17 @@ class WorkflowRunner:
                     output=tool_call.input if tool_call else self._extract_text(response),
                     raw_output=tool_call.input if tool_call else None,
                     cost_usd=cost,
-                    input_tokens=getattr(usage, "input_tokens", 0) or 0,
-                    output_tokens=getattr(usage, "output_tokens", 0) or 0,
-                    cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-                    cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                    input_tokens=(getattr(usage, "input_tokens", 0) or 0)
+                                 + (getattr(extra_usage, "input_tokens", 0) or 0),
+                    output_tokens=(getattr(usage, "output_tokens", 0) or 0)
+                                  + (getattr(extra_usage, "output_tokens", 0) or 0),
+                    cache_read_tokens=(getattr(usage, "cache_read_input_tokens", 0) or 0)
+                                      + (getattr(extra_usage, "cache_read_input_tokens", 0) or 0),
+                    cache_creation_tokens=(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+                                          + (getattr(extra_usage, "cache_creation_input_tokens", 0) or 0),
                     duration_ms=duration_ms,
                     llm_audit_log_id=audit_id,
+                    tool_calls_made=extra_tool_calls,
                 )
 
                 # Run semantic validator inside the retry loop so that rejection
@@ -511,12 +533,161 @@ class WorkflowRunner:
 
         return self._make_failed_result(spec, agent_run_id, used_model, last_error, "loop_exit")
 
-    async def _stream_response(self, spec: AgentSpec, api_request: dict, agent_run_id: str):
-        """Stream Opus response; returns the final message object."""
+    async def _stream_response(
+        self,
+        spec: AgentSpec,
+        api_request: dict,
+        agent_run_id: str,
+        ctx: "WorkflowContext | None" = None,
+    ):
+        """Stream Opus response; writes partial text to agent_runs for live monitoring."""
+        partial_buf: list[str] = []
+        last_write = time.monotonic()
+        WRITE_INTERVAL = 3.0  # seconds between partial DB flushes
+
         async with self.anthropic.messages.stream(**api_request) as stream:
-            async for _event in stream:
-                pass  # drain stream; get_final_message() assembles the complete response
+            async for event in stream:
+                if ctx and hasattr(event, "delta") and hasattr(event.delta, "text"):
+                    partial_buf.append(event.delta.text)
+                    if time.monotonic() - last_write >= WRITE_INTERVAL and partial_buf:
+                        partial_text = "".join(partial_buf)
+                        asyncio.create_task(
+                            self._write_partial_agent_output(agent_run_id, partial_text)
+                        )
+                        last_write = time.monotonic()
             return await stream.get_final_message()
+
+    async def _write_partial_agent_output(self, agent_run_id: str, partial_text: str) -> None:
+        """Write streaming partial output to agent_runs for live operator monitoring."""
+        try:
+            async with self.db_session_factory() as db:
+                await db.execute(
+                    text("UPDATE agent_runs SET output = :p WHERE id = :id"),
+                    {"p": json.dumps({"partial": partial_text}), "id": agent_run_id},
+                )
+                await db.commit()
+        except Exception as e:
+            log.debug("Partial stream write failed (non-fatal): %s", e)
+
+    # ------------------------------------------------------------------
+    # Agentic data-tool dispatch loop
+    # ------------------------------------------------------------------
+
+    async def _run_data_tool_pre_loop(
+        self,
+        spec: AgentSpec,
+        api_request: dict,
+        agent_run_id: str,
+        ctx: "WorkflowContext",
+        max_tool_turns: int = 10,
+    ) -> tuple[Any, Any, list[dict]]:
+        """Execute data tool calls in a loop until the model calls the output tool.
+
+        Returns (final_response, accumulated_extra_usage, tool_calls_made).
+        The extra_usage is a SimpleNamespace compatible with compute_cost().
+        """
+        import types as _types
+
+        messages = list(api_request["messages"])
+        # Allow any tool on intermediate turns
+        req = {**api_request, "messages": messages}
+        if spec.tools and spec.output_tool:
+            req["tool_choice"] = {"type": "auto"}
+
+        acc_input = acc_output = acc_cache_r = acc_cache_c = 0
+        tool_calls_made: list[dict] = []
+
+        for turn in range(max_tool_turns + 1):
+            is_last = turn >= max_tool_turns
+            if is_last and spec.output_tool:
+                req = {**req, "tool_choice": {"type": "tool", "name": spec.output_tool}}
+
+            if spec.stream_response:
+                response = await self._stream_response(spec, req, agent_run_id, ctx)
+            else:
+                response = await asyncio.wait_for(
+                    self.anthropic.messages.create(**req),
+                    timeout=spec.timeout_seconds,
+                )
+
+            tool_uses = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
+            output_called = spec.output_tool and any(b.name == spec.output_tool for b in tool_uses)
+
+            if output_called or is_last or getattr(response, "stop_reason", None) == "end_turn":
+                return response, _types.SimpleNamespace(
+                    input_tokens=acc_input, output_tokens=acc_output,
+                    cache_read_input_tokens=acc_cache_r, cache_creation_input_tokens=acc_cache_c,
+                ), tool_calls_made
+
+            if not tool_uses:
+                return response, _types.SimpleNamespace(
+                    input_tokens=acc_input, output_tokens=acc_output,
+                    cache_read_input_tokens=acc_cache_r, cache_creation_input_tokens=acc_cache_c,
+                ), tool_calls_made
+
+            # Accumulate this intermediate turn's tokens
+            u = response.usage
+            acc_input += getattr(u, "input_tokens", 0) or 0
+            acc_output += getattr(u, "output_tokens", 0) or 0
+            acc_cache_r += getattr(u, "cache_read_input_tokens", 0) or 0
+            acc_cache_c += getattr(u, "cache_creation_input_tokens", 0) or 0
+
+            # Dispatch each data tool with per-tool timeout
+            tool_results = []
+            for tb in tool_uses:
+                result = await self._dispatch_data_tool(tb, spec, agent_run_id, ctx)
+                tool_calls_made.append({"tool": tb.name, "input_keys": list(getattr(tb, "input", {}).keys())})
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tb.id,
+                    "content": json.dumps(result, default=str),
+                })
+
+            messages = [
+                *messages,
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": tool_results},
+            ]
+            req = {**req, "messages": messages}
+
+        # Unreachable; satisfies type checker
+        return response, _types.SimpleNamespace(  # type: ignore[return-value]
+            input_tokens=acc_input, output_tokens=acc_output,
+            cache_read_input_tokens=acc_cache_r, cache_creation_input_tokens=acc_cache_c,
+        ), tool_calls_made
+
+    async def _dispatch_data_tool(
+        self, tool_use_block: Any, spec: AgentSpec, agent_run_id: str, ctx: "WorkflowContext"
+    ) -> dict:
+        """Execute one data tool with per-tool timeout. Never raises — returns error dict on failure."""
+        from src.agents.runtime.spec import ToolContext
+
+        tool_name = tool_use_block.name
+        td = self._tool_registry.get(tool_name)
+        if td is None:
+            return {"error": f"Unknown tool: {tool_name}"}
+
+        tool_ctx = ToolContext(
+            workflow_run_id=ctx.workflow_run_id,
+            agent_run_id=agent_run_id,
+            agent_name=spec.name,
+            db=None,  # executor opens its own session via db_session_factory
+            redis=self.redis,
+            as_of=ctx.as_of,
+            is_replay=ctx.is_replay,
+        )
+        try:
+            result = await asyncio.wait_for(
+                td.executor(getattr(tool_use_block, "input", {}), tool_ctx),
+                timeout=td.timeout_seconds,
+            )
+            return result
+        except asyncio.TimeoutError:
+            log.warning("[%s] tool %r timed out after %ds", spec.name, tool_name, td.timeout_seconds)
+            return {"error": f"{tool_name} timed out after {td.timeout_seconds}s"}
+        except Exception as e:
+            log.warning("[%s] tool %r failed: %s", spec.name, tool_name, e)
+            return {"error": f"{tool_name} failed: {type(e).__name__}: {e}"}
 
     # ------------------------------------------------------------------
     # Output validation

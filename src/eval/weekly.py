@@ -27,6 +27,9 @@ class WeekData:
     all_predictions_count: int = 0          # all predictions regardless of outcome resolution
     resolved_predictions: list[dict] = field(default_factory=list)
     shadow_eval_scores: list[dict] = field(default_factory=list)
+    # Prior 4 weeks — used for trend_4w metrics
+    prior_4w_workflow_runs: list[dict] = field(default_factory=list)
+    prior_4w_resolved_predictions: list[dict] = field(default_factory=list)
 
 
 async def fetch_week_data(start: date, end: date, db_session_factory) -> WeekData:
@@ -102,6 +105,30 @@ async def fetch_week_data(start: date, end: date, db_session_factory) -> WeekDat
                 {"start": start, "end": end + timedelta(days=1)},
             )
             week.shadow_eval_scores = [dict(r._mapping) for r in result.fetchall()]
+
+            # Prior 4 weeks — for trend metrics (weeks t-4 to t-1)
+            prior_end = start
+            prior_start = start - timedelta(days=28)
+            result = await db.execute(
+                text("""
+                    SELECT cost_usd FROM workflow_runs
+                    WHERE started_at >= :start AND started_at < :end
+                      AND status = 'succeeded'
+                """),
+                {"start": prior_start, "end": prior_end},
+            )
+            week.prior_4w_workflow_runs = [dict(r._mapping) for r in result.fetchall()]
+
+            result = await db.execute(
+                text("""
+                    SELECT ap.id, apo.realised_pnl_pct
+                    FROM agent_predictions ap
+                    JOIN agent_predictions_outcomes apo ON apo.prediction_id = ap.id
+                    WHERE ap.created_at >= :start AND ap.created_at < :end
+                """),
+                {"start": prior_start, "end": prior_end},
+            )
+            week.prior_4w_resolved_predictions = [dict(r._mapping) for r in result.fetchall()]
 
     except Exception as e:
         log.error(f"fetch_week_data failed: {e}")
@@ -269,6 +296,12 @@ def compute_cost_per_correct_prediction(week: WeekData) -> dict:
     for ar in week.agent_runs:
         by_agent[ar["agent_name"]] += Decimal(str(ar.get("cost_usd") or 0))
 
+    # 4-week rolling average cost per win from prior period data
+    prior_total_cost = sum(float(r.get("cost_usd") or 0) for r in week.prior_4w_workflow_runs)
+    prior_wins = sum(1 for p in week.prior_4w_resolved_predictions
+                     if (p.get("realised_pnl_pct") or 0) > 0)
+    cost_per_win_usd_trend_4w = prior_total_cost / prior_wins if prior_wins else None
+
     return {
         "total_llm_cost_usd": total_cost,
         "n_predictions": n_total,
@@ -276,6 +309,7 @@ def compute_cost_per_correct_prediction(week: WeekData) -> dict:
         "win_rate_pct": (n_wins / n_total * 100) if n_total else 0,
         "cost_per_prediction_usd": total_cost / n_total if n_total else None,
         "cost_per_win_usd": total_cost / n_wins if n_wins else None,
+        "cost_per_win_usd_trend_4w": cost_per_win_usd_trend_4w,
         "by_agent": {k: float(v) for k, v in by_agent.items()},
     }
 
@@ -309,6 +343,7 @@ def render_markdown_report(
         f"| Total P&L | {pnl_attribution['week_total_pnl_pct']:+.1f}% |",
         f"| Cost per prediction | ${cost_correct['cost_per_prediction_usd']:.2f} |" if cost_correct['cost_per_prediction_usd'] else "| Cost per prediction | N/A |",
         f"| Cost per win | ${cost_correct['cost_per_win_usd']:.2f} |" if cost_correct['cost_per_win_usd'] else "| Cost per win | N/A |",
+        f"| 4-week avg cost/win | ${cost_correct['cost_per_win_usd_trend_4w']:.2f} |" if cost_correct.get('cost_per_win_usd_trend_4w') else "| 4-week avg cost/win | N/A (no prior data) |",
         "",
         "## Calibration Drift (CEO Judge)",
         "",
