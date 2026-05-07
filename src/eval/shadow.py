@@ -13,6 +13,51 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+_MAX_EVAL_INPUT_CHARS = 48_000   # ~12k tokens at 4 chars/token; hard cap for shadow eval
+
+
+def _truncate_for_eval(stage_outputs: dict, max_chars: int = _MAX_EVAL_INPUT_CHARS) -> dict:
+    """Shrink stage_outputs so it fits within the shadow evaluator's token budget.
+
+    Strategy (order matters — most lossy stages trimmed first):
+    1. Each explorer sub-output list is truncated to its first element.
+    2. Long string values (>2000 chars) inside any dict value are trimmed.
+    3. If the serialised size still exceeds max_chars, trim the whole blob to max_chars.
+    """
+    import copy
+
+    truncated = copy.deepcopy(stage_outputs)
+
+    # Step 1: trim explorer lists — keep only the first result per symbol
+    for key in list(truncated.keys()):
+        if key.startswith("explorer_") and isinstance(truncated[key], list):
+            truncated[key] = truncated[key][:1]
+
+    # Step 2: trim long string leaf values
+    def _trim_strings(obj: object, limit: int = 2_000) -> object:
+        if isinstance(obj, str):
+            return obj[:limit] + "…[trimmed]" if len(obj) > limit else obj
+        if isinstance(obj, dict):
+            return {k: _trim_strings(v, limit) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_trim_strings(v, limit) for v in obj]
+        return obj
+
+    truncated = _trim_strings(truncated)  # type: ignore[arg-type]
+
+    # Step 3: final size guard — hard truncate the serialised blob
+    serialised = json.dumps(truncated)
+    if len(serialised) > max_chars:
+        serialised = serialised[:max_chars]
+        log.warning(
+            "shadow eval input truncated to %d chars (stage_outputs too large)", max_chars
+        )
+        # Return the raw truncated string as a special key so the evaluator
+        # knows the inputs were clipped rather than receiving broken JSON.
+        return {"_truncated_blob": serialised, "_truncation_note": "inputs exceeded eval budget"}
+
+    return truncated
+
 
 async def persist_shadow_eval_output(
     result: "AgentRunResult", ctx: "WorkflowContext"
@@ -122,3 +167,40 @@ async def fetch_recent_overall_scores(db_session_factory, days: int = 5) -> list
     except Exception as e:
         log.warning(f"Failed to fetch recent eval scores: {e}")
         return []
+
+
+async def check_daily_eval_alerts(
+    db_session_factory,
+    telegram=None,
+    chat_id: str | None = None,
+    rolling_days: int = 3,
+    alert_threshold: float = 6.0,
+) -> bool:
+    """Fire a Telegram alert if the 3-day rolling average eval score drops below threshold.
+
+    Called once per day after the shadow eval run.  Returns True if an alert was sent.
+    """
+    scores = await fetch_recent_overall_scores(db_session_factory, days=rolling_days)
+    if not scores:
+        log.info("check_daily_eval_alerts: no recent scores, skipping")
+        return False
+
+    avg = sum(scores) / len(scores)
+    if avg >= alert_threshold:
+        return False
+
+    msg = (
+        f"⚠️ Shadow eval degradation alert\n"
+        f"3-day rolling avg score: {avg:.1f}/10 (threshold {alert_threshold})\n"
+        f"Samples: {len(scores)} runs over the last {rolling_days} days\n"
+        f"Action: review recent prompts and agent outputs."
+    )
+    log.warning(msg)
+
+    if telegram and chat_id:
+        try:
+            await telegram.send(chat_id=chat_id, text=msg)
+        except Exception as e:
+            log.warning(f"Telegram alert for eval degradation failed: {e}")
+
+    return True

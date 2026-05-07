@@ -308,3 +308,121 @@ class TestTagReplayRun:
 
         # Should not raise
         await _tag_replay_run(runner, "new-id", "parent-id", "tag")
+
+
+# ---------------------------------------------------------------------------
+# Faithful replay — zero API calls guarantee
+# ---------------------------------------------------------------------------
+
+class TestFaithfulReplayZeroApiCalls:
+    """A faithful replay (no overrides) must make ZERO calls to the Anthropic API.
+
+    This is the most important invariant of the replay system: it must be free
+    to run and must not use any new tokens.  We verify it by wiring a real
+    WorkflowRunner with a mock Anthropic client whose `messages.create` raises
+    if called — if it IS called, the test fails.
+    """
+
+    @pytest.mark.asyncio
+    async def test_faithful_replay_never_calls_anthropic(self):
+        """Faithful replay (is_replay=True, no overrides) serves everything from audit log.
+
+        We use a real WorkflowRunner but with:
+        - DB that returns a cached audit-log response for any agent
+        - Anthropic mock whose messages.create raises if called
+        """
+        from contextlib import asynccontextmanager
+        from decimal import Decimal
+        import types
+        from src.agents.runtime.workflow_runner import WorkflowRunner
+        from src.agents.runtime.spec import (
+            AgentRunResult, StageAgent, WorkflowSpec, WorkflowStage,
+        )
+
+        # Build a fake audit-log response for brain_triage
+        fake_audit_response = [
+            {
+                "type": "tool_use",
+                "name": "emit_brain_triage",
+                "input": {
+                    "skip_today": False,
+                    "skip_reason": None,
+                    "fno_candidates": [],
+                    "equity_candidates": [],
+                    "market_regime": {"vix_regime": "neutral", "trend": "sideways"},
+                    "notes": "cached",
+                },
+            }
+        ]
+
+        fake_usage = {
+            "input_tokens": 100, "output_tokens": 50,
+            "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0,
+        }
+
+        # DB that returns a single audit row for any query
+        call_count = {"n": 0}
+
+        @asynccontextmanager
+        async def db_factory():
+            db = AsyncMock()
+            mock_res = MagicMock()
+            # First call = create workflow_run; second = fetch audit log row
+            import json as _json
+
+            def _fetchone():
+                return ("agent-run-id-cached", _json.dumps(fake_audit_response), fake_usage)
+
+            mock_res.fetchone = _fetchone
+            mock_res.fetchall = lambda: []
+            mock_res.rowcount = 1
+            mock_res.scalar = lambda: None
+            db.execute = AsyncMock(return_value=mock_res)
+            db.commit = AsyncMock()
+            yield db
+
+        # Anthropic client that must NOT be called
+        anthropic_mock = MagicMock()
+        anthropic_mock.messages.create = AsyncMock(
+            side_effect=AssertionError("Anthropic API must NOT be called during faithful replay")
+        )
+
+        runner = WorkflowRunner(
+            db_session_factory=db_factory,
+            redis=AsyncMock(),
+            anthropic=anthropic_mock,
+        )
+        # Monkey-patch redis.get to not trigger kill-switch
+        runner.redis.get = AsyncMock(return_value=None)
+        runner.redis.set = AsyncMock(return_value=True)
+
+        minimal_wf = WorkflowSpec(
+            name="test_faithful",
+            version="v1",
+            cost_ceiling_usd=Decimal("5.0"),
+            token_ceiling=100_000,
+            stages=(
+                WorkflowStage(
+                    stage_name="brain_triage",
+                    kind="sequential",
+                    agents=(StageAgent(agent_name="brain_triage", persona_version="v1",
+                                       output_key="triage"),),
+                ),
+            ),
+        )
+
+        # Run as replay — faithful (no overrides)
+        result = await runner.run(
+            minimal_wf,
+            params={
+                "original_workflow_run_id": "orig-uuid-faithful",
+                "persona_version_overrides": {},
+                "from_agent": None,
+            },
+            triggered_by="replay",
+        )
+
+        # If Anthropic was called, the mock would have raised AssertionError.
+        # Reaching here means zero API calls were made.
+        assert result.workflow_run_id is not None
+        anthropic_mock.messages.create.assert_not_called()

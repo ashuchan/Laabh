@@ -344,3 +344,245 @@ class TestProjectStageCost:
         single_cost = runner._project_stage_cost(stage_single, ctx)
         iter_cost = runner._project_stage_cost(stage_iter, ctx)
         assert iter_cost == single_cost * 5
+
+
+# ---------------------------------------------------------------------------
+# Tests that require a mock Anthropic client
+# ---------------------------------------------------------------------------
+
+def _make_anthropic_response(tool_name: str, tool_input: dict, model: str = "claude-haiku-4-5-20251001"):
+    """Build a minimal Anthropic messages.create response with one tool_use block."""
+    import types
+
+    usage = types.SimpleNamespace(
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+    tool_block = types.SimpleNamespace(
+        type="tool_use",
+        id="toolu_fake_001",
+        name=tool_name,
+        input=tool_input,
+    )
+    response = types.SimpleNamespace(
+        content=[tool_block],
+        usage=usage,
+        model=model,
+    )
+    return response
+
+
+def make_mock_anthropic(tool_input: dict, tool_name: str = "emit_brain_triage",
+                        side_effect=None):
+    """Return an AsyncAnthropic-like mock whose messages.create returns a fixed response."""
+    anthropic = MagicMock()
+    if side_effect:
+        anthropic.messages.create = AsyncMock(side_effect=side_effect)
+        anthropic.messages.stream = MagicMock(side_effect=side_effect)
+    else:
+        anthropic.messages.create = AsyncMock(
+            return_value=_make_anthropic_response(tool_name, tool_input)
+        )
+    return anthropic
+
+
+class TestExecuteWithRetries:
+    """Tests for _execute_with_retries behaviour: fallback, budget, validation-retry."""
+
+    @pytest.mark.asyncio
+    async def test_succeeds_on_first_attempt(self):
+        tool_output = {
+            "skip_today": False,
+            "skip_reason": None,
+            "fno_candidates": [],
+            "equity_candidates": [],
+            "market_regime": {"vix_regime": "neutral", "trend": "sideways"},
+            "notes": "test",
+        }
+        anthropic = make_mock_anthropic(tool_output, tool_name="emit_brain_triage")
+        runner = make_runner(anthropic=anthropic)
+        spec = runner._build_agent_spec("brain_triage", "v1")
+        api_request = {
+            "model": spec.model,
+            "max_tokens": spec.max_output_tokens,
+            "system": [{"type": "text", "text": "You are brain_triage."}],
+            "messages": [{"role": "user", "content": "test"}],
+            "tools": [],
+            "tool_choice": {"type": "tool", "name": spec.output_tool},
+        }
+        result = await runner._execute_with_retries(spec, api_request, "test-run-1", None)
+        assert result.status == "succeeded"
+        assert result.output == tool_output
+        assert anthropic.messages.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_fallback_model_used_after_transient_exhausted(self):
+        """After max transient retries on primary, switches to fallback model."""
+        # Fail until we switch to fallback model, then succeed
+        call_count = 0
+        primary_model = "claude-haiku-4-5-20251001"
+        fallback_model = "claude-sonnet-4-6"
+        tool_output = {
+            "skip_today": True, "skip_reason": "VIX high", "fno_candidates": [],
+            "equity_candidates": [], "market_regime": {"vix_regime": "high", "trend": "bearish"},
+            "notes": "",
+        }
+
+        async def _side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("model") == primary_model:
+                raise asyncio.TimeoutError("timeout")
+            return _make_anthropic_response("emit_brain_triage", tool_output, fallback_model)
+
+        anthropic = MagicMock()
+        anthropic.messages.create = AsyncMock(side_effect=_side_effect)
+        runner = make_runner(anthropic=anthropic)
+        spec = runner._build_agent_spec("brain_triage", "v1")
+        # Set retries low and enable fallback (brain_triage has no fallback_model by default)
+        import dataclasses
+        spec = dataclasses.replace(
+            spec, max_retries_transient=1, on_failure="degrade",
+            fallback_model=fallback_model,
+        )
+
+        api_request = {
+            "model": primary_model,
+            "max_tokens": spec.max_output_tokens,
+            "system": [{"type": "text", "text": "You are an agent."}],
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [],
+            "tool_choice": {"type": "tool", "name": spec.output_tool},
+        }
+        result = await runner._execute_with_retries(spec, api_request, "run-fallback", None)
+        # Should succeed on fallback
+        assert result.status == "succeeded"
+        assert result.model_used == fallback_model
+
+    @pytest.mark.asyncio
+    async def test_used_fallback_flag_prevents_double_fallback(self):
+        """Once fallback fires, further failures return 'transient_exhausted', not a second fallback."""
+        import dataclasses
+
+        async def _always_timeout(**kwargs):
+            raise asyncio.TimeoutError("always times out")
+
+        anthropic = MagicMock()
+        anthropic.messages.create = AsyncMock(side_effect=_always_timeout)
+        runner = make_runner(anthropic=anthropic)
+        spec = runner._build_agent_spec("brain_triage", "v1")
+        spec = dataclasses.replace(
+            spec, max_retries_transient=0, on_failure="degrade",
+            fallback_model="claude-sonnet-4-6",
+        )
+
+        api_request = {
+            "model": spec.model,
+            "max_tokens": spec.max_output_tokens,
+            "system": [{"type": "text", "text": "You are an agent."}],
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [],
+            "tool_choice": {"type": "tool", "name": spec.output_tool},
+        }
+        result = await runner._execute_with_retries(spec, api_request, "run-double", None)
+        # Must eventually fail, not loop infinitely
+        assert result.status == "failed"
+        assert result.error is not None
+
+    @pytest.mark.asyncio
+    async def test_validation_retry_fires_on_rejected_output(self):
+        """OutputValidationError triggers repair-and-retry up to max_retries_validation."""
+        import dataclasses
+        import types
+
+        good_output = {
+            "skip_today": False, "skip_reason": None, "fno_candidates": [],
+            "equity_candidates": [], "market_regime": {"vix_regime": "neutral", "trend": "sideways"},
+            "notes": "",
+        }
+        call_count = 0
+
+        async def _side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            # First call returns a tool call with bad output (empty dict);
+            # second call returns good output.
+            output = {} if call_count == 1 else good_output
+            return _make_anthropic_response("emit_brain_triage", output)
+
+        anthropic = MagicMock()
+        anthropic.messages.create = AsyncMock(side_effect=_side_effect)
+        runner = make_runner(anthropic=anthropic)
+        spec = runner._build_agent_spec("brain_triage", "v1")
+        # Wire a simple validator that rejects empty output
+        spec = dataclasses.replace(spec, output_validator=None, max_retries_validation=2)
+
+        # Patch _validate_output to reject first call, accept second
+        validate_count = 0
+
+        async def _mock_validate(spec_arg, result, ctx):
+            nonlocal validate_count
+            validate_count += 1
+            if validate_count == 1:
+                from src.agents.runtime.workflow_runner import OutputValidationError
+                raise OutputValidationError("bad output on attempt 1")
+            return result
+
+        runner._validate_output = _mock_validate  # type: ignore[method-assign]
+        spec = dataclasses.replace(spec, output_validator="CEOJudgeOutputValidated")
+
+        api_request = {
+            "model": spec.model,
+            "max_tokens": spec.max_output_tokens,
+            "system": [{"type": "text", "text": "You are an agent."}],
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [],
+            "tool_choice": {"type": "tool", "name": spec.output_tool},
+        }
+        result = await runner._execute_with_retries(spec, api_request, "run-valretry", None)
+        assert result.status == "succeeded"
+        assert anthropic.messages.create.call_count == 2
+
+
+class TestFromAgentToggle:
+    """Tests for from_agent replay-mode switching in WorkflowContext."""
+
+    def test_from_agent_stored_in_context(self):
+        from src.agents.runtime.spec import WorkflowContext
+
+        ctx = WorkflowContext(
+            workflow_run_id="test",
+            workflow_spec=make_minimal_workflow(),
+            params={},
+            cost_so_far_usd=Decimal("0"),
+            tokens_so_far=0,
+            agent_run_results=[],
+            stage_outputs={},
+            db_session_factory=make_fake_db(),
+            redis=make_fake_redis(),
+            anthropic=None,
+            as_of=None,
+            from_agent="ceo_judge",
+        )
+        assert ctx.from_agent == "ceo_judge"
+
+    def test_from_agent_none_by_default(self):
+        from src.agents.runtime.spec import WorkflowContext
+
+        ctx = WorkflowContext(
+            workflow_run_id="test",
+            workflow_spec=make_minimal_workflow(),
+            params={},
+            cost_so_far_usd=Decimal("0"),
+            tokens_so_far=0,
+            agent_run_results=[],
+            stage_outputs={},
+            db_session_factory=make_fake_db(),
+            redis=make_fake_redis(),
+            anthropic=None,
+            as_of=None,
+        )
+        assert ctx.from_agent is None
+        assert ctx._replay_live_mode is False
