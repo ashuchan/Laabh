@@ -60,6 +60,7 @@ def test_total_exposure_sums_premiums():
 
 
 def test_symbol_from_arm():
-    from src.quant.orchestrator import _symbol_from_arm
-    assert _symbol_from_arm("RELIANCE_orb") == "RELIANCE"
-    assert _symbol_from_arm("NIFTY_vwap_revert") == "NIFTY"
+    # _symbol_from_arm was replaced by arm_meta dict; use _split_arm from persistence
+    from src.quant.persistence import _split_arm
+    assert _split_arm("RELIANCE_orb")[0] == "RELIANCE"
+    assert _split_arm("NIFTY_vwap_revert")[0] == "NIFTY"

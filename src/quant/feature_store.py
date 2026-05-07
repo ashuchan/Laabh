@@ -49,7 +49,7 @@ class FeatureBundle:
     bid_volume_3min_change: float
     ask_volume_3min_change: float
 
-    # Bollinger-band width (20-period on 1-min closes)
+    # Bollinger-band width (20-period on 3-min closes)
     bb_width: float
 
     # VIX

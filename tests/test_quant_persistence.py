@@ -18,9 +18,21 @@ def test_split_arm(arm_id, expected):
     assert _split_arm(arm_id) == expected
 
 
+def test_split_arm_hyphenated_symbol():
+    """Symbols with hyphens (e.g., post-demerger) should still split correctly."""
+    assert _split_arm("TATA-EQ_orb") == ("TATA-EQ", "orb")
+    assert _split_arm("IDEA-EQ_vwap_revert") == ("IDEA-EQ", "vwap_revert")
+
+
+def test_split_arm_fallback_unknown_primitive():
+    """Unknown primitive suffix falls back to rsplit on last underscore."""
+    symbol, prim = _split_arm("RELIANCE_custom")
+    assert symbol == "RELIANCE"
+    assert prim == "custom"
+
+
 def test_posterior_patch_roundtrip():
     """Patch and read back posterior mean/var through ThompsonSampler."""
-    import numpy as np
     from src.quant.bandit.selector import ArmSelector
     from src.quant.persistence import _patch_posterior
 
@@ -30,6 +42,20 @@ def test_posterior_patch_roundtrip():
 
     assert selector.posterior_mean("RELIANCE_orb") == pytest.approx(0.05)
     assert selector.posterior_var("RELIANCE_orb") == pytest.approx(0.02)
+
+
+def test_gamma_roundtrip_thompson():
+    """γ applied to variance via _patch_posterior with gamma: var_after = prior / γ."""
+    from src.quant.bandit.selector import ArmSelector
+    from src.quant.persistence import _patch_posterior
+
+    arms = ["A_orb"]
+    selector = ArmSelector(arms, prior_mean=0.0, prior_var=0.01, seed=0)
+    gamma = 0.95
+    prior_var = 0.01
+    # Simulate load_morning: pass decayed var directly
+    _patch_posterior(selector, "A_orb", mean=0.0, var=prior_var / gamma, gamma=gamma)
+    assert selector.posterior_var("A_orb") == pytest.approx(prior_var / gamma, rel=1e-6)
 
 
 def test_forget_factor_applied():

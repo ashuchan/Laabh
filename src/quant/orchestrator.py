@@ -6,11 +6,13 @@ LAABH_INTRADAY_MODE=quant.
 from __future__ import annotations
 
 import asyncio
+import time as _time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
+import pytz
 from loguru import logger
 
 from src.config import get_settings
@@ -22,6 +24,8 @@ from src.quant import persistence
 from src.quant import reports
 from src.quant.sizer import compute_lots
 from src.quant.universe import load_universe
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 
 def _make_arm_id(symbol: str, primitive_name: str) -> str:
@@ -79,41 +83,71 @@ async def run_loop(
         for p in settings.quant_primitives_list
     ]
 
+    # Pre-compute arm → (symbol, primitive_name) to avoid per-tick _split_arm calls
+    arm_meta: dict[str, tuple[str, str]] = {
+        _make_arm_id(u["symbol"], p): (u["symbol"], p)
+        for u in universe
+        for p in settings.quant_primitives_list
+    }
+
     selector = await persistence.load_morning(
         portfolio_id, today, all_arms, underlying_map,
         as_of=as_of, dryrun_run_id=dryrun_run_id,
     )
 
     primitives = _load_primitives(settings.quant_primitives_list)
-    history: dict[str, list] = {u["symbol"]: [] for u in universe}  # symbol → [FeatureBundle]
+    max_history = max((p.warmup_minutes for p in primitives), default=30) + 5
+    # Each 3-min bar = 1 entry; limit history to max_history bars
+    max_history_bars = (max_history // 3) + 2
+    history: dict[str, list] = {u["symbol"]: [] for u in universe}
+
     open_positions: list[OpenPosition] = []
 
     starting_nav = await _get_nav(portfolio_id)
-    circuit = CircuitState(starting_nav=starting_nav)
+    circuit = CircuitState(
+        starting_nav=starting_nav,
+        lockin_target_pct=settings.laabh_quant_lockin_target_pct,
+        kill_switch_dd_pct=settings.laabh_quant_kill_switch_dd_pct,
+        cooloff_consecutive_losses=settings.laabh_quant_cooloff_consecutive_losses,
+        cooloff_minutes=settings.laabh_quant_cooloff_minutes,
+    )
 
     await _init_day_state(portfolio_id, today, starting_nav, universe, settings)
 
-    import pytz
-    ist = pytz.timezone("Asia/Kolkata")
+    # Compute session open once — 09:15 IST in UTC
+    _session_open_ist_time = _IST.localize(
+        datetime(today.year, today.month, today.day, 9, 15, 0)
+    )
+
+    # In replay mode, start current_time at as_of; in live mode, it's always datetime.now().
+    replay_mode = as_of is not None
+    current_time = as_of if replay_mode else datetime.now(timezone.utc)
+    poll_delta = timedelta(seconds=settings.laabh_quant_poll_interval_sec)
 
     # --- Main loop ---
     while True:
-        now_utc = as_of or datetime.now(timezone.utc)
-        now_ist = now_utc.astimezone(ist)
+        if not replay_mode:
+            current_time = datetime.now(timezone.utc)
+
+        now_ist = current_time.astimezone(_IST)
 
         if now_ist.time() >= settings.laabh_quant_hard_exit_time:
             break
 
-        tick_start = now_utc
+        tick_start = current_time
         logger.debug(f"[QUANT] tick at {now_ist.strftime('%H:%M:%S')} IST")
 
         # 1. Refresh features for each underlying
         features_map: dict[str, Any] = {}
         for u in universe:
-            bundle = await feature_store.get(u["id"], now_utc)
+            bundle = await feature_store.get(u["id"], current_time)
             if bundle:
                 features_map[u["symbol"]] = bundle
-                history[u["symbol"]].append(bundle)
+                sym_hist = history[u["symbol"]]
+                sym_hist.append(bundle)
+                # Trim to avoid unbounded memory growth
+                if len(sym_hist) > max_history_bars:
+                    del sym_hist[0]
 
         # 2. Compute signals from each enabled primitive × each underlying
         signals: list[tuple[str, str, Any]] = []  # (arm_id, symbol, signal)
@@ -131,17 +165,17 @@ async def run_loop(
 
         # 3. Manage existing positions
         current_nav = await _get_nav(portfolio_id)
-        circuit.check_and_fire(current_nav, now_utc)
+        circuit.check_and_fire(current_nav, current_time)
 
         for pos in list(open_positions):
-            symbol = _symbol_from_arm(pos.arm_id)
+            symbol = arm_meta.get(pos.arm_id, (pos.arm_id, ""))[0]
             bundle = features_map.get(symbol)
             if bundle is None:
                 continue
-            current_premium = await _get_premium(pos)
+            current_premium = _get_premium_from_bundle(pos, bundle)
             arm_signals = [(arm_id, sig) for arm_id, _, sig in signals if arm_id == pos.arm_id]
             close, reason = should_close(
-                pos, current_premium, bundle.realized_vol_3min, now_utc, arm_signals
+                pos, current_premium, bundle.realized_vol_3min, current_time, arm_signals
             )
             if close:
                 pnl = await _close_position(pos, current_premium, reason, portfolio_id)
@@ -151,34 +185,41 @@ async def run_loop(
                 if pnl > 0:
                     circuit.record_win(pos.arm_id)
                 else:
-                    circuit.record_loss(pos.arm_id, now_utc)
+                    circuit.record_loss(pos.arm_id, current_time)
 
         # 4. Day-level circuit breaker
         if circuit.kill_active:
             logger.info("[QUANT] Kill switch active — skipping new entries this tick")
-            await _sleep_tick(settings, tick_start, as_of)
+            await _sleep_tick(settings, tick_start, replay_mode)
+            if replay_mode:
+                current_time += poll_delta
             continue
 
         # 5. Capacity gate
         if len(open_positions) >= settings.laabh_quant_max_concurrent_positions:
-            await _sleep_tick(settings, tick_start, as_of)
+            await _sleep_tick(settings, tick_start, replay_mode)
+            if replay_mode:
+                current_time += poll_delta
             continue
 
         # 6. First-entry warmup gate
-        session_open_ist = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-        minutes_since_open = (now_ist - session_open_ist).total_seconds() / 60.0
+        minutes_since_open = (now_ist - _session_open_ist_time).total_seconds() / 60.0
         if minutes_since_open < settings.laabh_quant_first_entry_after_minutes:
-            await _sleep_tick(settings, tick_start, as_of)
+            await _sleep_tick(settings, tick_start, replay_mode)
+            if replay_mode:
+                current_time += poll_delta
             continue
 
         # 7. Bandit selection
         signalling_arms = [arm_id for arm_id, _, _ in signals]
         active_arms = [
             a for a in signalling_arms
-            if not circuit.arm_in_cooloff(a, now_utc)
+            if not circuit.arm_in_cooloff(a, current_time)
         ]
         if not active_arms:
-            await _sleep_tick(settings, tick_start, as_of)
+            await _sleep_tick(settings, tick_start, replay_mode)
+            if replay_mode:
+                current_time += poll_delta
             continue
 
         signal_strengths = {arm_id: sig.strength for arm_id, _, sig in signals}
@@ -187,18 +228,22 @@ async def run_loop(
             signal_strengths=signal_strengths,
         )
         if chosen_arm is None:
-            await _sleep_tick(settings, tick_start, as_of)
+            await _sleep_tick(settings, tick_start, replay_mode)
+            if replay_mode:
+                current_time += poll_delta
             continue
 
         # 8. Size and open position
         chosen_entry = next((sig for arm_id, _, sig in signals if arm_id == chosen_arm), None)
         if chosen_entry is None:
-            await _sleep_tick(settings, tick_start, as_of)
+            await _sleep_tick(settings, tick_start, replay_mode)
+            if replay_mode:
+                current_time += poll_delta
             continue
 
         capital = Decimal(str(current_nav))
-        max_loss_per_lot = Decimal(str(float(capital) * 0.01))  # rough 1% max loss per lot
-        estimated_costs = Decimal("250")  # STT + brokerage estimate
+        max_loss_per_lot = Decimal(str(float(capital) * 0.01))
+        estimated_costs = Decimal("250")
         expected_gross = Decimal(str(float(capital) * 0.02 * chosen_entry.strength))
 
         lots = compute_lots(
@@ -209,23 +254,35 @@ async def run_loop(
             expected_gross_pnl=expected_gross,
             open_exposure=_total_exposure(open_positions),
             lockin_active=circuit.lockin_active,
+            kelly_fraction=settings.laabh_quant_kelly_fraction,
+            max_per_trade_pct=settings.laabh_quant_max_per_trade_pct,
+            lockin_size_reduction=settings.laabh_quant_lockin_size_reduction,
+            max_total_exposure_pct=settings.laabh_quant_max_total_exposure_pct,
+            cost_gate_multiple=settings.laabh_quant_cost_gate_multiple,
         )
 
         if lots > 0:
+            chosen_symbol = arm_meta.get(chosen_arm, (chosen_arm, ""))[0]
+            chosen_underlying_id = underlying_map.get(chosen_symbol)
             pos = await _open_position(
                 chosen_arm, chosen_entry, lots, portfolio_id,
                 selector.posterior_mean(chosen_arm),
-                now_utc,
+                current_time,
+                underlying_id=chosen_underlying_id,
             )
             if pos:
                 open_positions.append(pos)
 
-        await _sleep_tick(settings, tick_start, as_of)
+        await _sleep_tick(settings, tick_start, replay_mode)
+        if replay_mode:
+            current_time += poll_delta
 
     # --- End of day ---
     logger.info(f"[QUANT] Hard exit time reached — closing {len(open_positions)} positions")
     for pos in list(open_positions):
-        premium = await _get_premium(pos)
+        symbol = arm_meta.get(pos.arm_id, (pos.arm_id, ""))[0]
+        bundle = features_map.get(symbol)
+        premium = _get_premium_from_bundle(pos, bundle) if bundle else pos.entry_premium_net
         await _close_position(pos, premium, "time_stop", portfolio_id)
 
     final_nav = await _get_nav(portfolio_id)
@@ -241,20 +298,21 @@ async def run_loop(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _symbol_from_arm(arm_id: str) -> str:
-    from src.quant.persistence import _split_arm
-    symbol, _ = _split_arm(arm_id)
-    return symbol
-
-
 def _total_exposure(positions: list[OpenPosition]) -> Decimal:
     return sum((p.entry_premium_net for p in positions), Decimal("0"))
+
+
+def _get_premium_from_bundle(pos: OpenPosition, bundle) -> Decimal:
+    """Return current ATM mid premium from feature bundle, falling back to entry."""
+    if bundle is not None and bundle.atm_bid and bundle.atm_ask:
+        mid = (bundle.atm_bid + bundle.atm_ask) / Decimal("2")
+        return mid
+    return pos.entry_premium_net
 
 
 async def _get_nav(portfolio_id: uuid.UUID) -> float:
     """Return current_cash + invested_value from portfolios table."""
     from src.db import session_scope
-    from sqlalchemy import select
     from src.models.portfolio import Portfolio
 
     async with session_scope() as session:
@@ -264,13 +322,6 @@ async def _get_nav(portfolio_id: uuid.UUID) -> float:
         return float(row.current_cash or 0) + float(row.invested_value or 0)
 
 
-async def _get_premium(pos: OpenPosition) -> Decimal:
-    """Return estimated current mid premium (stub — integrates with chain in live mode)."""
-    # In live mode this would query options_chain for current ATM mid.
-    # For now, return entry_premium_net as a neutral placeholder.
-    return pos.entry_premium_net
-
-
 async def _open_position(
     arm_id: str,
     signal,
@@ -278,22 +329,27 @@ async def _open_position(
     portfolio_id: uuid.UUID,
     posterior_mean: float,
     now: datetime,
+    *,
+    underlying_id: uuid.UUID | None,
 ) -> OpenPosition | None:
     """Record a new quant trade in the DB and return an OpenPosition."""
     from src.db import session_scope
     from src.models.quant_trade import QuantTrade
-    from src.quant.persistence import _split_arm
-    import time as _time
 
-    symbol, primitive_name = _split_arm(arm_id)
+    if underlying_id is None:
+        logger.error(f"[QUANT] No underlying_id for {arm_id} — skipping open")
+        return None
+
     entry_premium = Decimal("100")  # stub — real impl queries live chain
+    # Deterministic seed from portfolio + arm + date for reproducibility
+    bandit_seed = abs(hash((str(portfolio_id), arm_id, now.date().isoformat()))) % (2**31)
 
     try:
         async with session_scope() as session:
             trade = QuantTrade(
                 portfolio_id=portfolio_id,
-                underlying_id=uuid.uuid4(),  # placeholder until universe mapping wired
-                primitive_name=primitive_name,
+                underlying_id=underlying_id,
+                primitive_name=arm_id.split("_", 1)[-1],
                 arm_id=arm_id,
                 direction=signal.strategy_class,
                 legs={},
@@ -303,7 +359,7 @@ async def _open_position(
                 signal_strength_at_entry=signal.strength,
                 posterior_mean_at_entry=posterior_mean,
                 sampled_mean_at_entry=posterior_mean,
-                bandit_seed=int(_time.time()),
+                bandit_seed=bandit_seed,
                 kelly_fraction=0.5,
                 lots=lots,
                 status="open",
@@ -315,12 +371,12 @@ async def _open_position(
 
     pos = OpenPosition(
         arm_id=arm_id,
-        underlying_id=symbol,
+        underlying_id=str(underlying_id),
         direction="bullish" if "call" in signal.strategy_class else "bearish",
         entry_premium_net=entry_premium,
         entry_at=now,
     )
-    pos.initial_risk_r = entry_premium * Decimal("0.2")  # 20% of premium
+    pos.initial_risk_r = entry_premium * Decimal("0.2")
     logger.info(f"[QUANT] Opened {arm_id} × {lots} lots @ {entry_premium}")
     return pos
 
@@ -335,7 +391,6 @@ async def _close_position(
     from src.db import session_scope
     from sqlalchemy import select
     from src.models.quant_trade import QuantTrade
-    from datetime import datetime, timezone
 
     pnl = exit_premium - pos.entry_premium_net
     try:
@@ -379,7 +434,8 @@ async def _init_day_state(
                 portfolio_id=portfolio_id,
                 date=today,
                 starting_nav=starting_nav,
-                universe=[str(u["id"]) for u in universe],
+                # Store {id, symbol} dicts so reports can map back to symbols
+                universe=[{"id": str(u["id"]), "symbol": u["symbol"]} for u in universe],
                 lockin_target_pct=settings.laabh_quant_lockin_target_pct,
                 kill_switch_pct=settings.laabh_quant_kill_switch_dd_pct,
                 bandit_algo=settings.laabh_quant_bandit_algo,
@@ -398,6 +454,7 @@ async def _finalize_day_state(
     from src.models.quant_day_state import QuantDayState
     from sqlalchemy import select, func
     from src.models.quant_trade import QuantTrade
+    from src.quant.reports import _day_start
 
     async with session_scope() as session:
         state = await session.get(QuantDayState, (portfolio_id, today))
@@ -405,16 +462,17 @@ async def _finalize_day_state(
             state.final_nav = final_nav
             state.pnl_pct = (final_nav - starting_nav) / starting_nav if starting_nav else 0.0
 
-            # Count trades
+            # Count only today's trades for this portfolio
             q = select(func.count()).where(
                 QuantTrade.portfolio_id == portfolio_id,
+                QuantTrade.entry_at >= _day_start(today),
             )
             state.trade_count = (await session.execute(q)).scalar() or 0
 
 
-async def _sleep_tick(settings, tick_start: datetime, as_of: datetime | None) -> None:
-    if as_of is not None:
-        return  # In replay mode, don't sleep
+async def _sleep_tick(settings, tick_start: datetime, replay_mode: bool) -> None:
+    if replay_mode:
+        return  # In replay mode, don't sleep — advance time externally
     elapsed = (datetime.now(timezone.utc) - tick_start).total_seconds()
     sleep_sec = max(0.0, settings.laabh_quant_poll_interval_sec - elapsed)
     if sleep_sec > 0:

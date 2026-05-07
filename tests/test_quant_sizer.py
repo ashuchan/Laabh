@@ -1,18 +1,14 @@
 """Tests for quant position sizer."""
 from __future__ import annotations
 
-import os
 from decimal import Decimal
-from unittest.mock import patch
 
 import pytest
 
+from src.quant.sizer import compute_lots
+
 
 def _compute(**overrides):
-    from src.config import get_settings
-    get_settings.cache_clear()
-    from src.quant.sizer import compute_lots
-
     defaults = dict(
         posterior_mean=0.02,
         portfolio_capital=Decimal("1000000"),
@@ -21,6 +17,12 @@ def _compute(**overrides):
         expected_gross_pnl=Decimal("2000"),
         open_exposure=Decimal("0"),
         lockin_active=False,
+        # Explicit sizing params (mirrors config defaults)
+        kelly_fraction=0.5,
+        max_per_trade_pct=0.03,
+        lockin_size_reduction=0.5,
+        max_total_exposure_pct=0.30,
+        cost_gate_multiple=3.0,
     )
     defaults.update(overrides)
     return compute_lots(**defaults)

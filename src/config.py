@@ -345,6 +345,11 @@ class Settings(BaseSettings):
     laabh_quant_hard_exit_time: time = Field(
         default=time(14, 30), alias="LAABH_QUANT_HARD_EXIT_TIME"
     )
+    # Name of the portfolio to use for quant mode. Falls back to the first
+    # active portfolio when unset (suitable for single-portfolio deployments).
+    laabh_quant_portfolio_name: str = Field(
+        default="", alias="LAABH_QUANT_PORTFOLIO_NAME"
+    )
 
     @property
     def sync_database_url(self) -> str:

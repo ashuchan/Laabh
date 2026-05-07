@@ -269,7 +269,8 @@ async def _fno_morning_brief() -> None:
     from src.fno.orchestrator import _send_morning_brief
     from src.config import get_settings as _gs
     mode = _gs().laabh_intraday_mode.upper()
-    await _send_morning_brief(mode_tag=f"[{mode}]")
+    # Square brackets must be escaped in MarkdownV2
+    await _send_morning_brief(mode_tag=f"\\[{mode}\\]")
 
 
 async def _quant_orchestrator_loop() -> None:
@@ -278,9 +279,12 @@ async def _quant_orchestrator_loop() -> None:
     from src.models.portfolio import Portfolio
     from sqlalchemy import select
 
-    # Pick the first active portfolio; for multi-portfolio support extend here.
+    settings = get_settings()
     async with session_scope() as session:
-        row = (await session.execute(select(Portfolio).limit(1))).scalar_one_or_none()
+        q = select(Portfolio).where(Portfolio.is_active == True)
+        if settings.laabh_quant_portfolio_name:
+            q = q.where(Portfolio.name == settings.laabh_quant_portfolio_name)
+        row = (await session.execute(q.limit(1))).scalar_one_or_none()
         if row is None:
             logger.warning("[QUANT] No portfolio found — orchestrator loop not started")
             return

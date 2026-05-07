@@ -1,16 +1,14 @@
 """Layer 5 — Day-level circuit breaker.
 
 Rules:
- - Lock-in:   nav_pct >= LOCKIN_TARGET_PCT → sizer halves f_max (flag only here)
- - Kill:      nav_pct <= -KILL_SWITCH_DD_PCT → no new entries
- - Cool-off:  ≥ COOLOFF_CONSECUTIVE_LOSSES losses on one arm → skip arm for N min
+ - Lock-in:   nav_pct >= lockin_target_pct → sizer halves f_max (flag only here)
+ - Kill:      nav_pct <= -kill_switch_dd_pct → no new entries
+ - Cool-off:  ≥ cooloff_consecutive_losses losses on one arm → skip arm for N min
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-
-from src.config import get_settings
 
 
 @dataclass
@@ -18,6 +16,11 @@ class CircuitState:
     """Mutable day-level state shared by sizer and orchestrator."""
 
     starting_nav: float
+    lockin_target_pct: float = 0.05
+    kill_switch_dd_pct: float = 0.03
+    cooloff_consecutive_losses: int = 3
+    cooloff_minutes: int = 30
+
     lockin_active: bool = False
     kill_active: bool = False
     lockin_fired_at: datetime | None = None
@@ -28,24 +31,24 @@ class CircuitState:
 
     def check_and_fire(self, current_nav: float, now: datetime) -> None:
         """Evaluate NAV-based rules and update flags (idempotent)."""
-        settings = get_settings()
+        if self.starting_nav == 0:
+            return
         nav_pct = (current_nav - self.starting_nav) / self.starting_nav
 
-        if not self.lockin_active and nav_pct >= settings.laabh_quant_lockin_target_pct:
+        if not self.lockin_active and nav_pct >= self.lockin_target_pct:
             self.lockin_active = True
             self.lockin_fired_at = now
 
-        if not self.kill_active and nav_pct <= -settings.laabh_quant_kill_switch_dd_pct:
+        if not self.kill_active and nav_pct <= -self.kill_switch_dd_pct:
             self.kill_active = True
             self.kill_fired_at = now
 
     def record_loss(self, arm_id: str, now: datetime) -> None:
         """Increment loss counter for *arm_id* and set cooloff if threshold hit."""
-        settings = get_settings()
         count = self._arm_consecutive_losses.get(arm_id, 0) + 1
         self._arm_consecutive_losses[arm_id] = count
-        if count >= settings.laabh_quant_cooloff_consecutive_losses:
-            until = now + timedelta(minutes=settings.laabh_quant_cooloff_minutes)
+        if count >= self.cooloff_consecutive_losses:
+            until = now + timedelta(minutes=self.cooloff_minutes)
             self._arm_cooloff_until[arm_id] = until
             self._arm_consecutive_losses[arm_id] = 0
 

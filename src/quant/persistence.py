@@ -7,17 +7,13 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
-from typing import TYPE_CHECKING
 
 from loguru import logger
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from src.config import get_settings
 from src.db import session_scope
 from src.quant.bandit.selector import ArmSelector
-
-if TYPE_CHECKING:
-    pass
 
 
 async def save_eod(
@@ -42,6 +38,8 @@ async def save_eod(
     from src.models.bandit_arm_state import BanditArmState
 
     settings = get_settings()
+    is_lints = settings.laabh_quant_bandit_algo == "lints"
+
     async with session_scope() as session:
         for arm_id in arms:
             symbol, primitive_name = _split_arm(arm_id)
@@ -52,7 +50,6 @@ async def save_eod(
             mean = selector.posterior_mean(arm_id)
             var = selector.posterior_var(arm_id)
 
-            # Upsert (insert or update)
             existing = await session.get(
                 BanditArmState,
                 (portfolio_id, underlying_id, primitive_name, trading_date),
@@ -68,20 +65,27 @@ async def save_eod(
                     n_observations=0,
                 )
                 session.add(state)
+                target = state
             else:
                 existing.posterior_mean = mean
                 existing.posterior_var = var
                 existing.last_updated_at = datetime.now(timezone.utc)
+                target = existing
 
-            # LinTS extras
-            if settings.laabh_quant_bandit_algo == "lints":
+            # LinTS extras: store theta_hat (MAP estimate), A_inv, and b_vector
+            if is_lints:
                 lints_impl = getattr(selector, "_impl", None)
                 if lints_impl and hasattr(lints_impl, "state_for_db"):
                     d = lints_impl.state_for_db(arm_id)
-                    target = existing if existing else state
-                    target.theta = d.get("b")
-                    target.a_inv = d.get("a_inv")
-                    target.b_vector = d.get("b")
+                    if d:
+                        # theta_hat = a_inv @ b (MAP estimate, not raw response sum)
+                        a_inv = d.get("a_inv")
+                        b_vec = d.get("b")
+                        import numpy as np
+                        theta_hat = (np.array(a_inv) @ np.array(b_vec)).tolist() if (a_inv and b_vec) else None
+                        target.theta = theta_hat
+                        target.a_inv = a_inv
+                        target.b_vector = b_vec
 
     logger.info(f"save_eod: wrote {len(arms)} arm posteriors for {trading_date}")
 
@@ -139,7 +143,12 @@ async def load_morning(
             decayed_mean = float(row.posterior_mean or settings.laabh_quant_bandit_prior_mean)
 
             # Patch the selector's internal posterior
-            _patch_posterior(selector, arm_id, mean=decayed_mean, var=decayed_var)
+            _patch_posterior(
+                selector, arm_id,
+                mean=decayed_mean, var=decayed_var,
+                a_inv=row.a_inv, b_vector=row.b_vector,
+                gamma=gamma,
+            )
 
     logger.info(f"load_morning: loaded posteriors for {trading_date} with γ={gamma}")
     return selector
@@ -162,7 +171,16 @@ def _split_arm(arm_id: str) -> tuple[str, str]:
     return (parts[0], parts[1]) if len(parts) == 2 else (arm_id, "unknown")
 
 
-def _patch_posterior(selector: ArmSelector, arm_id: str, *, mean: float, var: float) -> None:
+def _patch_posterior(
+    selector: ArmSelector,
+    arm_id: str,
+    *,
+    mean: float,
+    var: float,
+    a_inv=None,
+    b_vector=None,
+    gamma: float = 1.0,
+) -> None:
     """Directly overwrite the in-memory posterior for one arm."""
     from src.quant.bandit.posterior import PosteriorState
 
@@ -173,5 +191,13 @@ def _patch_posterior(selector: ArmSelector, arm_id: str, *, mean: float, var: fl
             old = impl._posteriors[arm_id]
             impl._posteriors[arm_id] = PosteriorState(mean=mean, var=var, n_obs=old.n_obs)
     elif hasattr(impl, "_states"):
-        # LinTSSampler — only patch the per-arm mean scalar; full state is in JSONB
-        pass
+        # LinTSSampler — restore full state from JSONB if available
+        if a_inv is not None and b_vector is not None:
+            import numpy as np
+            from src.quant.bandit.lints import LinTSArmState
+            restored = LinTSArmState(
+                a_inv=np.array(a_inv) / gamma,  # γ-decay A_inv (widens posterior)
+                b=np.array(b_vector),
+                n_obs=0,
+            )
+            impl._states[arm_id] = restored
