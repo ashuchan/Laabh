@@ -73,6 +73,7 @@ class CEOJudgeOutputValidated(BaseModel):
     @field_validator("allocation")
     @classmethod
     def no_duplicate_non_hedge_positions(cls, v: list[Allocation]) -> list[Allocation]:
+        import logging as _log
         seen: dict[str, list[str]] = {}
         for alloc in v:
             sym = alloc.underlying_or_symbol
@@ -80,8 +81,12 @@ class CEOJudgeOutputValidated(BaseModel):
                 seen.setdefault(sym, []).append(alloc.asset_class)
         for sym, classes in seen.items():
             if len(classes) > 1 and "cash" not in classes:
-                # Both fno and equity on same underlying — caveat (not rejection)
-                pass  # soft check only
+                # Both fno and equity on same underlying — log a caveat but allow through.
+                # This is intentional: hedged pairs (e.g. short fno + long equity) are valid.
+                _log.getLogger(__name__).warning(
+                    "Allocation has both %s asset classes for %r — verify this is intentional.",
+                    classes, sym,
+                )
         return v
 
     @field_validator("expected_book_pnl_pct")

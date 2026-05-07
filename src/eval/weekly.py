@@ -7,7 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from statistics import mean, stdev
+from statistics import mean
 from typing import Any
 from uuid import uuid4
 
@@ -24,6 +24,7 @@ class WeekData:
     end: date
     workflow_runs: list[dict] = field(default_factory=list)
     agent_runs: list[dict] = field(default_factory=list)
+    all_predictions_count: int = 0          # all predictions regardless of outcome resolution
     resolved_predictions: list[dict] = field(default_factory=list)
     shadow_eval_scores: list[dict] = field(default_factory=list)
 
@@ -40,7 +41,7 @@ async def fetch_week_data(start: date, end: date, db_session_factory) -> WeekDat
                            total_tokens, params, started_at
                     FROM workflow_runs
                     WHERE started_at >= :start AND started_at < :end
-                      AND status IN ('succeeded', 'succeeded_with_caveats')
+                      AND status = 'succeeded'
                     ORDER BY started_at
                 """),
                 {"start": start, "end": end + timedelta(days=1)},
@@ -61,6 +62,16 @@ async def fetch_week_data(start: date, end: date, db_session_factory) -> WeekDat
                     {"ids": run_ids},
                 )
                 week.agent_runs = [dict(r._mapping) for r in result.fetchall()]
+
+            # Total prediction count (regardless of outcome resolution)
+            count_result = await db.execute(
+                text("""
+                    SELECT COUNT(*) FROM agent_predictions
+                    WHERE created_at >= :start AND created_at < :end
+                """),
+                {"start": start, "end": end + timedelta(days=1)},
+            )
+            week.all_predictions_count = count_result.scalar() or 0
 
             # Resolved predictions with outcomes
             result = await db.execute(
@@ -194,8 +205,8 @@ def render_markdown_report(
         f"**Period:** {week.start} to {week.end}",
         f"**Workflows run:** {len(week.workflow_runs)}",
         f"**Total LLM spend:** ${cost_correct['total_llm_cost_usd']:.2f}",
-        f"**Total predictions:** {cost_correct['n_predictions']}",
-        f"**Resolved predictions:** {len(week.resolved_predictions)}",
+        f"**Total predictions:** {week.all_predictions_count}",
+        f"**Resolved predictions:** {len(week.resolved_predictions)} of {week.all_predictions_count}",
         "",
         "---",
         "",

@@ -121,6 +121,7 @@ class WorkflowRunResult:
     agent_run_results: list[AgentRunResult]
     predictions: list[dict]
     validator_outcomes: list[dict]
+    stage_outputs: dict = field(default_factory=dict)
     error: str | None = None
     short_circuit_reason: str | None = None
 
@@ -170,3 +171,8 @@ class WorkflowContext:
     telegram: Any = None
     is_replay: bool = False
     persona_version_overrides: dict[str, str] = field(default_factory=dict)
+    # from_agent: if set, agents at or after this name in the pipeline make live
+    # API calls; agents before it are served from the audit-log cache.
+    from_agent: str | None = None
+    # Tracks whether we have seen the from_agent yet during this replay.
+    _replay_live_mode: bool = False

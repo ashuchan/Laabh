@@ -43,7 +43,8 @@ def compute_cost(model: str, usage: object) -> Decimal:
     cache_write = Decimal(getattr(usage, "cache_creation_input_tokens", 0) or 0)
 
     # Cache reads replace some input tokens; adjust the billable input accordingly.
-    billable_input = input_tokens - cache_read
+    # Clamp to 0 — cache_read can exceed input_tokens when the entire prompt is cached.
+    billable_input = max(Decimal("0"), input_tokens - cache_read)
 
     cost = (
         billable_input / _MILLION * prices["input"]

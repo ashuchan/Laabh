@@ -78,11 +78,28 @@ async def run_prompt_version_ab(
 
 
 def _extract_expected_pnl(workflow_run: dict) -> float | None:
+    """Extract expected P&L from an original workflow_run row.
+
+    workflow_runs.params contains inputs, not outputs. The judge's expected P&L
+    lives in stage_outputs (if pre-joined) or is unavailable from the DB row alone.
+    """
+    stage_outputs = workflow_run.get("stage_outputs") or {}
+    verdict = stage_outputs.get("judge_verdict") or {}
+    pnl = verdict.get("expected_book_pnl_pct")
+    if pnl is not None:
+        return float(pnl)
+    # Fallback: operator-seeded runs may include this in params
     params = workflow_run.get("params") or {}
-    return params.get("expected_book_pnl_pct")
+    p = params.get("expected_book_pnl_pct")
+    return float(p) if p is not None else None
 
 
 def _extract_expected_pnl_from_result(result: Any) -> float | None:
+    stage_outputs = getattr(result, "stage_outputs", {}) or {}
+    verdict = stage_outputs.get("judge_verdict") or {}
+    pnl = verdict.get("expected_book_pnl_pct")
+    if pnl is not None:
+        return float(pnl)
     predictions = getattr(result, "predictions", [])
     if not predictions:
         return None
@@ -90,13 +107,17 @@ def _extract_expected_pnl_from_result(result: Any) -> float | None:
 
 
 def _decisions_changed(original_run: dict, replay_result: Any) -> bool:
-    """Return True if the replay produced a different allocation than the original."""
-    original_params = original_run.get("params") or {}
-    original_decision = original_params.get("last_decision_summary", "")
+    """Return True if the replay produced a different decision_summary than the original."""
+    stage_outputs = original_run.get("stage_outputs") or {}
+    verdict = stage_outputs.get("judge_verdict") or {}
+    original_decision = verdict.get("decision_summary") or (
+        (original_run.get("params") or {}).get("last_decision_summary", "")
+    )
 
-    replay_predictions = getattr(replay_result, "predictions", [])
-    if not replay_predictions:
-        return False
+    replay_stage = getattr(replay_result, "stage_outputs", {}) or {}
+    replay_verdict = replay_stage.get("judge_verdict") or {}
+    replay_decision = replay_verdict.get("decision_summary", "")
 
-    replay_decision = replay_predictions[0].get("decision", "")
+    if not original_decision and not replay_decision:
+        return False  # neither run has a decision — treat as unchanged
     return original_decision != replay_decision

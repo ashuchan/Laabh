@@ -125,7 +125,8 @@ class WorkflowRunner:
         workflow_run_id = str(uuid4())
         async with self.db_session_factory() as db:
             await self._create_workflow_run_row(
-                db, workflow_run_id, workflow_spec, merged_params, triggered_by
+                db, workflow_run_id, workflow_spec, merged_params, triggered_by,
+                idempotency_key=idempotency_key,
             )
             await db.commit()
 
@@ -146,6 +147,7 @@ class WorkflowRunner:
             telegram=self.telegram,
             is_replay=triggered_by == "replay",
             persona_version_overrides=merged_params.get("persona_version_overrides", {}),
+            from_agent=merged_params.get("from_agent"),
         )
 
         # 5. Execute stages
@@ -296,6 +298,10 @@ class WorkflowRunner:
         prompt_messages = self._assemble_prompt(spec, invocation, ctx)
         input_tokens_estimate = self._estimate_input_tokens(spec, prompt_messages)
 
+        await self._persist_agent_run_started(
+            agent_run_id, sa, ctx, input_tokens_estimate, item_index=invocation.item_index
+        )
+
         if input_tokens_estimate > spec.max_input_tokens:
             failed = self._make_failed_result(
                 spec, agent_run_id, spec.model,
@@ -307,12 +313,17 @@ class WorkflowRunner:
 
         api_request = self._build_api_request(spec, prompt_messages, ctx)
 
-        await self._persist_agent_run_started(agent_run_id, sa, ctx, input_tokens_estimate)
-
         result = await self._execute_with_retries(spec, api_request, agent_run_id, ctx)
 
         if result.status == "succeeded" and spec.output_validator:
             result = await self._validate_output(spec, result, ctx)
+
+        if result.status == "succeeded" and spec.name == "shadow_evaluator":
+            try:
+                from src.eval.shadow import persist_shadow_eval_output
+                await persist_shadow_eval_output(result, ctx)
+            except Exception as e:
+                log.warning(f"shadow eval persist failed (non-fatal): {e}")
 
         await self._persist_agent_run_completed(result, ctx)
         return result
@@ -377,6 +388,7 @@ class WorkflowRunner:
         last_error: str = ""
         used_model = spec.model
         api_request_current = api_request
+        _used_fallback = False
 
         while transient_attempt <= spec.max_retries_transient:
             try:
@@ -443,7 +455,8 @@ class WorkflowRunner:
                 last_error = f"TimeoutError: {e}"
                 log.warning(f"[{spec.name}] timeout (attempt {transient_attempt})")
                 if transient_attempt > spec.max_retries_transient:
-                    if spec.fallback_model and spec.on_failure == "degrade":
+                    if spec.fallback_model and spec.on_failure == "degrade" and not _used_fallback:
+                        _used_fallback = True
                         used_model = spec.fallback_model
                         api_request_current = {**api_request_current, "model": spec.fallback_model}
                         transient_attempt = 0
@@ -461,8 +474,9 @@ class WorkflowRunner:
                     f"(attempt {transient_attempt}/{spec.max_retries_transient}): {last_error}"
                 )
                 if transient_attempt > spec.max_retries_transient:
-                    if spec.fallback_model and spec.on_failure == "degrade":
+                    if spec.fallback_model and spec.on_failure == "degrade" and not _used_fallback:
                         log.info(f"[{spec.name}] retrying with fallback {spec.fallback_model!r}")
+                        _used_fallback = True
                         used_model = spec.fallback_model
                         api_request_current = {**api_request_current, "model": spec.fallback_model}
                         transient_attempt = 0
@@ -476,10 +490,9 @@ class WorkflowRunner:
 
     async def _stream_response(self, spec: AgentSpec, api_request: dict, agent_run_id: str):
         """Stream Opus response; returns the final message object."""
-        full_content: list = []
         async with self.anthropic.messages.stream(**api_request) as stream:
-            async for event in stream:
-                pass  # progress handled; just drain
+            async for _event in stream:
+                pass  # drain stream; get_final_message() assembles the complete response
             return await stream.get_final_message()
 
     # ------------------------------------------------------------------
@@ -594,7 +607,9 @@ class WorkflowRunner:
                         "sym": alloc.get("underlying_or_symbol", ""),
                         "dec": alloc.get("decision", judge_verdict.get("decision_summary", "")),
                         "rat": judge_verdict.get("decision_summary"),
-                        "con": alloc.get("conviction", judge_verdict.get("confidence_in_allocation")),
+                        "con": alloc.get("conviction", judge_verdict.get(
+                            "calibration_self_check", {}
+                        ).get("confidence_in_allocation")),
                         "exp": judge_verdict.get("expected_book_pnl_pct"),
                         "max": judge_verdict.get("max_drawdown_tolerated_pct"),
                         "tgt": None,
@@ -623,6 +638,7 @@ class WorkflowRunner:
         sa: StageAgent,
         ctx: WorkflowContext,
         estimated_input_tokens: int,
+        item_index: int = 0,
     ) -> None:
         async with self.db_session_factory() as db:
             await db.execute(
@@ -642,7 +658,7 @@ class WorkflowRunner:
                     "ver": sa.persona_version,
                     "model": "tbd",
                     "est": estimated_input_tokens,
-                    "idx": 0,
+                    "idx": item_index,
                 },
             )
             await db.commit()
@@ -694,15 +710,16 @@ class WorkflowRunner:
         workflow_spec: WorkflowSpec,
         params: dict,
         triggered_by: str,
+        idempotency_key: str | None = None,
     ) -> None:
         await db.execute(
             text("""
                 INSERT INTO workflow_runs (
                     id, workflow_name, version, status, triggered_by,
-                    params, started_at, created_at
+                    params, idempotency_key, started_at, created_at
                 ) VALUES (
                     :id, :name, :ver, 'running', :tb,
-                    :params, NOW(), NOW()
+                    :params, :idem, NOW(), NOW()
                 )
             """),
             {
@@ -711,6 +728,7 @@ class WorkflowRunner:
                 "ver": workflow_spec.version,
                 "tb": triggered_by,
                 "params": json.dumps(params, default=str),
+                "idem": idempotency_key,
             },
         )
 
@@ -757,9 +775,22 @@ class WorkflowRunner:
             agent_run_results=ctx.agent_run_results,
             predictions=predictions or [],
             validator_outcomes=validator_outcomes or [],
+            stage_outputs=dict(ctx.stage_outputs),
             error=error,
             short_circuit_reason=short_circuit_reason,
         )
+
+    @staticmethod
+    def _safe_jsonb(data: object, limit: int = 65535) -> object:
+        """Serialize to JSON and return as dict/list for JSONB, or None if too large.
+
+        Truncating a JSON string before passing to a JSONB column causes a parse
+        error. We skip the field entirely rather than risk a broken INSERT.
+        """
+        serialised = json.dumps(data, default=str)
+        if len(serialised) > limit:
+            return None  # omit oversized payloads — audit row still written
+        return data  # pass native Python object; SQLAlchemy/asyncpg serialises to JSONB
 
     async def _write_llm_audit_log(
         self, spec: AgentSpec, model: str, api_request: dict,
@@ -769,6 +800,9 @@ class WorkflowRunner:
         try:
             log_id = str(uuid4())
             usage = response.usage
+            response_content = [
+                b.dict() if hasattr(b, "dict") else str(b) for b in response.content
+            ]
             async with self.db_session_factory() as db:
                 await db.execute(
                     text("""
@@ -789,11 +823,8 @@ class WorkflowRunner:
                         "caller": f"agent.{spec.name}",
                         "model": model,
                         "temp": spec.temperature,
-                        "prompt": json.dumps(api_request.get("messages", [])[:1], default=str),
-                        "resp": json.dumps(
-                            [b.dict() if hasattr(b, "dict") else str(b) for b in response.content],
-                            default=str,
-                        )[:65535],
+                        "prompt": json.dumps(api_request.get("messages", [])[:1], default=str)[:65535],
+                        "resp": json.dumps(response_content, default=str)[:65535],
                         "in_tok": getattr(usage, "input_tokens", None),
                         "out_tok": getattr(usage, "output_tokens", None),
                         "tag": f"agent.{spec.name}",
@@ -802,11 +833,8 @@ class WorkflowRunner:
                             "agent_run_id": agent_run_id,
                             "persona_version": spec.persona_version,
                         }),
-                        "req": json.dumps(api_request, default=str)[:65535],
-                        "res": json.dumps(
-                            [b.dict() if hasattr(b, "dict") else str(b) for b in response.content],
-                            default=str,
-                        )[:65535],
+                        "req": self._safe_jsonb(api_request),
+                        "res": self._safe_jsonb(response_content),
                         "cr": getattr(usage, "cache_read_input_tokens", 0) or 0,
                         "cc": getattr(usage, "cache_creation_input_tokens", 0) or 0,
                         "cost": float(compute_cost(model, usage)),
@@ -972,8 +1000,16 @@ class WorkflowRunner:
     def _evaluate_condition(self, condition: str | None, ctx: WorkflowContext) -> bool:
         if not condition:
             return True
+        # Use ast.literal_eval for simple equality checks, or a restricted namespace.
+        # We never load WorkflowSpecs from untrusted sources, but restrict builtins
+        # anyway as a defence-in-depth measure against future configuration changes.
         try:
-            return bool(eval(condition, {"ctx": ctx, "stage_outputs": ctx.stage_outputs}))  # noqa: S307
+            import ast
+            restricted_globals = {"__builtins__": {}, "stage_outputs": ctx.stage_outputs}
+            return bool(eval(  # noqa: S307
+                compile(ast.parse(condition, mode="eval"), "<condition>", "eval"),
+                restricted_globals,
+            ))
         except Exception as e:
             log.warning(f"Condition eval failed: {e}")
             return False
@@ -1030,19 +1066,36 @@ class WorkflowRunner:
 
     @staticmethod
     def _validator_severity(validator_name: str, error: dict) -> str:
-        """Hard validators fail the prediction; soft validators caveat it."""
-        hard_validators = {
-            "capital_pct_sums_to_at_most_100",
-            "at_risk_under_3pct",
-            "fno_legs_match_direction",
+        """Hard validators fail the prediction; soft validators caveat it.
+
+        Pydantic v2 field_validator errors carry the validator function name in
+        the 'ctx.error' or message string rather than in 'loc'.  We match against
+        known hard-validator substrings in the error message for reliability.
+        """
+        hard_msg_markers = {
+            "sums to",           # capital_pct_sums_to_at_most_100
+            "exceeds 40%",       # no_single_leg_over_40_pct (non-cash)
+            "max_drawdown",      # kill_switches_match_drawdown
+            "expected_pnl",      # expected_pnl_is_positive
         }
-        field = error.get("loc", ("",))[-1] if isinstance(error, dict) else ""
-        if validator_name in hard_validators or field in hard_validators:
+        msg = error.get("msg", "") if isinstance(error, dict) else ""
+        if any(marker in msg for marker in hard_msg_markers):
             return "hard"
         return "soft"
 
     def _is_overridden(self, spec: AgentSpec, ctx: WorkflowContext) -> bool:
-        return spec.name in ctx.persona_version_overrides
+        """Return True if this agent should make a live API call rather than serve from cache.
+
+        An agent is live if it has an explicit persona_version_override, OR if
+        from_agent is set and we have reached or passed that agent in the pipeline.
+        """
+        if spec.name in ctx.persona_version_overrides:
+            return True
+        if ctx.from_agent:
+            if spec.name == ctx.from_agent or ctx._replay_live_mode:
+                ctx._replay_live_mode = True  # flip on permanently once reached
+                return True
+        return False
 
     async def _fetch_from_audit_log(
         self, spec: AgentSpec, ctx: WorkflowContext, invocation: _AgentInvocation
@@ -1074,10 +1127,25 @@ class WorkflowRunner:
         return None
 
     def _materialize_result_from_audit(
-        self, cached: dict, spec: AgentSpec, agent_run_id: str
+        self, cached: list | dict, spec: AgentSpec, agent_run_id: str
     ) -> AgentRunResult:
-        """Convert a cached audit log response into an AgentRunResult."""
-        tool_input = cached.get("tool_input") or cached
+        """Convert a cached audit log response_body (list of content blocks) into an AgentRunResult.
+
+        response_body is stored as a JSONB array of Anthropic content blocks.
+        We extract the tool_use block's input, falling back to text content.
+        """
+        tool_input: dict | None = None
+        content_blocks = cached if isinstance(cached, list) else [cached]
+        for block in content_blocks:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                tool_input = block.get("input")
+                break
+        if tool_input is None:
+            # Fallback: concatenate text blocks
+            tool_input = {"_text": " ".join(
+                b.get("text", "") for b in content_blocks
+                if isinstance(b, dict) and b.get("type") == "text"
+            )}
         return AgentRunResult(
             agent_run_id=agent_run_id,
             agent_name=spec.name,
