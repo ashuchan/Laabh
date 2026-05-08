@@ -5,7 +5,9 @@ It scores every F&O instrument on three liquidity criteria and writes a
 `fno_candidates` row with phase=1 for each instrument that passes.
 
 Liquidity criteria (all three must pass):
-  1. ATM OI ≥ config.fno_phase1_min_atm_oi (default 50 000 contracts)
+  1. ATM OI ≥ config.fno_phase1_min_atm_oi (default 5 000 contracts for Tier 1,
+     1 000 for Tier 2 / untiered — calibrated against live intraday OI;
+     see src/config.py for the rationale)
   2. ATM bid-ask spread ≤ config.fno_phase1_max_spread_pct (default 1.5%)
   3. 5-day average equity volume ≥ config.fno_phase1_min_avg_volume (default 500 000 shares)
      (if no volume data, criterion is skipped — not treated as a fail)

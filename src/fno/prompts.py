@@ -5,7 +5,7 @@ Increment FNO_THESIS_PROMPT_VERSION whenever the prompt or schema changes.
 """
 from __future__ import annotations
 
-FNO_THESIS_PROMPT_VERSION = "v3"
+FNO_THESIS_PROMPT_VERSION = "v4"
 
 # Expected JSON response schema (for documentation + parsing validation):
 # {
@@ -71,7 +71,7 @@ violate any of them, downgrade to SKIP or HEDGE and name the rule):
 FNO_THESIS_USER_TEMPLATE = """\
 Instrument: {symbol} ({sector})
 Underlying price: ₹{underlying_price}
-IV Rank (52w): {iv_rank}%
+IV Rank (52w): {iv_rank_block}
 IV Regime: {iv_regime}
 OI Structure: {oi_structure}
 Days to nearest expiry: {days_to_expiry}
@@ -79,7 +79,7 @@ Days to nearest expiry: {days_to_expiry}
 Catalyst scores (0=max bearish, 10=max bullish):
 - News signals: {news_score}/10 ({bullish_count} bullish, {bearish_count} bearish in last {lookback_hours}h)
 - Market sentiment: {sentiment_score}/10
-- FII/DII activity: {fii_dii_score}/10 (FII net ₹{fii_net_cr}Cr, DII net ₹{dii_net_cr}Cr)
+- FII/DII activity: {fii_dii_block}
 - Macro alignment: {macro_align_score}/10 (key drivers: {macro_drivers})
 - Convergence: {convergence_score}/10
 - Composite: {composite_score}/10

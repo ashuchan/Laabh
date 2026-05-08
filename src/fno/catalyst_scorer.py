@@ -73,6 +73,56 @@ def _net_cr_to_score(net_cr: float, threshold: float) -> float:
     return round(5.0 + (net_cr / threshold) * 5.0, 2)
 
 
+def score_fii_dii_for_instrument(
+    market_fii_net_cr: float,
+    market_dii_net_cr: float,
+    stock_pct_change: float | None,
+    *,
+    alignment_bonus: float = 1.5,
+    pct_threshold: float = 0.5,
+) -> float:
+    """Per-instrument FII/DII score.
+
+    NSE doesn't publish per-stock FII flows on a daily cadence we can
+    cheaply consume, so this is an alignment proxy: take the market-wide
+    FII/DII signal and modulate it by *this* stock's recent price action.
+
+    Why: a market-wide bullish FII print is far more informative for a
+    stock that's *also* up than for one that's diverging — institutional
+    buying tends to concentrate in winners. Conversely a market-wide
+    bullish print where the stock is *down* is a divergence signal worth
+    discounting.
+
+    Rules:
+      - market_score > 5.5 (bullish) AND stock_pct >= +pct_threshold → +bonus
+      - market_score < 4.5 (bearish) AND stock_pct <= -pct_threshold → +bonus (alignment with selling)
+      - market_score > 5.5 AND stock_pct <= -pct_threshold → -bonus (divergence)
+      - market_score < 4.5 AND stock_pct >= +pct_threshold → -bonus (divergence)
+      - otherwise (neutral market or stock) → unchanged
+
+    Falls back to the unmodulated market score when ``stock_pct_change`` is
+    None (no recent price data for the instrument).
+    """
+    market_score = score_fii_dii(market_fii_net_cr, market_dii_net_cr)
+    if stock_pct_change is None:
+        return market_score
+
+    market_dir = 1 if market_score > 5.5 else (-1 if market_score < 4.5 else 0)
+    if market_dir == 0:
+        return market_score  # market signal too weak to modulate
+
+    stock_dir = (
+        1 if stock_pct_change >= pct_threshold
+        else (-1 if stock_pct_change <= -pct_threshold else 0)
+    )
+    if stock_dir == 0:
+        return market_score  # stock barely moved; no alignment info
+
+    if market_dir == stock_dir:
+        return round(min(10.0, market_score + alignment_bonus), 2)
+    return round(max(0.0, market_score - alignment_bonus), 2)
+
+
 def score_macro(
     sector: str | None,
     macro_snapshots: dict[str, float],
@@ -108,21 +158,33 @@ def score_convergence(
     sentiment: float,
     fii_dii: float,
     macro: float,
+    *,
+    bullish_threshold: float = 5.5,
+    bearish_threshold: float = 4.5,
 ) -> float:
     """Score 0-10 measuring directional agreement across all four signals.
 
-    Counts how many dimensions are bullish (>6), bearish (<4), neutral (4-6).
-    Strong convergence (all agree) → 10 or 0. No convergence → 5.
+    Smooth gradient — each "leaning bullish" dimension (score > 5.5) lifts
+    convergence by 1.25; each "leaning bearish" (< 4.5) drops it by 1.25.
+    Result clipped to [0, 10].
+
+    Why this changed (2026-05-08): the prior step-function ("≥3 bullish to
+    move off 5.0") meant convergence stayed neutral whenever fewer than 3
+    of the 4 dimensions had real-and-strong signal. With sparse data
+    (news + sentiment populated, fii_dii + macro often defaulted to 5.0),
+    convergence was always 5.0 — and at 1.5× weight it dragged composites
+    down hard. The smoother gradient still rewards full agreement (4
+    bullish → 10.0) but no longer punishes 2-of-4 alignment.
+
+    The thresholds were also lowered (>6.0 → >5.5 bullish, <4.0 → <4.5
+    bearish) so "leaning" signals participate, not just "screaming" ones.
     """
     scores = [news, sentiment, fii_dii, macro]
-    bullish = sum(1 for s in scores if s > 6.0)
-    bearish = sum(1 for s in scores if s < 4.0)
-
-    if bullish >= 3:
-        return round(5.0 + (bullish / len(scores)) * 5.0, 2)
-    if bearish >= 3:
-        return round(5.0 - (bearish / len(scores)) * 5.0, 2)
-    return 5.0
+    n = len(scores)
+    bullish = sum(1 for s in scores if s > bullish_threshold)
+    bearish = sum(1 for s in scores if s < bearish_threshold)
+    delta = (bullish - bearish) * (5.0 / n)
+    return round(max(0.0, min(10.0, 5.0 + delta)), 2)
 
 
 def compute_composite(
@@ -239,6 +301,37 @@ async def _get_phase1_candidates(session, run_date: date) -> list[tuple[str, str
     return [(str(r.instrument_id), r.symbol) for r in result.all()]
 
 
+async def _get_recent_pct_change(
+    session,
+    instrument_id: str,
+) -> float | None:
+    """Latest close vs prior close from price_daily for one instrument.
+
+    Returns ``None`` when fewer than 2 non-null-close rows are available
+    (used by ``score_fii_dii_for_instrument`` to fall back to the raw
+    market-wide score).
+    """
+    from src.models.price import PriceDaily
+    # Filter `> 0` rather than just isnot(None): a suspended-trading row
+    # can carry close=0 and would silently divide-by-zero or produce
+    # spurious ±100% moves below.
+    rows = (await session.execute(
+        select(PriceDaily.close)
+        .where(
+            PriceDaily.instrument_id == instrument_id,
+            PriceDaily.close > 0,
+        )
+        .order_by(PriceDaily.date.desc())
+        .limit(2)
+    )).all()
+    if len(rows) < 2:
+        return None
+    latest, prior = float(rows[0].close), float(rows[1].close)
+    if prior <= 0 or latest <= 0:  # belt and suspenders
+        return None
+    return round((latest - prior) / prior * 100, 4)
+
+
 async def _get_news_counts(
     session,
     instrument_id: str,
@@ -262,8 +355,22 @@ async def _get_news_counts(
     return bullish, bearish
 
 
-async def _get_latest_fii_dii(session) -> tuple[float, float]:
-    """Return (fii_net_cr, dii_net_cr) from the most recent fii_dii raw_content."""
+async def get_latest_fii_dii(session) -> tuple[float | None, float | None]:
+    """Return (fii_net_cr, dii_net_cr) from the most recent fii_dii raw_content,
+    or (None, None) if no row exists or the JSON cannot be parsed.
+
+    Public (no underscore prefix) because both Phase 2 (here) and Phase 3
+    (``thesis_synthesizer.run_phase3``) need this same data and must agree
+    on the contract. Originally a private copy-pasted helper in both
+    modules; consolidated 2026-05-08 to a single canonical implementation
+    after a code review caught the divergence drift.
+
+    The previous version silently returned (0.0, 0.0) on any failure,
+    which made "no FII/DII data today" indistinguishable from "FII and
+    DII both flat at 0 Cr" in the LLM prompt. Returning None lets the
+    caller render an explicit "(data unavailable)" line so the LLM
+    doesn't apply the FII/DII alignment rule against zeros.
+    """
     import json
     result = await session.execute(
         select(RawContent.content_text)
@@ -273,12 +380,27 @@ async def _get_latest_fii_dii(session) -> tuple[float, float]:
     )
     row = result.scalar_one_or_none()
     if row is None:
-        return 0.0, 0.0
+        logger.warning(
+            "fno.catalyst: no fii_dii rows in raw_content — Phase 2 will treat "
+            "FII/DII as unavailable (downstream LLM prompt renders '(data unavailable)')"
+        )
+        return None, None
     try:
         data = json.loads(row)
-        return float(data.get("fii_net_cr", 0.0)), float(data.get("dii_net_cr", 0.0))
-    except Exception:
-        return 0.0, 0.0
+        fii = data.get("fii_net_cr")
+        dii = data.get("dii_net_cr")
+        if fii is None or dii is None:
+            logger.warning(
+                f"fno.catalyst: fii_dii row present but keys missing "
+                f"(fii_net_cr={fii}, dii_net_cr={dii}) — treating as unavailable"
+            )
+            return None, None
+        return float(fii), float(dii)
+    except Exception as exc:
+        logger.warning(
+            f"fno.catalyst: fii_dii row parse failed ({exc}) — treating as unavailable"
+        )
+        return None, None
 
 
 async def _get_latest_macro(session) -> dict[str, float]:
@@ -371,19 +493,26 @@ async def _upsert_phase2_candidate(
     run_date: date,
     news: float,
     sentiment: float,
-    fii_dii: float,
+    fii_dii: float | None,
     macro: float,
     convergence: float,
     composite: float,
     config_version: str,
 ) -> None:
+    """Upsert a Phase 2 candidate row.
+
+    ``fii_dii`` may be ``None`` to indicate the underlying FII/DII data
+    was unavailable for this run — Phase 3 reads None and renders
+    "(data unavailable)" rather than a misleading "5/10".
+    """
+    fii_dii_decimal = Decimal(str(fii_dii)) if fii_dii is not None else None
     stmt = pg_insert(FNOCandidate).values(
         instrument_id=instrument_id,
         run_date=run_date,
         phase=2,
         news_score=Decimal(str(news)),
         sentiment_score=Decimal(str(sentiment)),
-        fii_dii_score=Decimal(str(fii_dii)),
+        fii_dii_score=fii_dii_decimal,
         macro_align_score=Decimal(str(macro)),
         convergence_score=Decimal(str(convergence)),
         composite_score=Decimal(str(composite)),
@@ -394,7 +523,7 @@ async def _upsert_phase2_candidate(
         set_={
             "news_score": Decimal(str(news)),
             "sentiment_score": Decimal(str(sentiment)),
-            "fii_dii_score": Decimal(str(fii_dii)),
+            "fii_dii_score": fii_dii_decimal,
             "macro_align_score": Decimal(str(macro)),
             "convergence_score": Decimal(str(convergence)),
             "composite_score": Decimal(str(composite)),
@@ -415,7 +544,11 @@ class Phase2Result:
     passed: bool
     news_score: float = 5.0
     sentiment_score: float = 5.0
-    fii_dii_score: float = 5.0
+    # ``fii_dii_score`` is ``None`` when the underlying market FII/DII data
+    # was unavailable for the run — distinguishes "data missing" from "real
+    # neutral". Phase 3 reads the same shape from FNOCandidate.fii_dii_score
+    # and renders "(data unavailable)" in the LLM prompt.
+    fii_dii_score: float | None = 5.0
     macro_align_score: float = 5.0
     convergence_score: float = 5.0
     composite_score: float = 5.0
@@ -437,12 +570,17 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
 
     async with session_scope() as session:
         candidates = await _get_phase1_candidates(session, run_date)
-        fii_net, dii_net = await _get_latest_fii_dii(session)
+        fii_net, dii_net = await get_latest_fii_dii(session)
         macro_snaps = await _get_latest_macro(session)
         sentiment = await _get_sentiment_score(session)
         policy_articles = await _get_policy_articles(session, lookback)
 
-    fii_dii_s = score_fii_dii(fii_net, dii_net)
+    # Track whether FII/DII data is real or missing. When missing, we
+    # compute the composite using a neutral 5.0 contribution (so downstream
+    # math doesn't break) but write None to FNOCandidate.fii_dii_score so
+    # Phase 3 can render "(data unavailable)" instead of misleading "5/10".
+    fii_dii_available = fii_net is not None and dii_net is not None
+
     regime_bias = compute_regime_bias(policy_articles)
     if regime_bias != 0.0:
         logger.info(
@@ -464,13 +602,29 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
                     select(Instrument.sector).where(Instrument.id == inst_id)
                 )
                 sector = inst_row.scalar_one_or_none()
+                # Per-stock pct_change for the FII/DII alignment proxy
+                stock_pct = await _get_recent_pct_change(session, inst_id)
 
             news_s = score_news(bullish_ct, bearish_ct)
+            # Per-instrument FII/DII: market-wide flow modulated by this
+            # stock's recent price action. When the underlying flow data
+            # is unavailable, fold a neutral 5.0 into the composite math
+            # but track the unavailability so we can persist None.
+            if fii_dii_available:
+                fii_dii_s_real = score_fii_dii_for_instrument(
+                    fii_net, dii_net, stock_pct
+                )
+                fii_dii_s_for_math = fii_dii_s_real
+            else:
+                fii_dii_s_real = None
+                fii_dii_s_for_math = 5.0
             macro_s = score_macro(sector, macro_snaps)
             policy_s = score_policy_event(sector, policy_articles)
-            conv_s = score_convergence(news_s, sentiment, fii_dii_s, macro_s)
+            conv_s = score_convergence(
+                news_s, sentiment, fii_dii_s_for_math, macro_s
+            )
             comp_s = compute_composite(
-                news_s, sentiment, fii_dii_s, macro_s, conv_s,
+                news_s, sentiment, fii_dii_s_for_math, macro_s, conv_s,
                 w_news=cfg.fno_phase2_weight_news,
                 w_sentiment=cfg.fno_phase2_weight_sentiment,
                 w_fii_dii=cfg.fno_phase2_weight_fii_dii,
@@ -487,7 +641,11 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
                 passed=passed,
                 news_score=news_s,
                 sentiment_score=sentiment,
-                fii_dii_score=fii_dii_s,
+                # Pass the real per-instrument value through (may be None
+                # when market FII/DII data was unavailable). The DB row
+                # gets the same value via _upsert_phase2_candidate below,
+                # so in-memory result and persisted row agree on shape.
+                fii_dii_score=fii_dii_s_real,
                 macro_align_score=macro_s,
                 convergence_score=conv_s,
                 composite_score=comp_s,
@@ -496,9 +654,13 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
 
             if passed:
                 async with session_scope() as session:
+                    # Pass fii_dii_s_real (may be None) so the FNOCandidate
+                    # row reflects data availability — NOT fii_dii_s_for_math
+                    # which is the neutral 5.0 used only for composite math.
                     await _upsert_phase2_candidate(
                         session, inst_id, run_date,
-                        news_s, sentiment, fii_dii_s, macro_s, conv_s, comp_s,
+                        news_s, sentiment, fii_dii_s_real, macro_s,
+                        conv_s, comp_s,
                         config_ver,
                     )
                 logger.debug(f"fno.catalyst: {symbol} PASS composite={comp_s:.1f}")

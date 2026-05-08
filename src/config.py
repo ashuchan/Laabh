@@ -60,11 +60,16 @@ class Settings(BaseSettings):
     fno_module_enabled: bool = Field(default=False, alias="FNO_MODULE_ENABLED")
 
     # F&O Phase 1 (Universe filter)
-    fno_phase1_min_atm_oi: int = Field(default=50000, alias="FNO_PHASE1_MIN_ATM_OI")
+    # Calibrated 2026-05-08 against live ATM-OI distribution across the
+    # 215-instrument F&O universe (median 826, p75 1.6k, max 335k for NIFTY).
+    # The previous 50k/5k pair was tuned on EOD-settled OI and rejected ~96%
+    # of names against intraday snapshots. New pair admits the top ~95
+    # instruments (~44%) feeding Phase 2 a useful candidate pool.
+    fno_phase1_min_atm_oi: int = Field(default=5000, alias="FNO_PHASE1_MIN_ATM_OI")
     # Mid-cap (Tier 2) OI threshold — Tier 2 underlyings have ~10x lower
     # ATM OI than Tier 1 large-caps, so a single Nifty-50-calibrated
     # threshold rejects them all. Use a lower bar for Tier 2.
-    fno_phase1_min_atm_oi_tier2: int = Field(default=5000, alias="FNO_PHASE1_MIN_ATM_OI_TIER2")
+    fno_phase1_min_atm_oi_tier2: int = Field(default=1000, alias="FNO_PHASE1_MIN_ATM_OI_TIER2")
     # Spread = (ask-bid)/mid as decimal. Real-world ATM bid-ask on liquid
     # index/large-cap options is 0.1-2%; mid-caps run 2-5%. Default 0.05 (5%)
     # admits everything except genuinely illiquid contracts.
@@ -77,16 +82,48 @@ class Settings(BaseSettings):
 
     # F&O Phase 2 (Catalyst scoring)
     fno_phase2_news_lookback_hours: int = Field(default=18, alias="FNO_PHASE2_NEWS_LOOKBACK_HOURS")
-    # Composite is bounded [0, 10]; 10 is unreachable. 6.0 = "above neutral
-    # with at least one bullish dimension". Calibrated against the synthetic
-    # April 30 chain: this admits ~12-15% of evaluated candidates.
-    fno_phase2_min_composite_score: float = Field(default=6.0, alias="FNO_PHASE2_MIN_COMPOSITE_SCORE")
+    # Composite is bounded [0, 10]. The original 6.0 calibration was tuned
+    # on the synthetic April 30 chain when most dimensions were neutral
+    # defaults (5.0). With the smoother convergence rule and per-stock
+    # FII/DII alignment landed 2026-05-08, the realistic ceiling for a
+    # "real but not screaming" signal sits around 5.5-6.0 — admitting at
+    # 5.5 lets the LLM gate (the actual edge filter) see candidates
+    # instead of pre-filtering them out arithmetically.
+    fno_phase2_min_composite_score: float = Field(default=5.5, alias="FNO_PHASE2_MIN_COMPOSITE_SCORE")
     fno_phase2_target_output: int = Field(default=20, alias="FNO_PHASE2_TARGET_OUTPUT")
     fno_phase2_weight_news: float = Field(default=1.0, alias="FNO_PHASE2_WEIGHT_NEWS")
     fno_phase2_weight_sentiment: float = Field(default=1.0, alias="FNO_PHASE2_WEIGHT_SENTIMENT")
     fno_phase2_weight_fii_dii: float = Field(default=0.8, alias="FNO_PHASE2_WEIGHT_FII_DII")
     fno_phase2_weight_macro: float = Field(default=0.8, alias="FNO_PHASE2_WEIGHT_MACRO")
     fno_phase2_weight_convergence: float = Field(default=1.5, alias="FNO_PHASE2_WEIGHT_CONVERGENCE")
+
+    # F&O Sentiment collector (writes raw_content[media_type='sentiment'])
+    # Composite of VIX (fear gauge) + multi-horizon NIFTY/breadth trend.
+    # See src/collectors/sentiment_collector.py for the formula.
+    fno_sentiment_weight_vix: float = Field(default=0.20, alias="FNO_SENTIMENT_WEIGHT_VIX")
+    fno_sentiment_weight_1d: float = Field(default=0.30, alias="FNO_SENTIMENT_WEIGHT_1D")
+    fno_sentiment_weight_1w: float = Field(default=0.25, alias="FNO_SENTIMENT_WEIGHT_1W")
+    fno_sentiment_weight_1m: float = Field(default=0.25, alias="FNO_SENTIMENT_WEIGHT_1M")
+    # Multiplier applied to the 1-day weight when the most recent trading day
+    # is more than 1 calendar day behind today (Mondays + post-holiday).
+    # The 1d signal is fresher mid-week than after a weekend, so we discount it.
+    fno_sentiment_stale_1d_decay: float = Field(default=0.5, alias="FNO_SENTIMENT_STALE_1D_DECAY")
+    # Min instruments with both `t` and `t-N` closes for the breadth leg of a
+    # horizon to be valid. Below this, the breadth leg drops out for that horizon.
+    fno_sentiment_min_breadth_instruments: int = Field(
+        default=50, alias="FNO_SENTIMENT_MIN_BREADTH_INSTRUMENTS"
+    )
+    # Max age of the latest vix_ticks row before we fall back to yfinance.
+    fno_sentiment_vix_max_stale_hours: int = Field(
+        default=24, alias="FNO_SENTIMENT_VIX_MAX_STALE_HOURS"
+    )
+    # Symbol of the index instrument used as the trend-leg benchmark. The
+    # bootstrap creates 'NIFTY' from the F&O bhavcopy without price history;
+    # the original index seed populates 'NIFTY 50' with prices, so the
+    # default points at the latter.
+    fno_sentiment_index_symbol: str = Field(
+        default="NIFTY 50", alias="FNO_SENTIMENT_INDEX_SYMBOL"
+    )
 
     # F&O Phase 3 (Thesis synthesis)
     fno_phase3_target_output: int = Field(default=30, alias="FNO_PHASE3_TARGET_OUTPUT")

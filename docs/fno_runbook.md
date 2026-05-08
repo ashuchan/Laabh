@@ -20,9 +20,14 @@ Screens every `is_fno=true` instrument in the database:
 
 | Criterion | Default | Config key |
 |-----------|---------|-----------|
-| ATM OI ≥ N contracts | 50 000 | `FNO_PHASE1_MIN_ATM_OI` |
+| ATM OI ≥ N contracts (Tier 1) | 5 000 | `FNO_PHASE1_MIN_ATM_OI` |
+| ATM OI ≥ N contracts (Tier 2 / untiered) | 1 000 | `FNO_PHASE1_MIN_ATM_OI_TIER2` |
 | ATM bid-ask spread ≤ X% | 0.5% | `FNO_PHASE1_MAX_ATM_SPREAD_PCT` |
 | 5-day avg volume ≥ N | 10 000 | `FNO_PHASE1_MIN_AVG_VOLUME_5D` |
+
+> Thresholds were recalibrated 2026-05-08 against the live ATM-OI distribution
+> (median 826, p75 1.6k); the prior 50k / 5k pair was tuned on end-of-day
+> settled OI and rejected ~96% of underlyings against intraday snapshots.
 
 Instruments on the NSE F&O ban list are automatically excluded.
 
