@@ -72,6 +72,22 @@ def test_selection_deterministic_given_seed():
     assert r1 == r2
 
 
+def test_n_obs_starts_at_zero_and_increments():
+    ts = ThompsonSampler(["A", "B"], _rng())
+    assert ts.n_obs("A") == 0
+    assert ts.n_obs("B") == 0
+    ts.update("A", 0.05)
+    assert ts.n_obs("A") == 1
+    assert ts.n_obs("B") == 0
+    ts.update("A", 0.05)
+    assert ts.n_obs("A") == 2
+
+
+def test_n_obs_unknown_arm_returns_zero():
+    ts = ThompsonSampler(["A"], _rng())
+    assert ts.n_obs("Z") == 0
+
+
 def test_prefer_higher_reward_arm():
     """After many updates, sampler should prefer the arm with higher true mean."""
     arms = ["good", "bad"]

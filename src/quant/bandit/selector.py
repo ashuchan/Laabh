@@ -82,6 +82,10 @@ class ArmSelector:
     def posterior_var(self, arm: ArmId) -> float:
         return self._impl.posterior_var(arm)
 
+    def n_obs(self, arm: ArmId) -> int:
+        """Return the per-arm observation count from the active impl."""
+        return self._impl.n_obs(arm)
+
     def snapshot(self):
         return self._impl.snapshot()
 

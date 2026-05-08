@@ -76,6 +76,23 @@ def test_posterior_converges_towards_true_theta():
     assert abs(theta_hat[0] - true_theta[0]) < 0.02
 
 
+def test_n_obs_starts_at_zero_and_increments():
+    lints = LinTSSampler(["A", "B"], _rng())
+    ctx = _ctx()
+    assert lints.n_obs("A") == 0
+    assert lints.n_obs("B") == 0
+    lints.update("A", 0.05, context=ctx)
+    assert lints.n_obs("A") == 1
+    assert lints.n_obs("B") == 0
+    lints.update("A", 0.05, context=ctx)
+    assert lints.n_obs("A") == 2
+
+
+def test_n_obs_unknown_arm_returns_zero():
+    lints = LinTSSampler(["A"], _rng())
+    assert lints.n_obs("Z") == 0
+
+
 def test_state_for_db_round_trip():
     arms = ["A"]
     lints = LinTSSampler(arms, _rng(), prior_var=0.01)

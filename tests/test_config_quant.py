@@ -36,6 +36,21 @@ def test_config_quant_defaults():
     assert len(s.quant_primitives_list) == 6
 
 
+def test_cost_gate_multiple_accepts_zero():
+    """ge=0.0 escape hatch lets users disable the cost gate explicitly."""
+    s = _fresh_settings(LAABH_QUANT_COST_GATE_MULTIPLE="0")
+    assert s.laabh_quant_cost_gate_multiple == 0.0
+
+
+def test_kelly_fraction_rejects_above_one():
+    """Validators must reject obvious foot-guns like Kelly > 1."""
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _fresh_settings(LAABH_QUANT_KELLY_FRACTION="1.5")
+
+
 def test_config_quant_overrides():
     s = _fresh_settings(
         LAABH_INTRADAY_MODE="quant",

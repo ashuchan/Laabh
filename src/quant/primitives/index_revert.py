@@ -4,6 +4,12 @@ Only fires for index underlyings (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY).
 Z = (INDEX_LTP - basket × scaling) / basket_std_30d
 Signal: short if Z > 2, long if Z < -2.
 Requires features.constituent_basket_value to be populated.
+
+KNOWN LIMITATION: the scaling factor is approximated by
+    scaling = index_ltp[oldest] / basket[oldest]
+which drifts as constituent weights change. A proper offline-calibrated
+scaling (eg. from yesterday's close) should replace this before the
+primitive carries meaningful production weight.
 """
 from __future__ import annotations
 

@@ -37,8 +37,9 @@ def _bundle(ltp: float, vwap: float = 100.0, rv30: float = 1.0) -> FeatureBundle
 
 
 def _flat_history(n: int = 10) -> list[FeatureBundle]:
-    # Alternating up/down so is_trending() returns False (50% ups, within [0.25, 0.75])
-    return [_bundle(100.0 + (i % 2) * 0.01) for i in range(n)]
+    # Alternating ±1 around 100 → price_std ≈ 1.05, ratio of ups/downs ≈ 0.5
+    # so the trending gate stays open.
+    return [_bundle(99.0 + (i % 2) * 2.0) for i in range(n)]
 
 
 def test_no_signal_during_warmup():
@@ -48,7 +49,7 @@ def test_no_signal_during_warmup():
 
 def test_bearish_signal_when_z_exceeds_threshold():
     prim = VWAPRevertPrimitive()
-    # Z = (103 - 100) / 1.0 = 3.0 > 2.0 → bearish
+    # price_std ≈ 1.05 → Z = (103 - 100) / 1.05 ≈ 2.86 > 2 → bearish
     hist = _flat_history()
     sig = prim.compute_signal(_bundle(103.0), hist)
     assert sig is not None
@@ -59,7 +60,7 @@ def test_bearish_signal_when_z_exceeds_threshold():
 def test_bullish_signal_when_z_below_neg_threshold():
     prim = VWAPRevertPrimitive()
     hist = _flat_history()
-    # Z = (97 - 100) / 1.0 = -3 → bullish
+    # Z = (97 - 100) / 1.05 ≈ -2.86 → bullish
     sig = prim.compute_signal(_bundle(97.0), hist)
     assert sig is not None
     assert sig.direction == "bullish"
@@ -68,6 +69,7 @@ def test_bullish_signal_when_z_below_neg_threshold():
 def test_no_signal_inside_band():
     prim = VWAPRevertPrimitive()
     hist = _flat_history()
+    # Z = (101 - 100) / 1.05 ≈ 0.95 < 2 → no signal
     sig = prim.compute_signal(_bundle(101.0), hist)
     assert sig is None
 

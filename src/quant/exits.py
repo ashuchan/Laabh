@@ -8,11 +8,12 @@ Rules (in priority order):
        at +1R: move stop to breakeven
        at +2R: trail at 1R from peak
  3. Adverse-signal flip: same arm's signal flips with |strength| > 0.6 → close
- 4. Time stop: hard_exit_time (14:30 IST by default)
+ 4. Time stop: hard_exit_time (14:30 IST by default; configurable per call)
 """
 from __future__ import annotations
 
 import math
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
 from decimal import Decimal
@@ -33,6 +34,8 @@ class OpenPosition:
     direction: Literal["bullish", "bearish"]
     entry_premium_net: Decimal
     entry_at: datetime
+    lots: int = 1
+    trade_id: uuid.UUID | None = None   # DB row id, set by orchestrator after flush
     peak_premium: Decimal = field(init=False)
     initial_risk_r: Decimal = Decimal("0")   # set by orchestrator after open
 

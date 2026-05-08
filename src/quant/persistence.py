@@ -49,6 +49,7 @@ async def save_eod(
 
             mean = selector.posterior_mean(arm_id)
             var = selector.posterior_var(arm_id)
+            n_obs = selector.n_obs(arm_id)
 
             existing = await session.get(
                 BanditArmState,
@@ -62,13 +63,14 @@ async def save_eod(
                     date=trading_date,
                     posterior_mean=mean,
                     posterior_var=var,
-                    n_observations=0,
+                    n_observations=n_obs,
                 )
                 session.add(state)
                 target = state
             else:
                 existing.posterior_mean = mean
                 existing.posterior_var = var
+                existing.n_observations = n_obs
                 existing.last_updated_at = datetime.now(timezone.utc)
                 target = existing
 

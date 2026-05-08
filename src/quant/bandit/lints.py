@@ -148,6 +148,11 @@ class LinTSSampler:
             return self._prior_var
         return float(np.diag(self._states[arm].a_inv).mean())
 
+    def n_obs(self, arm: ArmId) -> int:
+        """Return the count of observations folded into *arm*'s posterior."""
+        state = self._states.get(arm)
+        return state.n_obs if state is not None else 0
+
     def state_for_db(self, arm: ArmId) -> dict:
         """Serialise state to JSONB-safe dict."""
         if arm not in self._states:

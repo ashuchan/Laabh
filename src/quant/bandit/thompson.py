@@ -95,3 +95,8 @@ class ThompsonSampler:
     def posterior_var(self, arm: ArmId) -> float:
         """Return the current posterior variance for *arm*."""
         return self._posteriors[arm].var if arm in self._posteriors else self._prior_var
+
+    def n_obs(self, arm: ArmId) -> int:
+        """Return the count of observations folded into *arm*'s posterior."""
+        post = self._posteriors.get(arm)
+        return post.n_obs if post is not None else 0

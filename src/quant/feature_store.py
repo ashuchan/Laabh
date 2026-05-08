@@ -172,7 +172,14 @@ async def get(
 # ---------------------------------------------------------------------------
 
 def _compute_vwap(ltps: list[float], vols: list[float]) -> float:
-    """Volume-weighted average price over available bars."""
+    """Volume-weighted average price over the supplied window.
+
+    Note: this is a *rolling-window* VWAP across the bars passed in (the
+    feature store loads the most-recent `history_rows` bars), not a strict
+    session-cumulative VWAP. Primitives that need session-VWAP semantics
+    should treat this as an approximation valid once enough warmup has
+    elapsed that the window covers the session.
+    """
     total_vol = sum(vols)
     if total_vol == 0 or not ltps:
         return ltps[-1] if ltps else 0.0
