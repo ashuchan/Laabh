@@ -1,7 +1,9 @@
 """Application configuration loaded from environment variables (.env)."""
 from __future__ import annotations
 
+from datetime import time
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -321,10 +323,105 @@ class Settings(BaseSettings):
         default="cached_or_live", alias="DRYRUN_LLM_MODE"
     )  # cached_or_live | mock | live
 
+    # --- Quant (bandit-orchestrated intraday F&O) ---
+    # LAABH_INTRADAY_MODE=quant bypasses all LLM intraday agents.
+    # Default "agentic" keeps existing behaviour unchanged.
+    laabh_intraday_mode: Literal["agentic", "quant"] = Field(
+        default="agentic", alias="LAABH_INTRADAY_MODE"
+    )
+    laabh_quant_poll_interval_sec: int = Field(
+        default=180, ge=1, le=3600, alias="LAABH_QUANT_POLL_INTERVAL_SEC"
+    )
+    laabh_quant_primitives_enabled: str = Field(
+        default="orb,vwap_revert,ofi,vol_breakout,momentum,index_revert",
+        alias="LAABH_QUANT_PRIMITIVES_ENABLED",
+    )
+    laabh_quant_min_signal_strength: float = Field(
+        default=0.4, ge=0.0, le=1.0, alias="LAABH_QUANT_MIN_SIGNAL_STRENGTH"
+    )
+    laabh_quant_bandit_algo: Literal["thompson", "lints"] = Field(
+        default="thompson", alias="LAABH_QUANT_BANDIT_ALGO"
+    )
+    laabh_quant_bandit_forget_factor: float = Field(
+        default=0.95, gt=0.0, le=1.0, alias="LAABH_QUANT_BANDIT_FORGET_FACTOR"
+    )
+    laabh_quant_bandit_prior_mean: float = Field(
+        default=0.0, alias="LAABH_QUANT_BANDIT_PRIOR_MEAN"
+    )
+    laabh_quant_bandit_prior_var: float = Field(
+        default=0.01, gt=0.0, alias="LAABH_QUANT_BANDIT_PRIOR_VAR"
+    )
+    laabh_quant_bandit_seed: int | None = Field(
+        default=None, alias="LAABH_QUANT_BANDIT_SEED"
+    )
+    laabh_quant_kelly_fraction: float = Field(
+        default=0.5, ge=0.0, le=1.0, alias="LAABH_QUANT_KELLY_FRACTION"
+    )
+    laabh_quant_max_per_trade_pct: float = Field(
+        default=0.03, gt=0.0, le=0.5, alias="LAABH_QUANT_MAX_PER_TRADE_PCT"
+    )
+    laabh_quant_max_total_exposure_pct: float = Field(
+        default=0.30, gt=0.0, le=1.0, alias="LAABH_QUANT_MAX_TOTAL_EXPOSURE_PCT"
+    )
+    laabh_quant_cost_gate_multiple: float = Field(
+        default=3.0, ge=0.0, alias="LAABH_QUANT_COST_GATE_MULTIPLE"
+    )
+    laabh_quant_lockin_target_pct: float = Field(
+        default=0.05, gt=0.0, le=1.0, alias="LAABH_QUANT_LOCKIN_TARGET_PCT"
+    )
+    laabh_quant_lockin_size_reduction: float = Field(
+        default=0.5, gt=0.0, le=1.0, alias="LAABH_QUANT_LOCKIN_SIZE_REDUCTION"
+    )
+    laabh_quant_kill_switch_dd_pct: float = Field(
+        default=0.03, gt=0.0, le=1.0, alias="LAABH_QUANT_KILL_SWITCH_DD_PCT"
+    )
+    laabh_quant_cooloff_consecutive_losses: int = Field(
+        default=3, ge=1, alias="LAABH_QUANT_COOLOFF_CONSECUTIVE_LOSSES"
+    )
+    laabh_quant_cooloff_minutes: int = Field(
+        default=30, ge=0, alias="LAABH_QUANT_COOLOFF_MINUTES"
+    )
+    laabh_quant_max_concurrent_positions: int = Field(
+        default=8, ge=1, alias="LAABH_QUANT_MAX_CONCURRENT_POSITIONS"
+    )
+    laabh_quant_universe_size_cap: int = Field(
+        default=20, ge=1, alias="LAABH_QUANT_UNIVERSE_SIZE_CAP"
+    )
+    laabh_quant_first_entry_after_minutes: int = Field(
+        default=30, ge=0, alias="LAABH_QUANT_FIRST_ENTRY_AFTER_MINUTES"
+    )
+    laabh_quant_hard_exit_time: time = Field(
+        default=time(14, 30), alias="LAABH_QUANT_HARD_EXIT_TIME"
+    )
+    # Per-lot risk budget — fraction of capital that may be lost on one lot
+    # before the trailing stop fires. Drives the sizer's lot count.
+    laabh_quant_max_loss_per_lot_pct: float = Field(
+        default=0.01, gt=0.0, le=0.5, alias="LAABH_QUANT_MAX_LOSS_PER_LOT_PCT"
+    )
+    # Estimated round-trip costs (brokerage + STT + slippage) per lot, in INR.
+    laabh_quant_estimated_costs_per_lot: float = Field(
+        default=250.0, ge=0.0, alias="LAABH_QUANT_ESTIMATED_COSTS_PER_LOT"
+    )
+    # Expected gross P&L scale — fraction of capital × signal strength used to
+    # estimate per-trade gross P&L for the cost gate.
+    laabh_quant_expected_gross_pnl_pct: float = Field(
+        default=0.02, gt=0.0, le=1.0, alias="LAABH_QUANT_EXPECTED_GROSS_PNL_PCT"
+    )
+    # Name of the portfolio to use for quant mode. Falls back to the first
+    # active portfolio when unset (suitable for single-portfolio deployments).
+    laabh_quant_portfolio_name: str = Field(
+        default="", alias="LAABH_QUANT_PORTFOLIO_NAME"
+    )
+
     @property
     def sync_database_url(self) -> str:
         """Sync URL for Alembic (replace asyncpg driver with psycopg2)."""
         return self.database_url.replace("+asyncpg", "+psycopg2")
+
+    @property
+    def quant_primitives_list(self) -> list[str]:
+        """Return enabled primitives as a parsed list."""
+        return [p.strip() for p in self.laabh_quant_primitives_enabled.split(",") if p.strip()]
 
 
 @lru_cache(maxsize=1)

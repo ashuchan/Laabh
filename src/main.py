@@ -49,7 +49,9 @@ def _shutdown_signals() -> tuple[int, ...]:
 
 async def _run() -> None:
     _configure_logging()
-    logger.info("Laabh Phase 1 starting")
+    settings = get_settings()
+    mode_tag = "[QUANT]" if settings.laabh_intraday_mode == "quant" else "[AGENTIC]"
+    logger.info(f"Laabh starting — intraday mode: {mode_tag}")
 
     scheduler = build_scheduler()
     scheduler.start()

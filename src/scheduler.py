@@ -279,7 +279,31 @@ async def _fno_eod_tasks() -> None:
 
 async def _fno_morning_brief() -> None:
     from src.fno.orchestrator import _send_morning_brief
-    await _send_morning_brief()
+    from src.config import get_settings as _gs
+    mode = _gs().laabh_intraday_mode.upper()
+    # Square brackets must be escaped in MarkdownV2
+    await _send_morning_brief(mode_tag=f"\\[{mode}\\]")
+
+
+async def _quant_orchestrator_loop() -> None:
+    """Launch the quant bandit-orchestrated intraday loop (blocks until EOD)."""
+    from src.db import session_scope
+    from src.models.portfolio import Portfolio
+    from sqlalchemy import select
+
+    settings = get_settings()
+    async with session_scope() as session:
+        q = select(Portfolio).where(Portfolio.is_active == True)
+        if settings.laabh_quant_portfolio_name:
+            q = q.where(Portfolio.name == settings.laabh_quant_portfolio_name)
+        row = (await session.execute(q.limit(1))).scalar_one_or_none()
+        if row is None:
+            logger.warning("[QUANT] No portfolio found — orchestrator loop not started")
+            return
+        portfolio_id = row.id
+
+    from src.quant.orchestrator import run_loop
+    await run_loop(portfolio_id)
 
 
 async def _fno_phase4_entry() -> None:
@@ -672,52 +696,69 @@ def build_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
     )
-    # 09:11 IST — morning brief (Phase 3 PROCEED summary to Telegram)
+    # 09:11 IST — morning brief (Phase 3 PROCEED summary to Telegram).
+    # Runs in BOTH agentic and quant modes; format tag adapts.
     sched.add_job(
         _fno_morning_brief,
         CronTrigger(hour=9, minute=11, day_of_week="mon-fri", timezone=ist),
         id="fno_morning_brief",
     )
-    # 09:15 IST — Phase 4 entry: open paper positions for each PROCEED.
-    # Runs once per day, four minutes after the morning brief, so the live
-    # 09:00 chain has had time to populate fresh bid/ask via the tier-1 cron.
-    sched.add_job(
-        _fno_phase4_entry,
-        CronTrigger(hour=9, minute=15, day_of_week="mon-fri", timezone=ist),
-        id="fno_phase4_entry",
-    )
-    # 09:16-14:30 IST every minute — Phase 4 manage tick: mark-to-market every
-    # open position, close on stop/target, update trailing stops, send alerts.
-    sched.add_job(
-        _fno_phase4_manage,
-        CronTrigger(
-            minute="*",
-            hour="9-14",
-            day_of_week="mon-fri",
-            timezone=ist,
-        ),
-        id="fno_phase4_manage",
-        max_instances=1,
-        coalesce=True,
-    )
-    # 14:30 IST — Phase 4 hard exit: force-close anything still open.
-    sched.add_job(
-        _fno_phase4_hard_exit,
-        CronTrigger(hour=14, minute=30, day_of_week="mon-fri", timezone=ist),
-        id="fno_phase4_hard_exit",
-    )
-    # 11:30 IST — mid-session position digest to Telegram (open trades + MTM).
-    sched.add_job(
-        _fno_phase4_position_digest,
-        CronTrigger(hour=11, minute=30, day_of_week="mon-fri", timezone=ist),
-        id="fno_phase4_digest_midday",
-    )
-    # 13:30 IST — second position digest before the hard-exit window.
-    sched.add_job(
-        _fno_phase4_position_digest,
-        CronTrigger(hour=13, minute=30, day_of_week="mon-fri", timezone=ist),
-        id="fno_phase4_digest_afternoon",
-    )
+
+    if settings.laabh_intraday_mode == "quant":
+        # --- Quant mode: bandit-orchestrated intraday loop ---
+        logger.info(
+            "[QUANT] intraday_mode=quant — Phase 4 agentic jobs skipped; "
+            "quant orchestrator registered instead"
+        )
+        sched.add_job(
+            _quant_orchestrator_loop,
+            CronTrigger(hour=9, minute=15, day_of_week="mon-fri", timezone=ist),
+            id="quant_orchestrator",
+            max_instances=1,
+            coalesce=True,
+        )
+    else:
+        # --- Agentic mode: existing Phase 4 jobs ---
+        # 09:15 IST — Phase 4 entry: open paper positions for each PROCEED.
+        # Runs once per day, four minutes after the morning brief, so the live
+        # 09:00 chain has had time to populate fresh bid/ask via the tier-1 cron.
+        sched.add_job(
+            _fno_phase4_entry,
+            CronTrigger(hour=9, minute=15, day_of_week="mon-fri", timezone=ist),
+            id="fno_phase4_entry",
+        )
+        # 09:16-14:30 IST every minute — Phase 4 manage tick: mark-to-market every
+        # open position, close on stop/target, update trailing stops, send alerts.
+        sched.add_job(
+            _fno_phase4_manage,
+            CronTrigger(
+                minute="*",
+                hour="9-14",
+                day_of_week="mon-fri",
+                timezone=ist,
+            ),
+            id="fno_phase4_manage",
+            max_instances=1,
+            coalesce=True,
+        )
+        # 14:30 IST — Phase 4 hard exit: force-close anything still open.
+        sched.add_job(
+            _fno_phase4_hard_exit,
+            CronTrigger(hour=14, minute=30, day_of_week="mon-fri", timezone=ist),
+            id="fno_phase4_hard_exit",
+        )
+        # 11:30 IST — mid-session position digest to Telegram (open trades + MTM).
+        sched.add_job(
+            _fno_phase4_position_digest,
+            CronTrigger(hour=11, minute=30, day_of_week="mon-fri", timezone=ist),
+            id="fno_phase4_digest_midday",
+        )
+        # 13:30 IST — second position digest before the hard-exit window.
+        sched.add_job(
+            _fno_phase4_position_digest,
+            CronTrigger(hour=13, minute=30, day_of_week="mon-fri", timezone=ist),
+            id="fno_phase4_digest_afternoon",
+        )
     # 15:40 IST — EOD IV history + daily summary
     sched.add_job(
         _fno_eod_tasks,
