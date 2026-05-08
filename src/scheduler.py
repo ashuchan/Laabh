@@ -518,8 +518,10 @@ def build_scheduler() -> AsyncIOScheduler:
     )
 
     # --- Phase 2.5: Equity strategy (LLM-driven paper trading) ---
-    # Gated behind EQUITY_STRATEGY_ENABLED so the cron stays absent when off.
-    if settings.equity_strategy_enabled:
+    # Gated behind both flags: EQUITY_TRADING_ENABLED is the master switch
+    # for any equity execution; EQUITY_STRATEGY_ENABLED toggles the LLM
+    # strategy specifically. When either is off the cron stays absent.
+    if settings.equity_trading_enabled and settings.equity_strategy_enabled:
         # 09:10 IST — morning allocation; BUYs fill at 09:15 open.
         sched.add_job(
             _run_equity_morning_allocation,
@@ -547,6 +549,8 @@ def build_scheduler() -> AsyncIOScheduler:
             id="equity_eod_squareoff",
         )
         logger.info("equity strategy enabled — morning/intraday/eod jobs registered")
+    elif not settings.equity_trading_enabled:
+        logger.info("equity trading disabled (EQUITY_TRADING_ENABLED=false) — strategy jobs skipped")
     else:
         logger.info("equity strategy disabled (EQUITY_STRATEGY_ENABLED=false)")
 

@@ -196,6 +196,15 @@ class Settings(BaseSettings):
     # --- Risk-free rate for Black-Scholes Greeks ---
     fno_risk_free_rate_pct: float = Field(default=6.5, alias="FNO_RISK_FREE_RATE_PCT")
 
+    # --- Equity Trading master switch ---
+    # When False, every code path that would create or trigger an EQUITY
+    # (non-F&O) paper trade is refused: the API endpoint returns 403, the
+    # LLM strategy jobs are not registered with the scheduler, pending
+    # limit/SL orders for equity instruments are skipped by the order book,
+    # and the catch-up reconciler ignores the equity daily-critical jobs.
+    # F&O paths are unaffected. Default True keeps current behaviour.
+    equity_trading_enabled: bool = Field(default=True, alias="EQUITY_TRADING_ENABLED")
+
     # --- Equity Strategy (Phase 2.5: LLM-driven paper trading) ---
     equity_strategy_enabled: bool = Field(default=False, alias="EQUITY_STRATEGY_ENABLED")
     # Portfolio scope: "lumpsum" reuses one persistent portfolio (cash carries

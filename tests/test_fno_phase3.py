@@ -140,3 +140,36 @@ def test_build_user_prompt_empty_headlines() -> None:
         headlines=[],
     )
     assert "no recent headlines" in prompt
+
+
+def test_build_user_prompt_threads_market_movers_block() -> None:
+    movers_block = (
+        "YESTERDAY'S F&O LEADERS (2026-05-07):\n"
+        "   1. PAYTM        +7.82%  ₹1,110.60 → ₹1,197.40\n"
+        "THIS INSTRUMENT YESTERDAY: PAYTM was rank #1 gainer (+7.82%).\n"
+    )
+    prompt = build_user_prompt(
+        symbol="PAYTM",
+        sector="Fintech",
+        underlying_price=1197.40,
+        iv_rank=55.0,
+        iv_regime="neutral",
+        oi_structure="balanced",
+        days_to_expiry=4,
+        news_score=6.0,
+        sentiment_score=6.0,
+        fii_dii_score=5.0,
+        macro_align_score=5.0,
+        convergence_score=5.5,
+        composite_score=5.6,
+        bullish_count=2,
+        bearish_count=0,
+        lookback_hours=18,
+        fii_net_cr=500.0,
+        dii_net_cr=300.0,
+        macro_drivers=[],
+        headlines=["PAYTM Q4 beat"],
+        market_movers_context=movers_block,
+    )
+    assert "F&O LEADERS" in prompt
+    assert "rank #1 gainer" in prompt

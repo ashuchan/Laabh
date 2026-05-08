@@ -12,7 +12,7 @@ from src.db import session_scope
 from src.models.pending_order import PendingOrder
 from src.models.portfolio import Portfolio
 from src.models.trade import Trade
-from src.trading.engine import TradingEngine
+from src.trading.engine import EquityTradingDisabled, TradingEngine
 from src.trading.order_book import OrderBook
 from src.trading.risk_manager import RiskError
 
@@ -75,20 +75,25 @@ async def place_order(req: PlaceOrderRequest):
                 signal_id=req.signal_id,
                 reason=req.reason,
             )
+        except EquityTradingDisabled as e:
+            raise HTTPException(status_code=403, detail=str(e))
         except RiskError as e:
             raise HTTPException(status_code=422, detail=str(e))
         return TradeResponse.model_validate(trade)
     else:
-        order = await _order_book.place_order(
-            portfolio_id=portfolio.id,
-            instrument_id=req.instrument_id,
-            trade_type=req.trade_type,
-            order_type=req.order_type,
-            quantity=req.quantity,
-            limit_price=float(req.limit_price) if req.limit_price else None,
-            trigger_price=float(req.trigger_price) if req.trigger_price else None,
-            signal_id=req.signal_id,
-        )
+        try:
+            order = await _order_book.place_order(
+                portfolio_id=portfolio.id,
+                instrument_id=req.instrument_id,
+                trade_type=req.trade_type,
+                order_type=req.order_type,
+                quantity=req.quantity,
+                limit_price=float(req.limit_price) if req.limit_price else None,
+                trigger_price=float(req.trigger_price) if req.trigger_price else None,
+                signal_id=req.signal_id,
+            )
+        except EquityTradingDisabled as e:
+            raise HTTPException(status_code=403, detail=str(e))
         return PendingOrderResponse.model_validate(order)
 
 

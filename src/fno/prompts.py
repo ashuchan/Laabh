@@ -5,7 +5,7 @@ Increment FNO_THESIS_PROMPT_VERSION whenever the prompt or schema changes.
 """
 from __future__ import annotations
 
-FNO_THESIS_PROMPT_VERSION = "v2"
+FNO_THESIS_PROMPT_VERSION = "v3"
 
 # Expected JSON response schema (for documentation + parsing validation):
 # {
@@ -58,6 +58,14 @@ violate any of them, downgrade to SKIP or HEDGE and name the rule):
    independent bets — flag this in risk_factors when relevant.
 5. THESIS DURABILITY: if the only catalyst is a one-day move that has
    already played out by the time premium decays, prefer SKIP.
+6. MARKET MOVERS CONTEXT: the user prompt may include a MARKET MOVERS
+   section listing yesterday's top gainers/losers among F&O underlyings.
+   Use it as regime/momentum context, not as a candidate list. If the
+   current instrument appears there, the move is a catalyst that may
+   either continue (follow-through if a fresh news/macro driver is
+   present in the headlines/scores) or exhaust (one-day blowoff — see
+   THESIS DURABILITY). Cite the move in `thesis` when it materially
+   shapes the call.
 """
 
 FNO_THESIS_USER_TEMPLATE = """\
@@ -79,6 +87,7 @@ Catalyst scores (0=max bearish, 10=max bullish):
 Recent news headlines:
 {headlines}
 
+{market_movers_context}
 {extra_context}
 
 Generate the thesis JSON.

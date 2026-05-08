@@ -107,6 +107,7 @@ def build_user_prompt(
     macro_drivers: list[str],
     headlines: list[str],
     extra_context: str = "",
+    market_movers_context: str = "",
 ) -> str:
     headlines_text = "\n".join(f"  - {h}" for h in headlines[:5]) or "  (no recent headlines)"
     return FNO_THESIS_USER_TEMPLATE.format(
@@ -130,6 +131,7 @@ def build_user_prompt(
         dii_net_cr=f"{dii_net_cr:+.0f}",
         macro_drivers=", ".join(macro_drivers) or "N/A",
         headlines=headlines_text,
+        market_movers_context=market_movers_context or "",
         extra_context=extra_context or "",
     )
 
@@ -274,14 +276,35 @@ async def _upsert_phase3_candidate(
 # Public entry point
 # ---------------------------------------------------------------------------
 
-async def run_phase3(run_date: date | None = None) -> list[ThesisResult]:
+async def run_phase3(
+    run_date: date | None = None,
+    *,
+    as_of: datetime | None = None,
+    dryrun_run_id: uuid.UUID | None = None,
+) -> list[ThesisResult]:
     """Run Phase 3 LLM thesis synthesis for top Phase-2 candidates.
 
     Returns list of ThesisResult. PROCEED/HEDGE candidates have a phase=3
     fno_candidates row written.
+
+    ``as_of`` / ``dryrun_run_id`` follow the CLAUDE.md pipeline convention.
+    ``as_of`` is currently used to pin the market-movers lookup window so a
+    replay of a past day sees that day's prior-session bhavcopy rather than
+    today's.
     """
     if run_date is None:
         run_date = date.today()
+
+    # Defensive: when replaying a historical run_date the caller is expected
+    # to also pass as_of, but if they forget we'd silently inject TODAY's
+    # prior-session movers into a historical prompt — leaking future
+    # context. Derive as_of from run_date in that case so the movers
+    # lookup pins to the right day.
+    if as_of is None and run_date != date.today():
+        as_of = datetime(
+            run_date.year, run_date.month, run_date.day,
+            3, 30, tzinfo=timezone.utc,  # 09:00 IST — any time on run_date works
+        )
 
     cfg = _settings
     model = cfg.fno_phase3_llm_model
@@ -296,6 +319,19 @@ async def run_phase3(run_date: date | None = None) -> list[ThesisResult]:
     if not candidates:
         logger.warning("fno.thesis: no Phase-2 candidates to synthesize")
         return []
+
+    # Pull the prior-session movers once and reuse across all candidates —
+    # the bhavcopy is a single archive file per day, so per-candidate calls
+    # would be wasted disk reads. Failure here must not block Phase 3
+    # (regime context is helpful, not required).
+    movers = None
+    try:
+        from src.fno.market_movers import get_top_fno_movers
+        movers = await get_top_fno_movers(
+            top_n=10, bottom_n=5, as_of=as_of, dryrun_run_id=dryrun_run_id,
+        )
+    except Exception as exc:
+        logger.warning(f"fno.thesis: market-movers fetch failed: {exc}")
 
     # Build the per-session enrichment block once — it's identical across
     # all candidates this run and pulling open_book/lessons/outcomes 12 times
@@ -357,6 +393,15 @@ async def run_phase3(run_date: date | None = None) -> list[ThesisResult]:
 
             days_to_expiry = (next_weekly_expiry(instrument.symbol, run_date) - run_date).days
 
+            # Render the prior-session movers block, annotated for THIS
+            # symbol if it appears in the leader/laggard lists.
+            movers_block = ""
+            if movers is not None:
+                from src.fno.market_movers import render_movers_block
+                movers_block = render_movers_block(
+                    movers, instrument_symbol=instrument.symbol
+                )
+
             prompt = build_user_prompt(
                 symbol=instrument.symbol,
                 sector=instrument.sector,
@@ -378,6 +423,7 @@ async def run_phase3(run_date: date | None = None) -> list[ThesisResult]:
                 dii_net_cr=dii_net,
                 macro_drivers=macro_drivers,
                 headlines=headlines,
+                market_movers_context=movers_block,
                 extra_context=extra_context,
             )
 

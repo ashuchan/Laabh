@@ -751,7 +751,7 @@ async def run_morning_allocation(
 ) -> dict[str, Any]:
     """Top up daily cash, ask the LLM how to deploy, and execute BUYs."""
     settings = get_settings()
-    if not settings.equity_strategy_enabled:
+    if not settings.equity_trading_enabled or not settings.equity_strategy_enabled:
         logger.info("equity strategy disabled — morning job skipped")
         return {"skipped": True}
 
@@ -816,7 +816,7 @@ async def run_intraday_action(
 ) -> dict[str, Any]:
     """Mid-session re-evaluation: hold/sell/buy based on current state."""
     settings = get_settings()
-    if not settings.equity_strategy_enabled:
+    if not settings.equity_trading_enabled or not settings.equity_strategy_enabled:
         return {"skipped": True}
 
     portfolio_id = await ensure_strategy_portfolio()
@@ -858,7 +858,7 @@ async def run_eod_squareoff(
 ) -> dict[str, Any]:
     """At ~15:20 IST, ask the LLM which intraday positions to close."""
     settings = get_settings()
-    if not settings.equity_strategy_enabled:
+    if not settings.equity_trading_enabled or not settings.equity_strategy_enabled:
         return {"skipped": True}
 
     portfolio_id = await ensure_strategy_portfolio()
