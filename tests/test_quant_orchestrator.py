@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
 from src.quant.primitives.base import Signal
@@ -37,7 +38,6 @@ async def test_orchestrator_smoke_no_crash():
 
     arms = ["NIFTY_orb"]
     selector = ArmSelector(arms, seed=0)
-    # Basic sanity: select returns None when no signalling arms
     result = selector.select([])
     assert result is None
 
@@ -60,7 +60,82 @@ def test_total_exposure_sums_premiums():
 
 
 def test_symbol_from_arm():
-    # _symbol_from_arm was replaced by arm_meta dict; use _split_arm from persistence
     from src.quant.persistence import _split_arm
     assert _split_arm("RELIANCE_orb")[0] == "RELIANCE"
     assert _split_arm("NIFTY_vwap_revert")[0] == "NIFTY"
+
+
+def test_get_premium_from_bundle_uses_mid():
+    """_get_premium_from_bundle returns (bid+ask)/2 when both are present."""
+    from src.quant.orchestrator import _get_premium_from_bundle
+    from src.quant.exits import OpenPosition
+
+    now = datetime.now(timezone.utc)
+    pos = OpenPosition("RELIANCE_orb", "RELIANCE", "bullish", Decimal("100"), now)
+
+    bundle = MagicMock()
+    bundle.atm_bid = Decimal("90")
+    bundle.atm_ask = Decimal("110")
+    assert _get_premium_from_bundle(pos, bundle) == Decimal("100")
+
+
+def test_get_premium_from_bundle_fallback_on_no_bid_ask():
+    """_get_premium_from_bundle falls back to entry_premium_net when bid/ask missing."""
+    from src.quant.orchestrator import _get_premium_from_bundle
+    from src.quant.exits import OpenPosition
+
+    now = datetime.now(timezone.utc)
+    pos = OpenPosition("RELIANCE_orb", "RELIANCE", "bullish", Decimal("150"), now)
+
+    bundle = MagicMock()
+    bundle.atm_bid = None
+    bundle.atm_ask = None
+    assert _get_premium_from_bundle(pos, bundle) == Decimal("150")
+
+
+def test_build_tick_context_shape():
+    """_build_tick_context returns a 5-dim array clamped to [0,1]."""
+    from src.quant.orchestrator import _build_tick_context
+
+    bundle = MagicMock()
+    bundle.vix_value = 18.0
+    bundle.realized_vol_30min = 0.3
+
+    ctx = _build_tick_context(
+        features_map={"NIFTY": bundle},
+        minutes_since_open=90.0,
+        day_running_pnl_pct=0.02,
+    )
+    assert ctx.shape == (5,)
+    assert all(0.0 <= v <= 1.0 for v in ctx), f"context out of [0,1]: {ctx}"
+
+
+def test_build_tick_context_empty_features():
+    """_build_tick_context uses VIX=15 fallback when features_map is empty."""
+    from src.quant.orchestrator import _build_tick_context
+
+    ctx = _build_tick_context(
+        features_map={},
+        minutes_since_open=0.0,
+        day_running_pnl_pct=0.0,
+    )
+    assert ctx.shape == (5,)
+    # VIX=15 → vix_value/30 = 0.5
+    assert abs(ctx[0] - 0.5) < 1e-6
+
+
+def test_get_premium_from_bundle_stub_with_bundle():
+    """Stub returns mid when bundle has bid/ask."""
+    from src.quant.orchestrator import _get_premium_from_bundle_stub
+
+    bundle = MagicMock()
+    bundle.atm_bid = Decimal("80")
+    bundle.atm_ask = Decimal("120")
+    assert _get_premium_from_bundle_stub(bundle) == Decimal("100")
+
+
+def test_get_premium_from_bundle_stub_fallback():
+    """Stub returns ₹100 when bundle is None."""
+    from src.quant.orchestrator import _get_premium_from_bundle_stub
+
+    assert _get_premium_from_bundle_stub(None) == Decimal("100")

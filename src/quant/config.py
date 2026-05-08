@@ -6,13 +6,15 @@ import a single focused namespace instead of the full Settings object.
 from __future__ import annotations
 
 from datetime import time
+from functools import lru_cache
 from typing import Literal
 
 from src.config import get_settings
 
 
+@lru_cache(maxsize=1)
 def get_quant_config() -> "QuantConfig":
-    """Return a QuantConfig view of the current settings (cheap, no copy)."""
+    """Return a cached QuantConfig view of the current settings."""
     return QuantConfig(get_settings())
 
 

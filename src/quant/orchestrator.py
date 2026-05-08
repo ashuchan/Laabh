@@ -6,12 +6,13 @@ LAABH_INTRADAY_MODE=quant.
 from __future__ import annotations
 
 import asyncio
-import time as _time
+import math
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
+import numpy as np
 import pytz
 from loguru import logger
 
@@ -26,6 +27,8 @@ from src.quant.sizer import compute_lots
 from src.quant.universe import load_universe
 
 _IST = pytz.timezone("Asia/Kolkata")
+# Total tradeable minutes per session: 09:15–14:30 = 315 min
+_SESSION_MINUTES = 315.0
 
 
 def _make_arm_id(symbol: str, primitive_name: str) -> str:
@@ -50,6 +53,34 @@ def _load_primitives(enabled: list[str]):
         "index_revert": IndexRevertPrimitive,
     }
     return [registry[name]() for name in enabled if name in registry]
+
+
+def _build_tick_context(
+    *,
+    features_map: dict[str, Any],
+    minutes_since_open: float,
+    day_running_pnl_pct: float,
+) -> np.ndarray:
+    """Build the 5-dim LinTS context vector for the current tick.
+
+    Falls back gracefully when VIX or vol data is unavailable (e.g. warmup).
+    """
+    # Use VIX from any available bundle (all underlyings share the same VIX value)
+    vix = 15.0
+    rv30_pctile = 0.5
+    for bundle in features_map.values():
+        vix = bundle.vix_value
+        # Normalise vol percentile: rv30min clamped to [0, 1] using a rough 0–1 annualised vol scale
+        rv30_pctile = min(1.0, max(0.0, bundle.realized_vol_30min / 1.0))
+        break
+
+    return build_context(
+        vix_value=vix,
+        time_of_day_pct=min(1.0, max(0.0, minutes_since_open / _SESSION_MINUTES)),
+        day_running_pnl_pct=day_running_pnl_pct,
+        nifty_5d_return=0.0,   # wired in when macro data is available
+        realized_vol_30min_pctile=rv30_pctile,
+    )
 
 
 async def run_loop(
@@ -83,7 +114,7 @@ async def run_loop(
         for p in settings.quant_primitives_list
     ]
 
-    # Pre-compute arm → (symbol, primitive_name) to avoid per-tick _split_arm calls
+    # Pre-compute arm → (symbol, primitive_name) to avoid per-tick string splitting
     arm_meta: dict[str, tuple[str, str]] = {
         _make_arm_id(u["symbol"], p): (u["symbol"], p)
         for u in universe
@@ -97,8 +128,8 @@ async def run_loop(
 
     primitives = _load_primitives(settings.quant_primitives_list)
     max_history = max((p.warmup_minutes for p in primitives), default=30) + 5
-    # Each 3-min bar = 1 entry; limit history to max_history bars
-    max_history_bars = (max_history // 3) + 2
+    # ceil so a 35-min warmup (not multiple of 3) keeps enough bars
+    max_history_bars = math.ceil(max_history / 3) + 2
     history: dict[str, list] = {u["symbol"]: [] for u in universe}
 
     open_positions: list[OpenPosition] = []
@@ -114,15 +145,16 @@ async def run_loop(
 
     await _init_day_state(portfolio_id, today, starting_nav, universe, settings)
 
-    # Compute session open once — 09:15 IST in UTC
+    # Compute session open once — 09:15 IST
     _session_open_ist_time = _IST.localize(
         datetime(today.year, today.month, today.day, 9, 15, 0)
     )
 
-    # In replay mode, start current_time at as_of; in live mode, it's always datetime.now().
     replay_mode = as_of is not None
     current_time = as_of if replay_mode else datetime.now(timezone.utc)
     poll_delta = timedelta(seconds=settings.laabh_quant_poll_interval_sec)
+    # Keep last features_map for EOD close; initialise empty to avoid NameError
+    features_map: dict[str, Any] = {}
 
     # --- Main loop ---
     while True:
@@ -138,14 +170,13 @@ async def run_loop(
         logger.debug(f"[QUANT] tick at {now_ist.strftime('%H:%M:%S')} IST")
 
         # 1. Refresh features for each underlying
-        features_map: dict[str, Any] = {}
+        features_map = {}
         for u in universe:
             bundle = await feature_store.get(u["id"], current_time)
             if bundle:
                 features_map[u["symbol"]] = bundle
                 sym_hist = history[u["symbol"]]
                 sym_hist.append(bundle)
-                # Trim to avoid unbounded memory growth
                 if len(sym_hist) > max_history_bars:
                     del sym_hist[0]
 
@@ -166,6 +197,7 @@ async def run_loop(
         # 3. Manage existing positions
         current_nav = await _get_nav(portfolio_id)
         circuit.check_and_fire(current_nav, current_time)
+        day_running_pnl_pct = (current_nav - starting_nav) / starting_nav if starting_nav else 0.0
 
         for pos in list(open_positions):
             symbol = arm_meta.get(pos.arm_id, (pos.arm_id, ""))[0]
@@ -173,12 +205,12 @@ async def run_loop(
             if bundle is None:
                 continue
             current_premium = _get_premium_from_bundle(pos, bundle)
-            arm_signals = [(arm_id, sig) for arm_id, _, sig in signals if arm_id == pos.arm_id]
+            arm_signals = [(aid, sig) for aid, _, sig in signals if aid == pos.arm_id]
             close, reason = should_close(
                 pos, current_premium, bundle.realized_vol_3min, current_time, arm_signals
             )
             if close:
-                pnl = await _close_position(pos, current_premium, reason, portfolio_id)
+                pnl = await _close_position(pos, current_premium, reason, portfolio_id, current_time)
                 open_positions.remove(pos)
                 reward = float(pnl) / float(pos.entry_premium_net) if pos.entry_premium_net else 0.0
                 selector.update(pos.arm_id, reward)
@@ -210,7 +242,7 @@ async def run_loop(
                 current_time += poll_delta
             continue
 
-        # 7. Bandit selection
+        # 7. Bandit selection — build context for LinTS
         signalling_arms = [arm_id for arm_id, _, _ in signals]
         active_arms = [
             a for a in signalling_arms
@@ -223,8 +255,14 @@ async def run_loop(
             continue
 
         signal_strengths = {arm_id: sig.strength for arm_id, _, sig in signals}
+        context = _build_tick_context(
+            features_map=features_map,
+            minutes_since_open=minutes_since_open,
+            day_running_pnl_pct=day_running_pnl_pct,
+        )
         chosen_arm = selector.select(
             active_arms,
+            context=context,
             signal_strengths=signal_strengths,
         )
         if chosen_arm is None:
@@ -262,13 +300,20 @@ async def run_loop(
         )
 
         if lots > 0:
-            chosen_symbol = arm_meta.get(chosen_arm, (chosen_arm, ""))[0]
+            chosen_symbol, chosen_primitive = arm_meta.get(chosen_arm, (chosen_arm, ""))
             chosen_underlying_id = underlying_map.get(chosen_symbol)
+            chosen_bundle = features_map.get(chosen_symbol)
             pos = await _open_position(
-                chosen_arm, chosen_entry, lots, portfolio_id,
-                selector.posterior_mean(chosen_arm),
-                current_time,
+                arm_id=chosen_arm,
+                primitive_name=chosen_primitive,
+                signal=chosen_entry,
+                lots=lots,
+                portfolio_id=portfolio_id,
+                posterior_mean=selector.posterior_mean(chosen_arm),
+                now=current_time,
                 underlying_id=chosen_underlying_id,
+                entry_bundle=chosen_bundle,
+                kelly_fraction=settings.laabh_quant_kelly_fraction,
             )
             if pos:
                 open_positions.append(pos)
@@ -278,15 +323,17 @@ async def run_loop(
             current_time += poll_delta
 
     # --- End of day ---
+    # features_map holds last tick's data; acceptable for paper-trading EOD close
+    # (worst case: position opened on final tick uses entry_premium_net as exit price → P&L=0)
     logger.info(f"[QUANT] Hard exit time reached — closing {len(open_positions)} positions")
     for pos in list(open_positions):
         symbol = arm_meta.get(pos.arm_id, (pos.arm_id, ""))[0]
         bundle = features_map.get(symbol)
         premium = _get_premium_from_bundle(pos, bundle) if bundle else pos.entry_premium_net
-        await _close_position(pos, premium, "time_stop", portfolio_id)
+        await _close_position(pos, premium, "time_stop", portfolio_id, current_time)
 
     final_nav = await _get_nav(portfolio_id)
-    await _finalize_day_state(portfolio_id, today, final_nav, starting_nav)
+    await _finalize_day_state(portfolio_id, today, final_nav, starting_nav, circuit)
     await persistence.save_eod(
         portfolio_id, today, selector, all_arms, underlying_map
     )
@@ -323,14 +370,17 @@ async def _get_nav(portfolio_id: uuid.UUID) -> float:
 
 
 async def _open_position(
+    *,
     arm_id: str,
+    primitive_name: str,
     signal,
     lots: int,
     portfolio_id: uuid.UUID,
     posterior_mean: float,
     now: datetime,
-    *,
     underlying_id: uuid.UUID | None,
+    entry_bundle,
+    kelly_fraction: float,
 ) -> OpenPosition | None:
     """Record a new quant trade in the DB and return an OpenPosition."""
     from src.db import session_scope
@@ -340,7 +390,8 @@ async def _open_position(
         logger.error(f"[QUANT] No underlying_id for {arm_id} — skipping open")
         return None
 
-    entry_premium = Decimal("100")  # stub — real impl queries live chain
+    # Use live ATM mid as entry premium; stub fallback when chain data unavailable
+    entry_premium = _get_premium_from_bundle_stub(entry_bundle)
     # Deterministic seed from portfolio + arm + date for reproducibility
     bandit_seed = abs(hash((str(portfolio_id), arm_id, now.date().isoformat()))) % (2**31)
 
@@ -349,7 +400,7 @@ async def _open_position(
             trade = QuantTrade(
                 portfolio_id=portfolio_id,
                 underlying_id=underlying_id,
-                primitive_name=arm_id.split("_", 1)[-1],
+                primitive_name=primitive_name,
                 arm_id=arm_id,
                 direction=signal.strategy_class,
                 legs={},
@@ -360,7 +411,7 @@ async def _open_position(
                 posterior_mean_at_entry=posterior_mean,
                 sampled_mean_at_entry=posterior_mean,
                 bandit_seed=bandit_seed,
-                kelly_fraction=0.5,
+                kelly_fraction=kelly_fraction,
                 lots=lots,
                 status="open",
             )
@@ -381,11 +432,19 @@ async def _open_position(
     return pos
 
 
+def _get_premium_from_bundle_stub(bundle) -> Decimal:
+    """Return ATM mid from bundle, or ₹100 stub when chain data is unavailable."""
+    if bundle is not None and bundle.atm_bid and bundle.atm_ask:
+        return (bundle.atm_bid + bundle.atm_ask) / Decimal("2")
+    return Decimal("100")
+
+
 async def _close_position(
     pos: OpenPosition,
     exit_premium: Decimal,
     reason: str,
     portfolio_id: uuid.UUID,
+    now: datetime,
 ) -> Decimal:
     """Mark the quant trade closed and return realized P&L."""
     from src.db import session_scope
@@ -405,7 +464,7 @@ async def _close_position(
             )
             trade = (await session.execute(q)).scalar_one_or_none()
             if trade:
-                trade.exit_at = datetime.now(timezone.utc)
+                trade.exit_at = now  # use simulated time so replay exit_at is correct
                 trade.exit_premium_net = exit_premium
                 trade.realized_pnl = pnl
                 trade.exit_reason = reason
@@ -434,7 +493,6 @@ async def _init_day_state(
                 portfolio_id=portfolio_id,
                 date=today,
                 starting_nav=starting_nav,
-                # Store {id, symbol} dicts so reports can map back to symbols
                 universe=[{"id": str(u["id"]), "symbol": u["symbol"]} for u in universe],
                 lockin_target_pct=settings.laabh_quant_lockin_target_pct,
                 kill_switch_pct=settings.laabh_quant_kill_switch_dd_pct,
@@ -449,6 +507,7 @@ async def _finalize_day_state(
     today: date,
     final_nav: float,
     starting_nav: float,
+    circuit: CircuitState,
 ) -> None:
     from src.db import session_scope
     from src.models.quant_day_state import QuantDayState
@@ -461,8 +520,10 @@ async def _finalize_day_state(
         if state:
             state.final_nav = final_nav
             state.pnl_pct = (final_nav - starting_nav) / starting_nav if starting_nav else 0.0
+            # Persist circuit-breaker fire times so EOD report can read them
+            state.lockin_fired_at = circuit.lockin_fired_at
+            state.kill_switch_fired_at = circuit.kill_fired_at
 
-            # Count only today's trades for this portfolio
             q = select(func.count()).where(
                 QuantTrade.portfolio_id == portfolio_id,
                 QuantTrade.entry_at >= _day_start(today),
@@ -472,7 +533,7 @@ async def _finalize_day_state(
 
 async def _sleep_tick(settings, tick_start: datetime, replay_mode: bool) -> None:
     if replay_mode:
-        return  # In replay mode, don't sleep — advance time externally
+        return
     elapsed = (datetime.now(timezone.utc) - tick_start).total_seconds()
     sleep_sec = max(0.0, settings.laabh_quant_poll_interval_sec - elapsed)
     if sleep_sec > 0:
