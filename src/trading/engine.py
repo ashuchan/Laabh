@@ -8,6 +8,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from loguru import logger
 from sqlalchemy import select, text
 
+from src.config import get_settings
 from src.db import session_scope
 from src.models.portfolio import Holding, Portfolio
 from src.models.trade import Trade
@@ -16,7 +17,53 @@ from src.services.notification_service import NotificationService
 from src.trading.risk_manager import RiskManager, RiskError
 
 
+class EquityTradingDisabled(Exception):
+    """Raised when an equity (non-F&O) trade is attempted while
+    ``EQUITY_TRADING_ENABLED=false``.
+
+    Distinct from ``RiskError`` so callers can map it to a 403 instead of a
+    422 — this is a policy refusal, not a risk-rule violation.
+    """
+
+
 _TWO = Decimal("0.01")
+
+
+async def _refuse_if_equity_disabled(
+    instrument_id: uuid.UUID,
+    *,
+    trade_type: str,
+    quantity: int,
+) -> None:
+    """Raise ``EquityTradingDisabled`` if the master flag is off and the
+    instrument is an equity (``is_fno=False``).
+
+    Invoked at every trade-execution chokepoint (engine market order,
+    order-book limit/SL placement). When the flag is True (default) this
+    is a no-op — no DB roundtrip.
+    """
+    settings = get_settings()
+    if settings.equity_trading_enabled:
+        return
+    # Read the two attributes we need *inside* the session scope. After the
+    # ``async with`` exits, ``session.commit()`` would expire attributes on
+    # the default SQLAlchemy config, and a later ``instr.is_fno`` access
+    # would attempt a lazy refresh against a closed session. Today this
+    # works only because ``src/db.py`` sets ``expire_on_commit=False`` —
+    # don't depend on that here.
+    async with session_scope() as session:
+        instr = await session.get(Instrument, instrument_id)
+        if instr is None:
+            # Don't shadow the missing-instrument case as a flag refusal —
+            # let the downstream code fail loudly with the real reason.
+            return
+        is_fno = bool(instr.is_fno)
+        symbol = instr.symbol
+    if not is_fno:
+        raise EquityTradingDisabled(
+            f"Equity trading disabled (EQUITY_TRADING_ENABLED=false): "
+            f"refusing {trade_type} {quantity}×{symbol}"
+        )
 
 
 def _round(v: Decimal) -> Decimal:
@@ -77,6 +124,9 @@ class TradingEngine:
         reason: str | None = None,
     ) -> Trade:
         """Execute a market order at current_ltp and persist all state changes atomically."""
+        await _refuse_if_equity_disabled(
+            instrument_id, trade_type=trade_type, quantity=quantity
+        )
         price = _round(current_ltp)
         brokerage, stt, other = self._calc_charges(trade_type, quantity, price)
         charges = brokerage + stt + other

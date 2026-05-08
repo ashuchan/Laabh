@@ -58,10 +58,20 @@ class BhavcopyMissingError(Exception):
     """Raised when the NSE archive returns a 404 for the requested date."""
 
 
-def _cache_path(segment: str, d: date) -> Path:
+# Per-segment cache schema versions. Bump when the parser's output schema
+# changes so previously cached parquet files (which we read back without
+# re-parsing) don't silently return the old shape. FO parser has been UDiFF-
+# aware from day one — keep it un-suffixed. CM parser was missing UDiFF
+# coverage until 2026-05-08; bumping to v2 invalidates pre-fix caches.
+_FO_CACHE_VERSION: str | None = None
+_CM_CACHE_VERSION: str | None = "v2"
+
+
+def _cache_path(segment: str, d: date, version: str | None = None) -> Path:
     cache_dir = Path(_SETTINGS.dryrun_bhavcopy_cache_dir).expanduser()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"{segment}_{d.strftime('%Y%m%d')}.parquet"
+    suffix = f"_{version}" if version else ""
+    return cache_dir / f"{segment}_{d.strftime('%Y%m%d')}{suffix}.parquet"
 
 
 async def _download_zip(url: str) -> bytes:
@@ -157,12 +167,33 @@ def _parse_fo_csv(csv_text: str) -> pd.DataFrame:
 
 
 def _parse_cm_csv(csv_text: str) -> pd.DataFrame:
-    """Parse cash-market bhavcopy CSV into a normalised DataFrame."""
+    """Parse cash-market bhavcopy CSV into a normalised DataFrame.
+
+    Handles both the legacy CM bhavcopy (``symbol``/``close``/``prevclose``…)
+    and the current UDiFF format (``tckrsymb``/``clspric``/``prvsclsgpric``…),
+    matching the F&O parser's coverage so callers can rely on canonical
+    column names regardless of which format NSE happens to ship.
+    """
     df = pd.read_csv(io.StringIO(csv_text), dtype=str)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     rename_map = {
+        # Legacy NSE CM bhavcopy
         "symbol_x": "symbol",
+        "prevclose": "prev_close",
         "tottrdqty": "tottrdqty",
+        # UDiFF (current NSE bhavcopy format)
+        "tckrsymb": "symbol",
+        "sctysrs": "series",
+        "fininstrmtp": "instrument_type",
+        "opnpric": "open",
+        "hghpric": "high",
+        "lwpric": "low",
+        "clspric": "close",
+        "lastpric": "last_price",
+        "prvsclsgpric": "prev_close",
+        "ttltradgvol": "tottrdqty",
+        "ttltrfval": "tottrdval",
+        "ttlnboftxsexctd": "totaltrades",
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
     for col in ["open", "high", "low", "close", "last_price", "prev_close",
@@ -174,7 +205,7 @@ def _parse_cm_csv(csv_text: str) -> pd.DataFrame:
 
 async def fetch_fo_bhavcopy(d: date) -> pd.DataFrame:
     """Return the F&O bhavcopy DataFrame for date d, using disk cache."""
-    cache = _cache_path("fo", d)
+    cache = _cache_path("fo", d, _FO_CACHE_VERSION)
     if cache.exists():
         logger.debug(f"bhavcopy: cache hit for F&O {d}")
         return pd.read_parquet(cache)
@@ -192,7 +223,7 @@ async def fetch_fo_bhavcopy(d: date) -> pd.DataFrame:
 
 async def fetch_cm_bhavcopy(d: date) -> pd.DataFrame:
     """Return the cash-market bhavcopy DataFrame for date d, using disk cache."""
-    cache = _cache_path("cm", d)
+    cache = _cache_path("cm", d, _CM_CACHE_VERSION)
     if cache.exists():
         logger.debug(f"bhavcopy: cache hit for CM {d}")
         return pd.read_parquet(cache)

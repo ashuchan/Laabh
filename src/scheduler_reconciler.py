@@ -129,8 +129,15 @@ async def reconcile_missed(
     earliest_acceptable = now_local - timedelta(hours=CATCHUP_GRACE_HOURS)
     dryrun = dryrun_run_id is not None
 
+    # Equity catch-up jobs aren't registered with the scheduler when the
+    # master equity flag is off; trying to catch them up would log a
+    # "job not registered" warning every startup. Skip them here too.
+    equity_jobs = {"equity_morning_allocation", "equity_eod_squareoff"}
+
     scheduled = 0
     for job_id, (hour, minute) in DAILY_CRITICAL.items():
+        if not settings.equity_trading_enabled and job_id in equity_jobs:
+            continue
         last_due = _last_expected_firing(now_local, hour, minute)
         # Tight grace window: only catch up if the scheduler missed THIS job's
         # firing within the last CATCHUP_GRACE_HOURS. Anything older is stale

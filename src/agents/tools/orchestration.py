@@ -1,36 +1,54 @@
 """Orchestration tool executor: get_full_rationale."""
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from src.agents.tools._helpers import is_missing_table
+
 if TYPE_CHECKING:
     from src.agents.tools.registry import ToolContext
+
+log = logging.getLogger(__name__)
 
 
 async def execute_get_full_rationale(params: dict, ctx: "ToolContext") -> dict:
     """Retrieve the full rationale for a prediction or candidate by ID.
 
     Tries agent_predictions first (by id), then falls back to signals.
+    Tolerates missing agent_predictions table (pre-migration-0009).
     """
     item_id = params["prediction_or_candidate_id"]
 
     try:
         async with ctx.db() as db:
-            # Try agent_predictions
-            result = await db.execute(
-                text("""
-                    SELECT ap.id, ap.symbol_or_underlying, ap.decision,
-                           ap.rationale, ap.judge_output, ap.created_at,
-                           ap.conviction, ap.expected_pnl_pct
-                    FROM agent_predictions ap
-                    WHERE ap.id = :id
-                    LIMIT 1
-                """),
-                {"id": str(item_id)},
-            )
-            row = result.fetchone()
+            # Try agent_predictions; degrade gracefully when table is missing.
+            row = None
+            try:
+                result = await db.execute(
+                    text("""
+                        SELECT ap.id, ap.symbol_or_underlying, ap.decision,
+                               ap.rationale, ap.judge_output, ap.created_at,
+                               ap.conviction, ap.expected_pnl_pct
+                        FROM agent_predictions ap
+                        WHERE ap.id = :id
+                        LIMIT 1
+                    """),
+                    {"id": str(item_id)},
+                )
+                row = result.fetchone()
+            except Exception as inner:
+                if not is_missing_table(inner):
+                    raise
+                # Postgres aborts the implicit txn after a relation error;
+                # rollback so the next SELECT in this session can run.
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                log.debug("agent_predictions table missing — skipping prediction lookup")
             if row:
                 return {
                     "type": "agent_prediction",
@@ -78,4 +96,4 @@ async def execute_get_full_rationale(params: dict, ctx: "ToolContext") -> dict:
             return {"result": None, "note": f"No prediction or signal found for id {item_id!r}"}
 
     except Exception as e:
-        return {"result": None, "error": str(e)}
+        return {"result": None, "error": f"{type(e).__name__}: {e}"}

@@ -32,13 +32,23 @@ from src.models.instrument import Instrument
 # ---------------------------------------------------------------------------
 
 def compute_iv_rank(current_iv: float, history: Sequence[float]) -> float | None:
-    """IV Rank: position of current IV within 52-week high/low range (0-100)."""
+    """IV Rank: position of current IV within 52-week high/low range (0-100).
+
+    Clamped to [0, 100]. The canonical IV Rank definition is bounded —
+    a current IV above the 52w high is "at new highs" (rank=100), a
+    current IV below the 52w low is "at new lows" (rank=0). The previous
+    unclamped formula could produce e.g. -6273 when there was a
+    unit mismatch between today's atm_iv (decimal: 0.27) and the
+    historical series (percentage points: 33.36) — that's a separate
+    data-ingestion bug, but the rank itself should never escape [0, 100].
+    """
     if not history:
         return None
     lo, hi = min(history), max(history)
     if hi == lo:
         return 50.0
-    return round((current_iv - lo) / (hi - lo) * 100, 2)
+    raw = (current_iv - lo) / (hi - lo) * 100
+    return round(max(0.0, min(100.0, raw)), 2)
 
 
 def compute_iv_percentile(current_iv: float, history: Sequence[float]) -> float | None:

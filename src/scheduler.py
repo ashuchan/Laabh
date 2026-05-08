@@ -253,6 +253,18 @@ async def _fno_vix_refresh() -> None:
     await run_vix_refresh()
 
 
+async def _fno_sentiment_refresh() -> None:
+    """Refresh the market-sentiment row that Phase 2 reads. Cheap (no LLM,
+    no external API except a single yfinance call as a fallback) so we run
+    it on the same intraday cadence as the VIX collector. Failures are
+    swallowed — Phase 2 falls back to neutral 5.0 if no row is found."""
+    try:
+        from src.collectors.sentiment_collector import run_once
+        await run_once()
+    except Exception as exc:
+        logger.warning(f"sentiment refresh failed: {exc}")
+
+
 async def _fno_premarket_pipeline() -> None:
     from src.fno.orchestrator import run_premarket_pipeline
     result = await run_premarket_pipeline()
@@ -542,8 +554,10 @@ def build_scheduler() -> AsyncIOScheduler:
     )
 
     # --- Phase 2.5: Equity strategy (LLM-driven paper trading) ---
-    # Gated behind EQUITY_STRATEGY_ENABLED so the cron stays absent when off.
-    if settings.equity_strategy_enabled:
+    # Gated behind both flags: EQUITY_TRADING_ENABLED is the master switch
+    # for any equity execution; EQUITY_STRATEGY_ENABLED toggles the LLM
+    # strategy specifically. When either is off the cron stays absent.
+    if settings.equity_trading_enabled and settings.equity_strategy_enabled:
         # 09:10 IST — morning allocation; BUYs fill at 09:15 open.
         sched.add_job(
             _run_equity_morning_allocation,
@@ -571,6 +585,8 @@ def build_scheduler() -> AsyncIOScheduler:
             id="equity_eod_squareoff",
         )
         logger.info("equity strategy enabled — morning/intraday/eod jobs registered")
+    elif not settings.equity_trading_enabled:
+        logger.info("equity trading disabled (EQUITY_TRADING_ENABLED=false) — strategy jobs skipped")
     else:
         logger.info("equity strategy disabled (EQUITY_STRATEGY_ENABLED=false)")
 
@@ -665,6 +681,18 @@ def build_scheduler() -> AsyncIOScheduler:
         _fno_vix_refresh,
         CronTrigger(minute="*/5", hour="9-15", day_of_week="mon-fri", timezone=ist),
         id="fno_vix_intraday",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Every 5 min during market hours — sentiment recompute. Runs ~30s after
+    # the VIX refresh so the latest tick is already in the DB. The premarket
+    # pipeline also calls run_once() inline between Phase 1 and Phase 2 so
+    # the morning row is fresh even before market open; this cron keeps the
+    # value live during the day for any ad-hoc Phase 3 reruns / dashboards.
+    sched.add_job(
+        _fno_sentiment_refresh,
+        CronTrigger(minute="*/5", hour="9-15", day_of_week="mon-fri", timezone=ist),
+        id="fno_sentiment_intraday",
         max_instances=1,
         coalesce=True,
     )

@@ -132,6 +132,10 @@ class WorkflowRunner:
 
         # 4. Build WorkflowContext
         as_of = merged_params.get("as_of") or datetime.now(timezone.utc)
+        # `_initial_stage_outputs` lets a caller (e.g. BacktestRunner running a
+        # mid-day review) seed stage_outputs before the first stage runs, so
+        # downstream `iteration_source` expressions can resolve immediately.
+        initial_outputs = dict(merged_params.get("_initial_stage_outputs") or {})
         ctx = WorkflowContext(
             workflow_run_id=workflow_run_id,
             workflow_spec=workflow_spec,
@@ -139,7 +143,7 @@ class WorkflowRunner:
             cost_so_far_usd=Decimal("0"),
             tokens_so_far=0,
             agent_run_results=[],
-            stage_outputs={},
+            stage_outputs=initial_outputs,
             db_session_factory=self.db_session_factory,
             redis=self.redis,
             anthropic=self.anthropic,
@@ -667,11 +671,14 @@ class WorkflowRunner:
         if td is None:
             return {"error": f"Unknown tool: {tool_name}"}
 
+        # Pass the runner's session factory through so SQL-backed tool executors
+        # (src.agents.tools.{news,explorer,fno,equity,orchestration}) can
+        # open their own session via `async with ctx.db() as db:`.
         tool_ctx = ToolContext(
             workflow_run_id=ctx.workflow_run_id,
             agent_run_id=agent_run_id,
             agent_name=spec.name,
-            db=None,  # executor opens its own session via db_session_factory
+            db=self.db_session_factory,
             redis=self.redis,
             as_of=ctx.as_of,
             is_replay=ctx.is_replay,
@@ -1069,11 +1076,20 @@ class WorkflowRunner:
     def _assemble_prompt(
         self, spec: AgentSpec, invocation: _AgentInvocation, ctx: WorkflowContext
     ) -> list[dict]:
-        """Assemble the user-turn messages for the API call."""
+        """Assemble the user-turn messages for the API call.
+
+        Resolution order for the user-turn payload:
+          1. The iteration item (per-candidate stages).
+          2. `params["agent_input_overrides"][agent_name]` — caller-supplied seed
+             for non-iterated agents (used by backtests to inject the morning
+             snapshot into brain_triage so it has data to triage on).
+          3. The accumulated stage_outputs (default for chained-from-prior-stage
+             agents like CEO bull/bear/judge).
+        """
         item = invocation.item
         if item is None:
-            # Build from stage_outputs context
-            item = dict(ctx.stage_outputs)
+            overrides = ctx.params.get("agent_input_overrides") or {}
+            item = overrides.get(spec.name) or dict(ctx.stage_outputs)
         if isinstance(item, dict):
             content = json.dumps(item, default=str, indent=2)
         else:
@@ -1116,10 +1132,13 @@ class WorkflowRunner:
         req: dict = {
             "model": spec.model,
             "max_tokens": spec.max_output_tokens,
-            "temperature": spec.temperature,
             "system": system_block,
             "messages": messages,
         }
+        # Opus 4.7 deprecates the `temperature` parameter. Other models still
+        # accept it. Only attach the parameter when the API will not reject it.
+        if not spec.model.startswith("claude-opus-4-7"):
+            req["temperature"] = spec.temperature
         if tools:
             req["tools"] = tools
         if spec.output_tool:
@@ -1246,17 +1265,21 @@ class WorkflowRunner:
         return versions
 
     def _compose_prediction_from_judge(self, ctx: WorkflowContext) -> dict:
+        # Pass the judge's verdict through to the validator unchanged. Earlier
+        # versions of this method projected only a subset of fields, which made
+        # CEOJudgeOutputValidated reject every run because required fields like
+        # ceo_note and calibration_self_check were silently dropped.
         judge_verdict = ctx.stage_outputs.get("judge_verdict") or {}
-        return {
-            "allocation": judge_verdict.get("allocation", []),
-            "decision_summary": judge_verdict.get("decision_summary", ""),
-            "conviction": judge_verdict.get("calibration_self_check", {}).get(
+        composed = dict(judge_verdict)
+        composed.setdefault("allocation", [])
+        composed.setdefault("decision_summary", "")
+        composed.setdefault("kill_switches", [])
+        composed["conviction"] = (
+            (judge_verdict.get("calibration_self_check") or {}).get(
                 "confidence_in_allocation", 0.5
-            ),
-            "expected_book_pnl_pct": judge_verdict.get("expected_book_pnl_pct"),
-            "max_drawdown_tolerated_pct": judge_verdict.get("max_drawdown_tolerated_pct"),
-            "kill_switches": judge_verdict.get("kill_switches", []),
-        }
+            )
+        )
+        return composed
 
     @staticmethod
     def _validator_severity(validator_name: str, error: dict) -> str:

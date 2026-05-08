@@ -8,10 +8,12 @@ from decimal import Decimal
 from loguru import logger
 from sqlalchemy import select
 
+from src.config import get_settings
 from src.db import session_scope
+from src.models.instrument import Instrument
 from src.models.pending_order import PendingOrder
 from src.models.price import PriceTick
-from src.trading.engine import TradingEngine
+from src.trading.engine import TradingEngine, _refuse_if_equity_disabled
 
 
 class OrderBook:
@@ -25,10 +27,18 @@ class OrderBook:
         executed = 0
         now = datetime.now(timezone.utc)
 
+        settings = get_settings()
         async with session_scope() as session:
-            result = await session.execute(
-                select(PendingOrder).where(PendingOrder.status == "pending")
-            )
+            stmt = select(PendingOrder).where(PendingOrder.status == "pending")
+            if not settings.equity_trading_enabled:
+                # Skip equity (non-F&O) pending orders so we don't trigger
+                # the engine's policy refusal once per tick. The engine
+                # still rejects as a backstop if the flag flips between
+                # this query and execution.
+                stmt = stmt.join(
+                    Instrument, PendingOrder.instrument_id == Instrument.id
+                ).where(Instrument.is_fno.is_(True))
+            result = await session.execute(stmt)
             orders = result.scalars().all()
 
         for order in orders:
@@ -108,6 +118,9 @@ class OrderBook:
         valid_till: datetime | None = None,
     ) -> PendingOrder:
         """Store a new pending limit or stop-loss order."""
+        await _refuse_if_equity_disabled(
+            instrument_id, trade_type=trade_type, quantity=quantity
+        )
         order = PendingOrder(
             portfolio_id=portfolio_id,
             instrument_id=instrument_id,

@@ -53,6 +53,15 @@ async def run_premarket_pipeline(
     phase1_passed = sum(1 for r in phase1_results if r.passed)
     logger.info(f"fno.orchestrator: Phase 1 → {phase1_passed}/{len(phase1_results)} passed")
 
+    # Phase 1.5: refresh the market-sentiment row Phase 2 will read. Failures
+    # here are non-fatal — Phase 2 falls back to neutral 5.0 if no row is
+    # found, so this is a "freshen-if-possible" step rather than a gate.
+    try:
+        from src.collectors.sentiment_collector import run_once as run_sentiment
+        await run_sentiment(as_of=as_of)
+    except Exception as exc:
+        logger.warning(f"fno.orchestrator: sentiment refresh failed: {exc}")
+
     # Phase 2: catalyst scoring
     phase2_results = await run_phase2(run_date)
     phase2_passed = sum(1 for r in phase2_results if r.passed)

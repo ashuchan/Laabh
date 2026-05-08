@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from src.agents.tools._helpers import parse_date, parse_dt, resolve_instrument_id
+
 if TYPE_CHECKING:
     from src.agents.tools.registry import ToolContext
 
@@ -45,23 +47,23 @@ _STRATEGY_TABLE: dict[tuple[str, str, str], list[str]] = {
 
 async def execute_get_options_chain(params: dict, ctx: "ToolContext") -> dict:
     """Fetch the current options chain snapshot for an F&O underlying."""
-    underlying_id = params["underlying_id"]
-    expiry_date = params["expiry_date"]
-    snapshot_at = params.get("snapshot_at")
-
-    if snapshot_at:
-        time_filter = "AND oc.snapshot_at <= :snapshot_at"
-        bind: dict = {
-            "iid": str(underlying_id),
-            "expiry": expiry_date,
-            "snapshot_at": snapshot_at,
-        }
-    else:
-        time_filter = ""
-        bind = {"iid": str(underlying_id), "expiry": expiry_date}
+    expiry = parse_date(params.get("expiry_date"))
+    if expiry is None:
+        return {"result": [], "error": "expiry_date: invalid or missing"}
+    snapshot_dt = parse_dt(params.get("snapshot_at"))
 
     try:
         async with ctx.db() as db:
+            iid = await resolve_instrument_id(db, params.get("underlying_id"))
+            if iid is None:
+                return {"result": [],
+                        "error": f"underlying_id {params.get('underlying_id')!r} did not resolve"}
+
+            bind: dict = {"iid": iid, "expiry": expiry}
+            time_filter = ""
+            if snapshot_dt is not None:
+                time_filter = "AND oc.snapshot_at <= :snapshot_at"
+                bind["snapshot_at"] = snapshot_dt
             result = await db.execute(
                 text(f"""
                     SELECT strike_price, option_type, ltp, bid_price, ask_price,
@@ -100,30 +102,34 @@ async def execute_get_options_chain(params: dict, ctx: "ToolContext") -> dict:
                     }
                     for r in rows
                 ],
-                "expiry_date": expiry_date,
+                "expiry_date": str(expiry),
                 "count": len(rows),
             }
     except Exception as e:
-        return {"result": [], "error": str(e)}
+        return {"result": [], "error": f"{type(e).__name__}: {e}"}
 
 
 async def execute_get_iv_context(params: dict, ctx: "ToolContext") -> dict:
     """Fetch IV history and HV for an underlying to assess IV richness."""
-    underlying_id = params["underlying_id"]
     lookback_days = int(params.get("lookback_days", 30))
 
     try:
         async with ctx.db() as db:
+            iid = await resolve_instrument_id(db, params.get("underlying_id"))
+            if iid is None:
+                return {"history": [],
+                        "error": f"underlying_id {params.get('underlying_id')!r} did not resolve"}
+
             result = await db.execute(
                 text("""
                     SELECT date, atm_iv, iv_rank_52w, iv_percentile_52w
                     FROM iv_history
                     WHERE instrument_id = :iid
-                      AND date >= CURRENT_DATE - :days
+                      AND date >= CURRENT_DATE - (:days)::int
                     ORDER BY date DESC
                     LIMIT 100
                 """),
-                {"iid": str(underlying_id), "days": lookback_days},
+                {"iid": iid, "days": lookback_days},
             )
             rows = result.fetchall()
             current = rows[0] if rows else None
@@ -146,7 +152,7 @@ async def execute_get_iv_context(params: dict, ctx: "ToolContext") -> dict:
                 "count": len(rows),
             }
     except Exception as e:
-        return {"result": [], "error": str(e)}
+        return {"history": [], "error": f"{type(e).__name__}: {e}"}
 
 
 def _classify_iv(iv_rank_52w: float | None) -> str:
@@ -236,10 +242,13 @@ async def execute_get_strategy_payoff(params: dict, ctx: "ToolContext") -> dict:
 
 async def execute_check_ban_list(params: dict, ctx: "ToolContext") -> dict:
     """Check whether an F&O instrument is on the SEBI ban list today."""
-    instrument_id = params["instrument_id"]
-
     try:
         async with ctx.db() as db:
+            iid = await resolve_instrument_id(db, params.get("instrument_id"))
+            if iid is None:
+                return {"is_banned": False,
+                        "error": f"instrument_id {params.get('instrument_id')!r} did not resolve"}
+
             result = await db.execute(
                 text("""
                     SELECT ban_date, source
@@ -248,7 +257,7 @@ async def execute_check_ban_list(params: dict, ctx: "ToolContext") -> dict:
                       AND ban_date = CURRENT_DATE
                     LIMIT 1
                 """),
-                {"iid": str(instrument_id)},
+                {"iid": iid},
             )
             row = result.fetchone()
             is_banned = row is not None
@@ -262,4 +271,4 @@ async def execute_check_ban_list(params: dict, ctx: "ToolContext") -> dict:
                 ) if is_banned else None,
             }
     except Exception as e:
-        return {"is_banned": False, "error": str(e)}
+        return {"is_banned": False, "error": f"{type(e).__name__}: {e}"}
