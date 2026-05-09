@@ -38,6 +38,7 @@ dependencies = [
     "youtube-transcript-api>=0.6.2",
     "openai>=1.30.0",
     "pyarrow>=24.0.0",
+    "streamlit>=1.40.0",
 ]
 
 [project.optional-dependencies]

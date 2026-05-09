@@ -47,6 +47,11 @@ class OrchestratorContext:
     recorder: TradeRecorder
     # Notifier is optional — backtest sets it to None / no-op.
     notify: Callable[[str], Awaitable[None]] | None = None
+    # When set, the orchestrator uses this value as the day's starting NAV
+    # instead of querying ``portfolios.current_cash + invested_value``.
+    # Required for backtest compounding: the runner threads each day's
+    # final NAV into the next day via this field. Live mode leaves it None.
+    nav_override: float | None = None
 
     @classmethod
     def live(cls) -> "OrchestratorContext":

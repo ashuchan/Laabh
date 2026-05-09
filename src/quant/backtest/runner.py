@@ -198,6 +198,11 @@ class BacktestRunner:
             f"portfolio {self._portfolio_id} (seed={self._seed})"
         )
 
+        # Compounding: the running NAV starts at the live portfolio NAV on
+        # day 1 and advances each day by the day's realized P&L. A failed
+        # day leaves the running NAV unchanged (no fictitious P&L applied).
+        running_nav = await self._fetch_nav(self._portfolio_id)
+
         result = BacktestRangeResult(
             portfolio_id=self._portfolio_id,
             start_date=start_date,
@@ -205,13 +210,15 @@ class BacktestRunner:
         )
         iterator = _maybe_tqdm(days, enabled=progress, desc="Backtest days")
         for d in iterator:
-            single = await self._run_one_day(d)
+            single = await self._run_one_day(d, starting_nav=running_nav)
             result.days.append(single)
             if single.failed:
                 logger.warning(
                     f"BacktestRunner: {d} failed — continuing. "
                     f"Error: {single.error}"
                 )
+            elif single.final_nav is not None:
+                running_nav = single.final_nav
         logger.info(
             f"BacktestRunner: done. days={result.n_days} "
             f"failed={result.n_failed} cumulative_pnl_pct={result.cumulative_pnl_pct:.4%}"
@@ -222,9 +229,21 @@ class BacktestRunner:
     # Per-day execution
     # ------------------------------------------------------------------
 
-    async def _run_one_day(self, trading_date: date) -> SingleDayResult:
-        """Create a backtest_runs row, replay the day, return the summary."""
-        starting_nav = await self._fetch_nav(self._portfolio_id)
+    async def _run_one_day(
+        self,
+        trading_date: date,
+        *,
+        starting_nav: float | None = None,
+    ) -> SingleDayResult:
+        """Create a backtest_runs row, replay the day, return the summary.
+
+        ``starting_nav`` is the NAV to compound from (carried over from the
+        prior day's final NAV by ``run_range``). When None — e.g. when
+        ``_run_one_day`` is invoked outside ``run_range`` — the live
+        portfolio NAV is fetched as a fallback.
+        """
+        if starting_nav is None:
+            starting_nav = await self._fetch_nav(self._portfolio_id)
 
         run_id = await self._create_backtest_run_row(
             trading_date=trading_date,
@@ -235,6 +254,7 @@ class BacktestRunner:
         ctx = self._build_context(
             trading_date=trading_date,
             backtest_run_id=run_id,
+            starting_nav=starting_nav,
         )
 
         # The orchestrator's hard-exit gate uses IST clock.time();
@@ -268,6 +288,7 @@ class BacktestRunner:
         *,
         trading_date: date,
         backtest_run_id: uuid.UUID,
+        starting_nav: float,
     ) -> OrchestratorContext:
         """Wire backtest-mode I/O into a fresh context for one day."""
         bt_clock = BacktestClock(
@@ -300,6 +321,7 @@ class BacktestRunner:
             feature_getter=feature_getter,
             universe_selector=universe_selector,
             recorder=recorder,
+            nav_override=starting_nav,
         )
 
     # ------------------------------------------------------------------

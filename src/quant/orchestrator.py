@@ -220,7 +220,11 @@ async def run_loop(
     open_positions: list[OpenPosition] = []
     realized_pnl_total: Decimal = Decimal("0")
 
-    starting_nav = await _get_nav(portfolio_id)
+    starting_nav = (
+        ctx.nav_override
+        if ctx.nav_override is not None
+        else await _get_nav(portfolio_id)
+    )
     starting_nav_d = Decimal(str(starting_nav))
     circuit = CircuitState(
         starting_nav=starting_nav,
@@ -354,14 +358,14 @@ async def run_loop(
             # 5. Day-level circuit breaker
             if circuit.kill_active:
                 logger.info("[QUANT] Kill switch active — skipping new entries this tick")
-                await _sleep_tick(settings, tick_start, replay_mode)
+                await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
                 continue
 
             # 6. Capacity gate
             if len(open_positions) >= settings.laabh_quant_max_concurrent_positions:
-                await _sleep_tick(settings, tick_start, replay_mode)
+                await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
                 continue
@@ -369,7 +373,7 @@ async def run_loop(
             # 7. First-entry warmup gate
             minutes_since_open = (now_ist - _session_open_ist_time).total_seconds() / 60.0
             if minutes_since_open < settings.laabh_quant_first_entry_after_minutes:
-                await _sleep_tick(settings, tick_start, replay_mode)
+                await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
                 continue
@@ -381,7 +385,7 @@ async def run_loop(
                 if not circuit.arm_in_cooloff(a, current_time)
             ]
             if not active_arms:
-                await _sleep_tick(settings, tick_start, replay_mode)
+                await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
                 continue
@@ -398,7 +402,7 @@ async def run_loop(
                 signal_strengths=signal_strengths,
             )
             if chosen_arm is None:
-                await _sleep_tick(settings, tick_start, replay_mode)
+                await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
                 continue
@@ -406,7 +410,7 @@ async def run_loop(
             # 9. Size and open position
             chosen_entry = next((sig for arm_id, _, sig in signals if arm_id == chosen_arm), None)
             if chosen_entry is None:
-                await _sleep_tick(settings, tick_start, replay_mode)
+                await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
                 continue

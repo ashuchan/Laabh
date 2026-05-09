@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Date, ForeignKey, Integer, Numeric, String, func
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -26,8 +26,12 @@ class QuantDayState(Base):
     lockin_target_pct: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
     kill_switch_pct: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
 
-    lockin_fired_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    kill_switch_fired_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    lockin_fired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    kill_switch_fired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     final_nav: Mapped[float | None] = mapped_column(Numeric(15, 2), nullable=True)
     pnl_pct: Mapped[float | None] = mapped_column(Numeric(8, 4), nullable=True)
@@ -37,4 +41,6 @@ class QuantDayState(Base):
     bandit_algo: Mapped[str] = mapped_column(String(15), nullable=False)
     forget_factor: Mapped[float] = mapped_column(Numeric(5, 3), nullable=False)
 
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

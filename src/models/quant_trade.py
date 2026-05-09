@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, ForeignKey, Index, Integer, Numeric, String, func
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, Numeric, String, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,10 +30,10 @@ class QuantTrade(Base):
     direction: Mapped[str] = mapped_column(String(20), nullable=False)
     legs: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
-    entry_at: Mapped[datetime] = mapped_column(nullable=False)
+    entry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     entry_premium_net: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
 
-    exit_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    exit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     exit_premium_net: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     realized_pnl: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
 
@@ -49,7 +49,9 @@ class QuantTrade(Base):
     exit_reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
     status: Mapped[str] = mapped_column(String(15), server_default="open")
 
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
     __table_args__ = (
         Index("idx_quant_trades_portfolio_date", "portfolio_id", "entry_at"),

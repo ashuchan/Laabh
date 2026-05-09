@@ -1,0 +1,24 @@
+{
+  "backtest_run_and_report": {
+    "pid": 53488,
+    "log": "C:\\Users\\ashus\\OneDrive\\Documents\\Code\\Laabh\\.dashboard_logs\\backtest_run_and_report_1778356447.log",
+    "started": "2026-05-10T01:24:07",
+    "argv": [
+      "C:\\Users\\ashus\\OneDrive\\Documents\\Code\\Laabh\\.venv\\Scripts\\python.exe",
+      "-m",
+      "scripts.backtest_run_and_report",
+      "--start-date",
+      "2026-04-27",
+      "--end-date",
+      "2026-05-08",
+      "--portfolio-id",
+      "cd224cdb-7bac-4fa4-97ef-ad7377851444",
+      "--seed",
+      "60",
+      "--risk-free-rate",
+      "3.0000",
+      "--smile-method",
+      "linear"
+    ]
+  }
+}
