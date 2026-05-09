@@ -1174,3 +1174,88 @@ ON CONFLICT (source) DO NOTHING;
 
 -- Add source provenance column to existing options_chain table
 ALTER TABLE options_chain ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'nse';
+
+-- ============================================================
+-- Quant-mode backtest harness (migration 0014)
+-- ============================================================
+
+-- 3-min intraday OHLCV bars for the F&O universe (Tier 1 backtest data)
+CREATE TABLE IF NOT EXISTS price_intraday (
+    instrument_id     UUID NOT NULL REFERENCES instruments(id),
+    timestamp         TIMESTAMPTZ NOT NULL,
+    open              NUMERIC(12,2) NOT NULL,
+    high              NUMERIC(12,2) NOT NULL,
+    low               NUMERIC(12,2) NOT NULL,
+    close             NUMERIC(12,2) NOT NULL,
+    volume            BIGINT NOT NULL,
+    vwap              NUMERIC(12,2),
+    PRIMARY KEY (instrument_id, timestamp)
+);
+DO $$ BEGIN
+    PERFORM create_hypertable('price_intraday', 'timestamp',
+        chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE);
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'TimescaleDB unavailable — price_intraday is a plain table';
+END; $$;
+CREATE INDEX IF NOT EXISTS idx_price_intraday_recent
+    ON price_intraday(instrument_id, timestamp DESC);
+
+-- Daily RBI repo rate (risk-free rate input for BS pricing)
+CREATE TABLE IF NOT EXISTS rbi_repo_history (
+    date            DATE PRIMARY KEY,
+    repo_rate_pct   NUMERIC(6,4) NOT NULL,
+    source          VARCHAR(30),
+    loaded_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- One row per (portfolio, backtest_date) replay
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    portfolio_id        UUID NOT NULL REFERENCES portfolios(id),
+    backtest_date       DATE NOT NULL,
+    started_at          TIMESTAMPTZ DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    config_snapshot     JSONB NOT NULL,
+    universe            JSONB NOT NULL,
+    starting_nav        NUMERIC(15,2) NOT NULL,
+    final_nav           NUMERIC(15,2),
+    pnl_pct             NUMERIC(8,4),
+    trade_count         INT,
+    winning_trades      INT,
+    bandit_seed         BIGINT NOT NULL,
+    git_sha             VARCHAR(40),
+    notes               TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_date
+    ON backtest_runs(backtest_date DESC);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_portfolio_date
+    ON backtest_runs(portfolio_id, backtest_date DESC);
+
+-- Per-trade ledger for backtest replays (separate from live quant_trades)
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    id                       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    backtest_run_id          UUID NOT NULL REFERENCES backtest_runs(id),
+    underlying_id            UUID NOT NULL REFERENCES instruments(id),
+    primitive_name           VARCHAR(30) NOT NULL,
+    arm_id                   VARCHAR(80) NOT NULL,
+    direction                VARCHAR(20) NOT NULL,
+    legs                     JSONB NOT NULL,
+    entry_at                 TIMESTAMPTZ NOT NULL,
+    entry_premium_net        NUMERIC(12,2) NOT NULL,
+    exit_at                  TIMESTAMPTZ,
+    exit_premium_net         NUMERIC(12,2),
+    realized_pnl             NUMERIC(12,2),
+    estimated_costs          NUMERIC(10,2) NOT NULL,
+    signal_strength_at_entry NUMERIC(5,3) NOT NULL,
+    posterior_mean_at_entry  NUMERIC(10,6) NOT NULL,
+    sampled_mean_at_entry    NUMERIC(10,6) NOT NULL,
+    kelly_fraction           NUMERIC(6,4) NOT NULL,
+    lots                     INT NOT NULL,
+    exit_reason              VARCHAR(30),
+    chain_source             VARCHAR(20),
+    underlying_source        VARCHAR(20)
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_run
+    ON backtest_trades(backtest_run_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_arm
+    ON backtest_trades(arm_id);

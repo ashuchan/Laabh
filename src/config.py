@@ -413,6 +413,57 @@ class Settings(BaseSettings):
         default="", alias="LAABH_QUANT_PORTFOLIO_NAME"
     )
 
+    # --- Quant backtest harness (CLAUDE-FNO-TASK-QUANT-BACKTEST §7) ---
+    # Off by default — backtest paths only activate when the runner sets mode.
+    laabh_quant_backtest_mode_enabled: bool = Field(
+        default=False, alias="LAABH_QUANT_BACKTEST_MODE_ENABLED"
+    )
+    laabh_quant_backtest_data_window_months: int = Field(
+        default=12, ge=1, alias="LAABH_QUANT_BACKTEST_DATA_WINDOW_MONTHS"
+    )
+    laabh_quant_backtest_universe_size: int = Field(
+        default=20, ge=1, alias="LAABH_QUANT_BACKTEST_UNIVERSE_SIZE"
+    )
+    laabh_quant_backtest_use_synthesized_chains: bool = Field(
+        default=True, alias="LAABH_QUANT_BACKTEST_USE_SYNTHESIZED_CHAINS"
+    )
+    laabh_quant_backtest_iv_smile_method: Literal["flat", "linear", "sabr"] = Field(
+        default="linear", alias="LAABH_QUANT_BACKTEST_IV_SMILE_METHOD"
+    )
+    # Top-gainers selector mix (10 + 5 + 5 = 20 by default)
+    laabh_quant_backtest_top_gainers_count: int = Field(
+        default=10, ge=0, alias="LAABH_QUANT_BACKTEST_TOP_GAINERS_COUNT"
+    )
+    laabh_quant_backtest_top_movers_count: int = Field(
+        default=5, ge=0, alias="LAABH_QUANT_BACKTEST_TOP_MOVERS_COUNT"
+    )
+    laabh_quant_backtest_top_gappers_count: int = Field(
+        default=5, ge=0, alias="LAABH_QUANT_BACKTEST_TOP_GAPPERS_COUNT"
+    )
+    laabh_quant_backtest_min_price: float = Field(
+        default=50.0, gt=0.0, alias="LAABH_QUANT_BACKTEST_MIN_PRICE"
+    )
+    # Dhan historical loader rate limit (per minute)
+    laabh_quant_backtest_dhan_rate_limit_per_min: int = Field(
+        default=30, ge=1, alias="LAABH_QUANT_BACKTEST_DHAN_RATE_LIMIT_PER_MIN"
+    )
+    laabh_quant_backtest_dhan_lookback_days_per_call: int = Field(
+        default=30, ge=1, alias="LAABH_QUANT_BACKTEST_DHAN_LOOKBACK_DAYS_PER_CALL"
+    )
+    # Walk-forward (Lopez de Prado purged k-fold)
+    laabh_quant_backtest_walk_forward_train_days: int = Field(
+        default=60, ge=1, alias="LAABH_QUANT_BACKTEST_WALK_FORWARD_TRAIN_DAYS"
+    )
+    laabh_quant_backtest_walk_forward_test_days: int = Field(
+        default=20, ge=1, alias="LAABH_QUANT_BACKTEST_WALK_FORWARD_TEST_DAYS"
+    )
+    laabh_quant_backtest_walk_forward_purge_days: int = Field(
+        default=5, ge=0, alias="LAABH_QUANT_BACKTEST_WALK_FORWARD_PURGE_DAYS"
+    )
+    laabh_quant_backtest_bootstrap_iterations: int = Field(
+        default=1000, ge=100, alias="LAABH_QUANT_BACKTEST_BOOTSTRAP_ITERATIONS"
+    )
+
     @property
     def sync_database_url(self) -> str:
         """Sync URL for Alembic (replace asyncpg driver with psycopg2)."""

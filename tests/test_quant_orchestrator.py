@@ -37,7 +37,14 @@ async def test_tick_error_does_not_crash_run_loop(monkeypatch):
     universe = [{"id": underlying_id, "symbol": "NIFTY", "name": "Nifty 50"}]
     selector = ArmSelector(["NIFTY_orb"], seed=0)
 
-    monkeypatch.setattr(orch, "load_universe", AsyncMock(return_value=universe))
+    # Post-Task-9 / M2 fix: orchestrator goes through ctx.universe_selector
+    # (LLMUniverseSelector by default). Patch the selector class so the
+    # live-default ctx built inside run_loop picks up the mock.
+    from src.quant.universe import LLMUniverseSelector
+    monkeypatch.setattr(
+        LLMUniverseSelector, "select",
+        AsyncMock(return_value=universe),
+    )
     monkeypatch.setattr(orch.persistence, "load_morning", AsyncMock(return_value=selector))
     monkeypatch.setattr(orch.persistence, "save_eod", AsyncMock(return_value=None))
     monkeypatch.setattr(orch, "_init_day_state", AsyncMock(return_value=None))
@@ -286,10 +293,16 @@ async def test_close_position_raises_on_db_failure():
     """When the DB write fails, _close_position must propagate the error so
     the orchestrator's tick try/except keeps the position in memory rather
     than silently losing it (and double-counting realised P&L on restart).
+
+    Post-Task-9: the close path now delegates to the recorder. We inject a
+    recorder whose ``close_trade`` raises, which is the same failure surface
+    the original test exercised — just now expressed at the recorder level
+    instead of patching session_scope.
     """
-    from unittest.mock import patch
+    from src.quant.context import OrchestratorContext
     from src.quant.exits import OpenPosition
     from src.quant.orchestrator import _close_position
+    from src.quant.recorder import TradeRecorder
 
     pos = OpenPosition(
         arm_id="A_orb",
@@ -300,22 +313,31 @@ async def test_close_position_raises_on_db_failure():
         lots=2,
     )
 
-    class _FailingScope:
-        async def __aenter__(self):
+    class _FailingRecorder(TradeRecorder):
+        async def open_trade(self, payload):
+            return None
+
+        async def close_trade(self, payload):
             raise RuntimeError("DB connection lost")
 
-        async def __aexit__(self, *a):
-            return False
+        async def init_day(self, payload):
+            return
 
-    with patch("src.db.session_scope", return_value=_FailingScope()):
-        with pytest.raises(RuntimeError, match="DB connection lost"):
-            await _close_position(
-                pos,
-                Decimal("110"),
-                "trailing_stop",
-                uuid.uuid4(),
-                datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
-            )
+        async def finalize_day(self, payload):
+            return
+
+    ctx = OrchestratorContext.live()
+    ctx.recorder = _FailingRecorder()
+
+    with pytest.raises(RuntimeError, match="DB connection lost"):
+        await _close_position(
+            pos,
+            Decimal("110"),
+            "trailing_stop",
+            uuid.uuid4(),
+            datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+            ctx,
+        )
 
 
 def test_replay_bandit_reward_is_per_lot_return():

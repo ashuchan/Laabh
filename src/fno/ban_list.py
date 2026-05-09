@@ -105,8 +105,13 @@ async def fetch_today(
             if existing.scalar_one_or_none() is not None:
                 continue
 
+            # Drive-by fix: migration 0007 added `symbol` as NOT NULL with no
+            # server default, but this insert never set it — every fresh insert
+            # would have failed with IntegrityError. Set it explicitly here;
+            # `is_active` has a server default of true so we leave it alone.
             session.add(FNOBanList(
                 instrument_id=instrument.id,
+                symbol=sym,
                 ban_date=target_date,
                 source=source,
                 fetched_at=datetime.now(tz=timezone.utc),

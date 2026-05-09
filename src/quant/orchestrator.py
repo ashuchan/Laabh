@@ -1,7 +1,13 @@
 """Master 3-min loop — ties all layers together.
 
-run_loop(portfolio_id) is the entry point called by the scheduler when
-LAABH_INTRADAY_MODE=quant.
+``run_loop(portfolio_id)`` is the entry point called by the scheduler when
+``LAABH_INTRADAY_MODE=quant``. The same loop also drives backtest replays
+when an ``OrchestratorContext`` with backtest-mode dependencies is injected.
+
+The mode-divergent I/O (clock, feature reads, universe selection, trade
+ledger) is encapsulated in ``OrchestratorContext`` (see ``src.quant.context``).
+When no context is supplied, ``run_loop`` builds the live default — existing
+call sites remain unchanged.
 """
 from __future__ import annotations
 
@@ -21,11 +27,17 @@ from src.config import get_settings
 from src.quant import feature_store
 from src.quant.bandit.lints import build_context
 from src.quant.circuit_breaker import CircuitState
+from src.quant.context import OrchestratorContext
 from src.quant.exits import OpenPosition, should_close
 from src.quant import persistence
+from src.quant.recorder import (
+    CloseTradePayload,
+    DayFinalizePayload,
+    DayInitPayload,
+    OpenTradePayload,
+)
 from src.quant import reports
 from src.quant.sizer import compute_lots
-from src.quant.universe import load_universe
 
 _IST = pytz.timezone("Asia/Kolkata")
 # Total tradeable minutes per session: 09:15–14:30 = 315 min
@@ -147,6 +159,7 @@ async def run_loop(
     *,
     as_of: datetime | None = None,
     dryrun_run_id: uuid.UUID | None = None,
+    ctx: OrchestratorContext | None = None,
 ) -> None:
     """3-min orchestration loop for quant mode.
 
@@ -154,14 +167,27 @@ async def run_loop(
         portfolio_id: The portfolio being traded.
         as_of: Override "now" for replay/backtest. None → live.
         dryrun_run_id: Dry-run correlation ID; when set, no real orders placed.
+        ctx: Injectable I/O bundle — clock, feature getter, universe selector,
+            trade recorder. Defaults to live-mode wiring; backtest callers
+            (BacktestRunner) pass a backtest-configured context.
     """
     settings = get_settings()
-    today = (as_of or datetime.now(timezone.utc)).date()
+    if ctx is None:
+        ctx = OrchestratorContext.live()
 
-    logger.info(f"[QUANT] Starting orchestrator loop for {today} (portfolio={portfolio_id})")
+    today = (as_of or ctx.clock.now()).date()
+
+    logger.info(
+        f"[QUANT] Starting orchestrator loop for {today} "
+        f"(portfolio={portfolio_id}, mode={ctx.mode})"
+    )
 
     # --- Bootstrap ---
-    universe = await load_universe(today, as_of=as_of, dryrun_run_id=dryrun_run_id)
+    # Universe selection goes through the injected selector unconditionally.
+    # Live default = LLMUniverseSelector (functionally identical to the legacy
+    # load_universe shim); backtest default = TopGainersUniverseSelector.
+    # No branch on ``ctx.mode`` — DIP: orchestrator doesn't know modes.
+    universe = await ctx.universe_selector.select(today)
     if not universe:
         logger.warning("[QUANT] Empty universe — aborting orchestrator loop")
         return
@@ -204,7 +230,7 @@ async def run_loop(
         cooloff_minutes=settings.laabh_quant_cooloff_minutes,
     )
 
-    await _init_day_state(portfolio_id, today, starting_nav, universe, settings)
+    await _init_day_state(portfolio_id, today, starting_nav, universe, settings, ctx)
 
     # Crash recovery: rebuild in-memory state from any open / closed trades
     # already written for today (e.g. after a process restart mid-session).
@@ -227,7 +253,10 @@ async def run_loop(
     )
 
     replay_mode = as_of is not None
-    current_time = as_of if replay_mode else datetime.now(timezone.utc)
+    # Time source: prefer ctx.clock (live default = LiveClock; backtest =
+    # BacktestClockAdapter). The legacy ``as_of`` replay path is preserved
+    # for backwards compatibility — when set, it overrides the clock.
+    current_time = as_of if replay_mode else ctx.clock.now()
     poll_delta = timedelta(seconds=settings.laabh_quant_poll_interval_sec)
     hard_exit_time = settings.laabh_quant_hard_exit_time
     estimated_costs_per_lot = Decimal(str(settings.laabh_quant_estimated_costs_per_lot))
@@ -239,7 +268,7 @@ async def run_loop(
     # --- Main loop ---
     while True:
         if not replay_mode:
-            current_time = datetime.now(timezone.utc)
+            current_time = ctx.clock.now()
 
         now_ist = current_time.astimezone(_IST)
 
@@ -253,7 +282,7 @@ async def run_loop(
             # 1. Refresh features for each underlying
             features_map = {}
             for u in universe:
-                bundle = await feature_store.get(u["id"], current_time)
+                bundle = await ctx.feature_getter(u["id"], current_time)
                 if bundle:
                     features_map[u["symbol"]] = bundle
                     sym_hist = history[u["symbol"]]
@@ -290,7 +319,7 @@ async def run_loop(
                 )
                 if close:
                     pnl = await _close_position(
-                        pos, current_premium, reason, portfolio_id, current_time
+                        pos, current_premium, reason, portfolio_id, current_time, ctx
                     )
                     open_positions.remove(pos)
                     realized_pnl_total += pnl
@@ -420,6 +449,7 @@ async def run_loop(
                     entry_bundle=chosen_bundle,
                     kelly_fraction=settings.laabh_quant_kelly_fraction,
                     estimated_costs_per_lot=estimated_costs_per_lot,
+                    ctx=ctx,
                 )
                 if pos:
                     open_positions.append(pos)
@@ -429,7 +459,7 @@ async def run_loop(
                 f"[QUANT] Tick failed at {now_ist.strftime('%H:%M:%S')}: {exc!r}"
             )
 
-        await _sleep_tick(settings, tick_start, replay_mode)
+        await _sleep_tick(settings, tick_start, replay_mode, ctx)
         if replay_mode:
             current_time += poll_delta
 
@@ -443,7 +473,7 @@ async def run_loop(
         bundle = features_map.get(symbol)
         premium = _get_premium_from_bundle(pos, bundle) if bundle else pos.entry_premium_net
         try:
-            pnl = await _close_position(pos, premium, "time_stop", portfolio_id, current_time)
+            pnl = await _close_position(pos, premium, "time_stop", portfolio_id, current_time, ctx)
             realized_pnl_total += pnl
         except Exception as exc:
             logger.error(
@@ -452,11 +482,14 @@ async def run_loop(
             )
 
     final_nav = float(starting_nav_d + realized_pnl_total)
-    await _finalize_day_state(portfolio_id, today, final_nav, starting_nav, circuit)
+    await _finalize_day_state(portfolio_id, today, final_nav, starting_nav, circuit, ctx)
     await persistence.save_eod(
         portfolio_id, today, selector, all_arms, underlying_map
     )
-    await reports.generate_eod(portfolio_id, today)
+    if ctx.mode != "backtest":
+        # Backtest reporting is handled centrally by BacktestRunner;
+        # per-day EOD reports would noise up the runs/ directory.
+        await reports.generate_eod(portfolio_id, today)
     logger.info(f"[QUANT] Day complete. Final NAV={final_nav:.2f}")
 
 
@@ -575,11 +608,9 @@ async def _open_position(
     entry_bundle,
     kelly_fraction: float,
     estimated_costs_per_lot: Decimal,
+    ctx: OrchestratorContext,
 ) -> OpenPosition | None:
-    """Record a new quant trade in the DB and return an OpenPosition."""
-    from src.db import session_scope
-    from src.models.quant_trade import QuantTrade
-
+    """Record a new trade via the recorder and return an in-memory OpenPosition."""
     if underlying_id is None:
         logger.error(f"[QUANT] No underlying_id for {arm_id} — skipping open")
         return None
@@ -587,37 +618,29 @@ async def _open_position(
         logger.error(f"[QUANT] Unexpected signal direction {signal.direction!r} for {arm_id}")
         return None
 
-    # Use live ATM mid as entry premium; stub fallback when chain data unavailable
     entry_premium = _get_premium_from_bundle_stub(entry_bundle)
     bandit_seed = _seed_for_arm(portfolio_id, arm_id, now.date())
     estimated_costs = estimated_costs_per_lot * Decimal(lots)
 
-    trade_id: uuid.UUID | None = None
-    try:
-        async with session_scope() as session:
-            trade = QuantTrade(
-                portfolio_id=portfolio_id,
-                underlying_id=underlying_id,
-                primitive_name=primitive_name,
-                arm_id=arm_id,
-                direction=signal.direction,
-                legs={},
-                entry_at=now,
-                entry_premium_net=entry_premium,
-                estimated_costs=estimated_costs,
-                signal_strength_at_entry=signal.strength,
-                posterior_mean_at_entry=posterior_mean,
-                sampled_mean_at_entry=posterior_mean,
-                bandit_seed=bandit_seed,
-                kelly_fraction=kelly_fraction,
-                lots=lots,
-                status="open",
-            )
-            session.add(trade)
-            await session.flush()  # populate server-generated id before commit
-            trade_id = trade.id
-    except Exception as exc:
-        logger.error(f"[QUANT] Failed to open position {arm_id}: {exc!r}")
+    payload = OpenTradePayload(
+        portfolio_id=portfolio_id,
+        underlying_id=underlying_id,
+        primitive_name=primitive_name,
+        arm_id=arm_id,
+        direction=signal.direction,
+        entry_at=now,
+        entry_premium_net=entry_premium,
+        estimated_costs=estimated_costs,
+        signal_strength_at_entry=signal.strength,
+        posterior_mean_at_entry=posterior_mean,
+        sampled_mean_at_entry=posterior_mean,
+        bandit_seed=bandit_seed,
+        kelly_fraction=kelly_fraction,
+        lots=lots,
+        legs={},
+    )
+    trade_id = await ctx.recorder.open_trade(payload)
+    if trade_id is None:
         return None
 
     pos = OpenPosition(
@@ -647,37 +670,22 @@ async def _close_position(
     reason: str,
     portfolio_id: uuid.UUID,
     now: datetime,
+    ctx: OrchestratorContext,
 ) -> Decimal:
-    """Mark the quant trade closed and return realised P&L (premium delta × lots)."""
-    from src.db import session_scope
-    from sqlalchemy import select
-    from src.models.quant_trade import QuantTrade
-
+    """Delegate the close to the recorder and return realised P&L."""
     pnl = (exit_premium - pos.entry_premium_net) * Decimal(pos.lots)
     try:
-        async with session_scope() as session:
-            trade = None
-            if pos.trade_id is not None:
-                trade = await session.get(QuantTrade, pos.trade_id)
-            if trade is None:
-                # Fallback: most-recent open trade for this arm. Only kicks in
-                # when trade_id is missing (e.g. a position rebuilt from a
-                # crash-recovery pass that lost the in-memory id mapping).
-                q = (
-                    select(QuantTrade)
-                    .where(QuantTrade.arm_id == pos.arm_id)
-                    .where(QuantTrade.portfolio_id == portfolio_id)
-                    .where(QuantTrade.status == "open")
-                    .order_by(QuantTrade.entry_at.desc())
-                    .limit(1)
-                )
-                trade = (await session.execute(q)).scalar_one_or_none()
-            if trade:
-                trade.exit_at = now  # simulated time so replay exit_at is correct
-                trade.exit_premium_net = exit_premium
-                trade.realized_pnl = pnl
-                trade.exit_reason = reason
-                trade.status = "closed"
+        await ctx.recorder.close_trade(
+            CloseTradePayload(
+                trade_id=pos.trade_id,
+                arm_id=pos.arm_id,
+                portfolio_id=portfolio_id,
+                exit_at=now,
+                exit_premium_net=exit_premium,
+                realized_pnl=pnl,
+                exit_reason=reason,
+            )
+        )
     except Exception as exc:
         # Surface the failure so the caller's outer try/except keeps the
         # position in memory; otherwise we'd lose track of it (orphan row in
@@ -695,24 +703,24 @@ async def _init_day_state(
     starting_nav: float,
     universe: list[dict],
     settings,
+    ctx: OrchestratorContext,
 ) -> None:
-    from src.db import session_scope
-    from src.models.quant_day_state import QuantDayState
-
-    async with session_scope() as session:
-        existing = await session.get(QuantDayState, (portfolio_id, today))
-        if existing is None:
-            state = QuantDayState(
-                portfolio_id=portfolio_id,
-                date=today,
-                starting_nav=starting_nav,
-                universe=[{"id": str(u["id"]), "symbol": u["symbol"]} for u in universe],
-                lockin_target_pct=settings.laabh_quant_lockin_target_pct,
-                kill_switch_pct=settings.laabh_quant_kill_switch_dd_pct,
-                bandit_algo=settings.laabh_quant_bandit_algo,
-                forget_factor=settings.laabh_quant_bandit_forget_factor,
-            )
-            session.add(state)
+    """Delegate per-day setup to the recorder (live → quant_day_state, backtest → no-op)."""
+    payload = DayInitPayload(
+        portfolio_id=portfolio_id,
+        trading_date=today,
+        starting_nav=starting_nav,
+        universe=universe,
+        config_snapshot={
+            "primitives": settings.quant_primitives_list,
+            "bandit_algo": settings.laabh_quant_bandit_algo,
+            "forget_factor": settings.laabh_quant_bandit_forget_factor,
+            "lockin_target_pct": settings.laabh_quant_lockin_target_pct,
+            "kill_switch_pct": settings.laabh_quant_kill_switch_dd_pct,
+        },
+        bandit_seed=settings.laabh_quant_bandit_seed or 0,
+    )
+    await ctx.recorder.init_day(payload)
 
 
 async def _finalize_day_state(
@@ -721,33 +729,62 @@ async def _finalize_day_state(
     final_nav: float,
     starting_nav: float,
     circuit: CircuitState,
+    ctx: OrchestratorContext,
 ) -> None:
+    """Delegate per-day teardown — recorder updates the right ledger.
+
+    Trade-count is computed from the same ledger the recorder writes to.
+    For live: ``quant_trades`` (existing behavior). For backtest: the
+    recorder counts via ``backtest_trades`` for its own run_id.
+    """
     from src.db import session_scope
-    from src.models.quant_day_state import QuantDayState
     from sqlalchemy import select, func
     from src.models.quant_trade import QuantTrade
     from src.quant.reports import _day_start
 
-    async with session_scope() as session:
-        state = await session.get(QuantDayState, (portfolio_id, today))
-        if state:
-            state.final_nav = final_nav
-            state.pnl_pct = (final_nav - starting_nav) / starting_nav if starting_nav else 0.0
-            # Persist circuit-breaker fire times so EOD report can read them
-            state.lockin_fired_at = circuit.lockin_fired_at
-            state.kill_switch_fired_at = circuit.kill_fired_at
-
+    # Live recorder needs an accurate trade count — query the live ledger.
+    # Backtest recorder ignores the count we pass and queries its own ledger.
+    trade_count = 0
+    if ctx.mode != "backtest":
+        async with session_scope() as session:
             q = select(func.count()).where(
                 QuantTrade.portfolio_id == portfolio_id,
                 QuantTrade.entry_at >= _day_start(today),
             )
-            state.trade_count = (await session.execute(q)).scalar() or 0
+            trade_count = (await session.execute(q)).scalar() or 0
+
+    payload = DayFinalizePayload(
+        portfolio_id=portfolio_id,
+        trading_date=today,
+        final_nav=final_nav,
+        starting_nav=starting_nav,
+        lockin_fired_at=circuit.lockin_fired_at,
+        kill_switch_fired_at=circuit.kill_fired_at,
+        trade_count=trade_count,
+    )
+    await ctx.recorder.finalize_day(payload)
 
 
-async def _sleep_tick(settings, tick_start: datetime, replay_mode: bool) -> None:
+async def _sleep_tick(
+    settings,
+    tick_start: datetime,
+    replay_mode: bool,
+    ctx: OrchestratorContext,
+) -> None:
+    """Delegate the tick wait to the injected clock.
+
+    Live clock blocks on ``asyncio.sleep``; backtest adapter advances virtual
+    time. In replay mode the orchestrator advances ``current_time`` itself
+    (legacy path, used by tests and by ``BacktestRunner``); we still need
+    to keep the clock's virtual state synchronised so consumers like
+    ``LookaheadGuard`` don't see the clock frozen at session open. The
+    ``advance(seconds)`` call is a no-op on the LiveClock and a virtual
+    advance on the BacktestClockAdapter — preserving both behaviors.
+    """
     if replay_mode:
+        ctx.clock.advance(settings.laabh_quant_poll_interval_sec)
         return
-    elapsed = (datetime.now(timezone.utc) - tick_start).total_seconds()
-    sleep_sec = max(0.0, settings.laabh_quant_poll_interval_sec - elapsed)
-    if sleep_sec > 0:
-        await asyncio.sleep(sleep_sec)
+    await ctx.clock.sleep_until_next_tick(
+        tick_start=tick_start,
+        poll_seconds=settings.laabh_quant_poll_interval_sec,
+    )
