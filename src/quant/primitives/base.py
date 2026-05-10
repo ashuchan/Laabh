@@ -31,6 +31,8 @@ class BasePrimitive(ABC):
         self,
         features: FeatureBundle,
         history: list[FeatureBundle],
+        *,
+        trace: dict | None = None,
     ) -> Signal | None:
         """Return a Signal with strength ∈ [-1, 1] or None if no signal.
 
@@ -38,6 +40,17 @@ class BasePrimitive(ABC):
             features: Current-bar feature bundle.
             history: Prior bars (oldest first), length may be < warmup_minutes
                      during startup. Return None if warmup not yet satisfied.
+            trace: When non-None, the primitive populates this dict with
+                   inputs / intermediates / a human-readable formula. Used by
+                   the Decision Inspector to render formula cards. Caller
+                   owns the dict; primitive only mutates. Live mode passes
+                   None, so there is zero overhead in production.
+
+        Trace shape (when populated):
+            {"name": <primitive name>,
+             "inputs": {<feature name>: value, ...},
+             "intermediates": {<derived name>: value, ...},
+             "formula": "<human-readable formula with values plugged in>"}
         """
 
     def _past_warmup(self, history: list[FeatureBundle]) -> bool:

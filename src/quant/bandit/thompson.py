@@ -48,16 +48,55 @@ class ThompsonSampler:
     # Core API
     # ------------------------------------------------------------------
 
-    def select(self, signalling_arms: list[ArmId]) -> ArmId | None:
+    def select(
+        self,
+        signalling_arms: list[ArmId],
+        *,
+        trace: dict | None = None,
+    ) -> ArmId | None:
         """Pick the best arm from those currently signalling.
 
         Returns None if *signalling_arms* is empty or none match known arms.
+
+        When ``trace`` is non-None, the method populates it with the
+        full per-arm tournament so the Decision Inspector can render the
+        bandit card. Random sampling is unchanged — every arm's sample is
+        captured exactly as it was used to score, so the trace is faithful.
+
+        Trace shape (when populated):
+            {"algo": "thompson",
+             "arms": {<arm_id>: {"posterior_mean": ...,
+                                 "posterior_var": ...,
+                                 "sampled_mean": ...,
+                                 "score": <same as sampled_mean here>},
+                      ...},
+             "selected": <chosen_arm or None>,
+             "n_competitors": <int>}
         """
         candidates = [a for a in signalling_arms if a in self._posteriors]
         if not candidates:
+            if trace is not None:
+                trace["algo"] = "thompson"
+                trace["arms"] = {}
+                trace["selected"] = None
+                trace["n_competitors"] = 0
             return None
         samples = {arm: self._posteriors[arm].sample(self._rng) for arm in candidates}
-        return max(samples, key=samples.__getitem__)
+        chosen = max(samples, key=samples.__getitem__)
+        if trace is not None:
+            trace["algo"] = "thompson"
+            trace["arms"] = {
+                arm: {
+                    "posterior_mean": float(self._posteriors[arm].mean),
+                    "posterior_var": float(self._posteriors[arm].var),
+                    "sampled_mean": float(samples[arm]),
+                    "score": float(samples[arm]),
+                }
+                for arm in candidates
+            }
+            trace["selected"] = chosen
+            trace["n_competitors"] = len(candidates)
+        return chosen
 
     def update(self, arm: ArmId, reward: float) -> None:
         """Update the posterior for *arm* with observed *reward*."""

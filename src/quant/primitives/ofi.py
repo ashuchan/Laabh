@@ -27,6 +27,8 @@ class OFIPrimitive(BasePrimitive):
         self,
         features: FeatureBundle,
         history: list[FeatureBundle],
+        *,
+        trace: dict | None = None,
     ) -> Signal | None:
         if not self._past_warmup(history):
             return None
@@ -52,6 +54,24 @@ class OFIPrimitive(BasePrimitive):
             direction, strategy = "bullish", "long_call"
         else:
             direction, strategy = "bearish", "long_put"
+
+        if trace is not None:
+            trace["name"] = self.name
+            trace["inputs"] = {
+                "bid_volume_3min_change": float(features.bid_volume_3min_change),
+                "ask_volume_3min_change": float(features.ask_volume_3min_change),
+                "atm_bid": float(features.atm_bid),
+                "atm_ask": float(features.atm_ask),
+            }
+            trace["intermediates"] = {
+                "ofi": float(ofi),
+                "ema_ofi": float(ema_ofi),
+            }
+            trace["formula"] = (
+                f"ofi = bid_Δ − ask_Δ = {ofi:.2f}; "
+                f"strength = tanh(ofi / ema_ofi) = tanh({ofi:.2f} / {ema_ofi:.2f}) "
+                f"= {strength:.4f}"
+            )
 
         return Signal(
             direction=direction,  # type: ignore[arg-type]

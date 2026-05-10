@@ -326,6 +326,9 @@ async def test_close_position_raises_on_db_failure():
         async def finalize_day(self, payload):
             return
 
+        async def record_signals(self, payload):
+            return
+
     ctx = OrchestratorContext.live()
     ctx.recorder = _FailingRecorder()
 

@@ -44,6 +44,7 @@ class _RecordingRecorder(TradeRecorder):
         self.closes: list[CloseTradePayload] = []
         self.day_inits: list[DayInitPayload] = []
         self.day_finalizes: list[DayFinalizePayload] = []
+        self.signal_logs: list = []
 
     async def open_trade(self, payload):
         self.opens.append(payload)
@@ -57,6 +58,9 @@ class _RecordingRecorder(TradeRecorder):
 
     async def finalize_day(self, payload):
         self.day_finalizes.append(payload)
+
+    async def record_signals(self, payload):
+        self.signal_logs.append(payload)
 
 
 class _StubUniverseSelector:
@@ -162,6 +166,22 @@ async def test_run_loop_with_backtest_context_drives_recorder(monkeypatch):
 
     # Universe selector consulted exactly once
     assert len(feature_calls) >= 1  # at least one tick before hard-exit
+
+    # Decision-Inspector trace plumbing: signal-log payloads carry the
+    # virtual_time and an entries list (may be empty when no primitive
+    # fires in this short test window — but the recorder must at minimum
+    # be wired and reachable). Each entry, if present, must expose the
+    # three optional trace fields without raising.
+    for payload in recorder.signal_logs:
+        assert payload.virtual_time is not None
+        for entry in payload.entries:
+            # Fields exist on the dataclass — None when not applicable, dict
+            # when populated. Either is acceptable here; the focused unit
+            # tests in test_quant_decision_inspector_traces.py assert the
+            # population semantics per bucket.
+            assert hasattr(entry, "primitive_trace")
+            assert hasattr(entry, "bandit_trace")
+            assert hasattr(entry, "sizer_trace")
 
 
 @pytest.mark.asyncio

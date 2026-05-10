@@ -35,6 +35,8 @@ from src.quant.recorder import (
     DayFinalizePayload,
     DayInitPayload,
     OpenTradePayload,
+    RecordSignalsPayload,
+    SignalLogEntry,
 )
 from src.quant import reports
 from src.quant.sizer import compute_lots
@@ -152,6 +154,94 @@ def _build_tick_context(
         nifty_5d_return=0.0,   # wired in when macro data is available
         realized_vol_30min_pctile=rv30_pctile,
     )
+
+
+def _slice_bandit_trace(full: dict | None, arm_id: str) -> dict | None:
+    """Return a per-arm slice of the full bandit trace.
+
+    The selector emits the whole tournament keyed by arm_id; per-row storage
+    keeps each row self-contained (the inspector reconstructs the tournament
+    by aggregating rows for the tick — see PR 2). Returns None when the
+    arm didn't compete or no trace was captured.
+    """
+    if not full:
+        return None
+    arms = full.get("arms") or {}
+    if arm_id not in arms:
+        return None
+    return {
+        "algo": full.get("algo"),
+        "context_vector": full.get("context_vector"),
+        "context_dims": full.get("context_dims"),
+        "this_arm": arms[arm_id],
+        "n_competitors": full.get("n_competitors"),
+    }
+
+
+async def _emit_signal_log(
+    *,
+    ctx: OrchestratorContext,
+    virtual_time: datetime,
+    all_raw_signals: list,
+    tick_disposition: dict[str, str],
+    strong_arm_set: set[str],
+    selector,
+    chosen_arm: str | None,
+    lots: int | None,
+    primitive_traces: dict[str, dict] | None = None,
+    bandit_trace_full: dict | None = None,
+    sizer_trace_full: dict | None = None,
+) -> None:
+    """Build SignalLogEntry rows for this tick and hand them to the recorder.
+
+    Best-effort: any failure in the recorder is logged but never propagated —
+    diagnostic logging must never break a live tick. The live recorder's
+    ``record_signals`` is a no-op so this path is essentially free outside
+    of backtest mode.
+
+    Trace plumbing (Decision Inspector PR 1):
+      * primitive_traces — per-arm dict, attached to that arm's row
+      * bandit_trace_full — sliced per arm; only competing arms get a slice
+      * sizer_trace_full — attached only to the chosen arm's row
+    """
+    if not all_raw_signals:
+        return
+    primitive_traces = primitive_traces or {}
+    entries: list[SignalLogEntry] = []
+    for arm_id, symbol, underlying_id, prim_name, sig in all_raw_signals:
+        # Default to weak_signal — if no later gate marked this arm, the
+        # signal must have failed the strength filter (the only reason a
+        # primitive's output can fall through every later branch).
+        reason = tick_disposition.get(arm_id, "weak_signal")
+        post = (
+            float(selector.posterior_mean(arm_id))
+            if arm_id in strong_arm_set
+            else None
+        )
+        is_chosen = chosen_arm is not None and arm_id == chosen_arm
+        entries.append(
+            SignalLogEntry(
+                underlying_id=underlying_id,
+                symbol=symbol,
+                arm_id=arm_id,
+                primitive_name=prim_name,
+                direction=sig.direction,
+                strength=float(sig.strength),
+                rejection_reason=reason,
+                posterior_mean=post,
+                bandit_selected=is_chosen,
+                lots_sized=(lots if is_chosen else None),
+                primitive_trace=primitive_traces.get(arm_id),
+                bandit_trace=_slice_bandit_trace(bandit_trace_full, arm_id),
+                sizer_trace=(sizer_trace_full if is_chosen else None),
+            )
+        )
+    try:
+        await ctx.recorder.record_signals(
+            RecordSignalsPayload(virtual_time=virtual_time, entries=entries)
+        )
+    except Exception as exc:
+        logger.warning(f"[QUANT] _emit_signal_log: skipped tick log due to {exc!r}")
 
 
 async def run_loop(
@@ -282,7 +372,24 @@ async def run_loop(
         tick_start = current_time
         logger.debug(f"[QUANT] tick at {now_ist.strftime('%H:%M:%S')} IST")
 
+        # Per-tick funnel-log scratch space. Populated as each gate fires so
+        # the inner ``finally`` can hand a fully-classified set of rows to
+        # the recorder regardless of which early-continue path we take.
+        all_raw_signals: list[tuple[str, str, uuid.UUID, str, Any]] = []
+        tick_disposition: dict[str, str] = {}
+        strong_arm_set: set[str] = set()
+        chosen_arm_for_log: str | None = None
+        lots_for_log: int | None = None
+        # Decision-Inspector trace scratch space. Allocated only when the
+        # recorder will consume them (backtest mode); live mode keeps these
+        # empty/None so the trace formatting cost is zero in production.
+        trace_enabled: bool = ctx.mode == "backtest"
+        primitive_traces: dict[str, dict] = {}
+        bandit_trace_full: dict | None = None
+        sizer_trace_full: dict | None = None
+
         try:
+          try:
             # 1. Refresh features for each underlying
             features_map = {}
             for u in universe:
@@ -294,7 +401,10 @@ async def run_loop(
                     if len(sym_hist) > max_history_bars:
                         del sym_hist[0]
 
-            # 2. Compute signals from each enabled primitive × each underlying
+            # 2. Compute signals from each enabled primitive × each underlying.
+            #    Capture EVERY non-None primitive output (incl. weak) for the
+            #    funnel log; the strength gate produces the working ``signals``
+            #    list the rest of the loop uses.
             signals: list[tuple[str, str, Any]] = []  # (arm_id, symbol, signal)
             for u in universe:
                 symbol = u["symbol"]
@@ -303,10 +413,23 @@ async def run_loop(
                     continue
                 hist = history[symbol][:-1]  # exclude current bundle
                 for prim in primitives:
-                    sig = prim.compute_signal(bundle, hist)
-                    if sig and abs(sig.strength) >= settings.laabh_quant_min_signal_strength:
-                        arm_id = _make_arm_id(symbol, prim.name)
+                    arm_id = _make_arm_id(symbol, prim.name)
+                    # Trace dict is allocated only in backtest mode. Each
+                    # primitive populates its own keys (name/inputs/
+                    # intermediates/formula). When live, ``ptrace`` stays
+                    # None and primitives short-circuit the formatting.
+                    ptrace: dict | None = {} if trace_enabled else None
+                    sig = prim.compute_signal(bundle, hist, trace=ptrace)
+                    if sig is None:
+                        continue
+                    all_raw_signals.append((arm_id, symbol, u["id"], prim.name, sig))
+                    if ptrace:
+                        primitive_traces[arm_id] = ptrace
+                    if abs(sig.strength) >= settings.laabh_quant_min_signal_strength:
                         signals.append((arm_id, symbol, sig))
+                        strong_arm_set.add(arm_id)
+                    else:
+                        tick_disposition[arm_id] = "weak_signal"
 
             # 3. Manage existing positions — close before NAV refresh so MTM
             #    only reflects still-open positions.
@@ -358,6 +481,8 @@ async def run_loop(
             # 5. Day-level circuit breaker
             if circuit.kill_active:
                 logger.info("[QUANT] Kill switch active — skipping new entries this tick")
+                for _aid in strong_arm_set:
+                    tick_disposition.setdefault(_aid, "kill_switch")
                 await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
@@ -365,6 +490,8 @@ async def run_loop(
 
             # 6. Capacity gate
             if len(open_positions) >= settings.laabh_quant_max_concurrent_positions:
+                for _aid in strong_arm_set:
+                    tick_disposition.setdefault(_aid, "capacity_full")
                 await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
@@ -373,6 +500,8 @@ async def run_loop(
             # 7. First-entry warmup gate
             minutes_since_open = (now_ist - _session_open_ist_time).total_seconds() / 60.0
             if minutes_since_open < settings.laabh_quant_first_entry_after_minutes:
+                for _aid in strong_arm_set:
+                    tick_disposition.setdefault(_aid, "warmup")
                 await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
@@ -384,6 +513,10 @@ async def run_loop(
                 a for a in signalling_arms
                 if not circuit.arm_in_cooloff(a, current_time)
             ]
+            # Mark every arm filtered by cooloff; the rest may still be picked
+            for _aid in signalling_arms:
+                if _aid not in active_arms:
+                    tick_disposition.setdefault(_aid, "cooloff")
             if not active_arms:
                 await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
@@ -396,20 +529,38 @@ async def run_loop(
                 minutes_since_open=minutes_since_open,
                 day_running_pnl_pct=day_running_pnl_pct,
             )
+            # Allocate the bandit-trace dict only when the recorder will use
+            # it. The selector populates it with the full per-arm tournament
+            # so the Decision Inspector can render the bandit card.
+            bandit_trace_full = {} if trace_enabled else None
             chosen_arm = selector.select(
                 active_arms,
                 context=context,
                 signal_strengths=signal_strengths,
+                trace=bandit_trace_full,
             )
             if chosen_arm is None:
+                # Bandit declined to pick any arm this tick — every active arm
+                # lost the draw.
+                for _aid in active_arms:
+                    tick_disposition.setdefault(_aid, "lost_bandit")
                 await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
                 continue
 
+            # Bandit picked one — every other active arm lost the draw.
+            for _aid in active_arms:
+                if _aid != chosen_arm:
+                    tick_disposition.setdefault(_aid, "lost_bandit")
+            chosen_arm_for_log = chosen_arm
+
             # 9. Size and open position
             chosen_entry = next((sig for arm_id, _, sig in signals if arm_id == chosen_arm), None)
             if chosen_entry is None:
+                # Defensive — chosen arm has no signal in the working list
+                # (shouldn't happen given upstream filtering).
+                tick_disposition.setdefault(chosen_arm, "lost_bandit")
                 await _sleep_tick(settings, tick_start, replay_mode, ctx)
                 if replay_mode:
                     current_time += poll_delta
@@ -422,6 +573,7 @@ async def run_loop(
                 capital * expected_gross_pnl_pct * Decimal(str(chosen_entry.strength))
             )
 
+            sizer_trace_full = {} if trace_enabled else None
             lots = compute_lots(
                 posterior_mean=selector.posterior_mean(chosen_arm),
                 portfolio_capital=capital,
@@ -435,8 +587,10 @@ async def run_loop(
                 lockin_size_reduction=settings.laabh_quant_lockin_size_reduction,
                 max_total_exposure_pct=settings.laabh_quant_max_total_exposure_pct,
                 cost_gate_multiple=settings.laabh_quant_cost_gate_multiple,
+                trace=sizer_trace_full,
             )
 
+            lots_for_log = lots
             if lots > 0:
                 chosen_symbol, chosen_primitive = arm_meta.get(chosen_arm, (chosen_arm, ""))
                 chosen_underlying_id = underlying_map.get(chosen_symbol)
@@ -457,6 +611,26 @@ async def run_loop(
                 )
                 if pos:
                     open_positions.append(pos)
+                tick_disposition.setdefault(chosen_arm, "opened")
+            else:
+                tick_disposition.setdefault(chosen_arm, "sized_zero")
+          finally:
+            # Always flush the per-tick funnel log — runs on natural fall-
+            # through, on every early ``continue``, and on exceptions raised
+            # during the body. Best-effort; helper swallows write failures.
+            await _emit_signal_log(
+                ctx=ctx,
+                virtual_time=current_time,
+                all_raw_signals=all_raw_signals,
+                tick_disposition=tick_disposition,
+                strong_arm_set=strong_arm_set,
+                selector=selector,
+                chosen_arm=chosen_arm_for_log,
+                lots=lots_for_log,
+                primitive_traces=primitive_traces,
+                bandit_trace_full=bandit_trace_full,
+                sizer_trace_full=sizer_trace_full,
+            )
 
         except Exception as exc:
             logger.exception(

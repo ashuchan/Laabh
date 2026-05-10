@@ -39,6 +39,10 @@ dependencies = [
     "openai>=1.30.0",
     "pyarrow>=24.0.0",
     "streamlit>=1.40.0",
+    # Decision Inspector (apps/decision_inspector.py) needs interactive
+    # charts with click-to-focus — Streamlit's native charts don't support
+    # selection events at the granularity we need.
+    "plotly>=5.20.0",
 ]
 
 [project.optional-dependencies]

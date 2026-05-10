@@ -47,12 +47,23 @@ class ArmSelector:
         *,
         context: np.ndarray | None = None,
         signal_strengths: dict[ArmId, float] | None = None,
+        trace: dict | None = None,
     ) -> ArmId | None:
-        """Pick best arm from signalling candidates."""
+        """Pick best arm from signalling candidates.
+
+        ``trace`` (optional) is forwarded to the underlying impl for the
+        Decision Inspector. See ``LinTSSampler.select`` /
+        ``ThompsonSampler.select`` for the per-algo trace shape.
+        """
         if self._algo == "lints":
             ctx = context if context is not None else np.zeros(5)
-            return self._impl.select(signalling_arms, context=ctx, signal_strengths=signal_strengths)
-        return self._impl.select(signalling_arms)
+            return self._impl.select(
+                signalling_arms,
+                context=ctx,
+                signal_strengths=signal_strengths,
+                trace=trace,
+            )
+        return self._impl.select(signalling_arms, trace=trace)
 
     def update(
         self,

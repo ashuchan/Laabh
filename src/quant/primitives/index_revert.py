@@ -33,6 +33,8 @@ class IndexRevertPrimitive(BasePrimitive):
         self,
         features: FeatureBundle,
         history: list[FeatureBundle],
+        *,
+        trace: dict | None = None,
     ) -> Signal | None:
         if not self._past_warmup(history):
             return None
@@ -64,8 +66,33 @@ class IndexRevertPrimitive(BasePrimitive):
         z = (features.underlying_ltp - scaled_basket) / basket_std
         rv = features.realized_vol_30min
 
+        fired = abs(z) > _Z_THRESHOLD
+        strength = (
+            self._clamp(self._tanh_strength(abs(z) - _Z_THRESHOLD)) if fired else 0.0
+        )
+
+        if trace is not None and fired:
+            trace["name"] = self.name
+            trace["inputs"] = {
+                "ltp": float(features.underlying_ltp),
+                "basket": float(basket),
+                "rv_30min": float(rv),
+            }
+            trace["intermediates"] = {
+                "scaling": float(scaling),
+                "scaled_basket": float(scaled_basket),
+                "basket_std": float(basket_std),
+                "z": float(z),
+                "z_threshold": float(_Z_THRESHOLD),
+            }
+            trace["formula"] = (
+                f"z = (ltp − scaled_basket) / σ = "
+                f"({features.underlying_ltp:.2f} − {scaled_basket:.2f}) / "
+                f"{basket_std:.4f} = {z:.4f}; "
+                f"strength = tanh(|z| − {_Z_THRESHOLD}) = {strength:.4f}"
+            )
+
         if z > _Z_THRESHOLD:
-            strength = self._clamp(self._tanh_strength(abs(z) - _Z_THRESHOLD))
             return Signal(
                 direction="bearish",
                 strength=strength,
@@ -74,7 +101,6 @@ class IndexRevertPrimitive(BasePrimitive):
                 expected_vol_pct=rv,
             )
         if z < -_Z_THRESHOLD:
-            strength = self._clamp(self._tanh_strength(abs(z) - _Z_THRESHOLD))
             return Signal(
                 direction="bullish",
                 strength=strength,

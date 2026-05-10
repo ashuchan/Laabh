@@ -25,6 +25,8 @@ class VolBreakoutPrimitive(BasePrimitive):
         self,
         features: FeatureBundle,
         history: list[FeatureBundle],
+        *,
+        trace: dict | None = None,
     ) -> Signal | None:
         if not self._past_warmup(history):
             return None
@@ -48,6 +50,25 @@ class VolBreakoutPrimitive(BasePrimitive):
             return None
 
         strength = self._clamp(self._tanh_strength((bb_now / bb_avg) - 1.0))
+
+        if trace is not None:
+            trace["name"] = self.name
+            trace["inputs"] = {
+                "bb_width_now": float(bb_now),
+                "ltp": float(ltp),
+                "rv_30min": float(features.realized_vol_30min),
+            }
+            trace["intermediates"] = {
+                "bb_avg": float(bb_avg),
+                "bb_ratio": float(bb_now / bb_avg),
+                "sma20": float(sma20),
+                "expansion_threshold": float(_BB_EXPANSION_RATIO),
+            }
+            trace["formula"] = (
+                f"bb_ratio = bb_now / bb_avg = {bb_now:.4f} / {bb_avg:.4f} "
+                f"= {bb_now / bb_avg:.4f} > {_BB_EXPANSION_RATIO}; "
+                f"strength = tanh(bb_ratio − 1) = {strength:.4f}"
+            )
 
         if ltp >= sma20:
             return Signal(

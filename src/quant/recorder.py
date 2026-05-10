@@ -70,6 +70,45 @@ class CloseTradePayload:
 
 
 @dataclass
+class SignalLogEntry:
+    """One row to write to ``backtest_signal_log``.
+
+    Built per-(tick × signalling arm) by the orchestrator. ``rejection_reason``
+    is the single label classifying why this arm did or didn't trade at this
+    tick — see ``backtest_signal_log`` schema for the closed taxonomy.
+
+    Trace fields (Decision Inspector PR 1):
+      * ``primitive_trace``: always populated by the orchestrator from the
+        primitive's introspection callback.
+      * ``bandit_trace``: per-arm slice of the tournament — set when this
+        arm reached the bandit (lost_bandit / sized_zero / opened buckets).
+      * ``sizer_trace``: full Kelly cascade — set ONLY on the chosen arm.
+    """
+
+    underlying_id: uuid.UUID
+    symbol: str
+    arm_id: str
+    primitive_name: str
+    direction: str
+    strength: float
+    rejection_reason: str
+    posterior_mean: float | None = None
+    bandit_selected: bool = False
+    lots_sized: int | None = None
+    primitive_trace: dict | None = None
+    bandit_trace: dict | None = None
+    sizer_trace: dict | None = None
+
+
+@dataclass
+class RecordSignalsPayload:
+    """A whole tick's worth of ``SignalLogEntry`` rows."""
+
+    virtual_time: datetime
+    entries: list[SignalLogEntry]
+
+
+@dataclass
 class DayInitPayload:
     """Per-day setup for the relevant ledger row."""
 
@@ -119,6 +158,16 @@ class TradeRecorder(abc.ABC):
     @abc.abstractmethod
     async def finalize_day(self, payload: DayFinalizePayload) -> None:
         """Update the per-day header row with end-of-day stats."""
+        ...
+
+    @abc.abstractmethod
+    async def record_signals(self, payload: RecordSignalsPayload) -> None:
+        """Persist a tick's signal-decision log rows.
+
+        Live recorders are expected to no-op (we don't bloat the production
+        ledger with diagnostic rows). The backtest recorder writes to
+        ``backtest_signal_log`` for the missed-trades / funnel report.
+        """
         ...
 
 
@@ -229,6 +278,11 @@ class LiveTradeRecorder(TradeRecorder):
             state.kill_switch_fired_at = p.kill_switch_fired_at
             state.trade_count = p.trade_count
 
+    async def record_signals(self, p: RecordSignalsPayload) -> None:
+        # Live recorder intentionally drops signal logs — diagnostic-only data
+        # belongs in the backtest harness, not the production ledger.
+        return
+
 
 # ---------------------------------------------------------------------------
 # Backtest implementation — backtest_trades + backtest_runs
@@ -321,8 +375,33 @@ class BacktestTradeRecorder(TradeRecorder):
             trade.exit_reason = p.exit_reason
 
     async def init_day(self, p: DayInitPayload) -> None:
-        # Backtest day rows are pre-created by BacktestRunner — no-op here.
-        return
+        """Backfill the run row's universe once the orchestrator has selected it.
+
+        The ``BacktestRunner`` pre-creates the row with ``universe=[]``
+        because universe selection happens *inside* ``orchestrator.run_loop``
+        (one source of truth — ``ctx.universe_selector``). This hook fires
+        right after that selection runs, so we update the row with the
+        actual universe — Decision Inspector reads, missed-trades reports,
+        and the per-day report all depend on this field being populated.
+        """
+        from src.models.backtest_run import BacktestRun
+
+        async with session_scope() as session:
+            run = await session.get(BacktestRun, self._run_id)
+            if run is None:
+                logger.warning(
+                    f"BacktestTradeRecorder.init_day: backtest_run "
+                    f"{self._run_id} not found — universe not backfilled"
+                )
+                return
+            run.universe = [
+                {
+                    "id": str(u["id"]),
+                    "symbol": u["symbol"],
+                    "name": u.get("name"),
+                }
+                for u in p.universe
+            ]
 
     async def finalize_day(self, p: DayFinalizePayload) -> None:
         from src.models.backtest_run import BacktestRun
@@ -342,11 +421,65 @@ class BacktestTradeRecorder(TradeRecorder):
                 if p.starting_nav else 0.0
             ))
             run.completed_at = datetime.now(timezone.utc)
-            run.trade_count = p.trade_count
 
-            # Count winners by querying realized_pnl > 0
+            # Trade count + winning_trades come from the backtest_trades
+            # ledger directly. The orchestrator passes ``p.trade_count = 0``
+            # in backtest mode (it queries the *live* QuantTrade table,
+            # which is the wrong ledger for a backtest run); querying our
+            # own ledger keeps the run row honest.
+            count_q = select(func.count()).where(
+                BacktestTrade.backtest_run_id == self._run_id,
+            )
+            run.trade_count = (await session.execute(count_q)).scalar() or 0
             wins_q = select(func.count()).where(
                 BacktestTrade.backtest_run_id == self._run_id,
                 BacktestTrade.realized_pnl > 0,
             )
             run.winning_trades = (await session.execute(wins_q)).scalar() or 0
+
+    async def record_signals(self, p: RecordSignalsPayload) -> None:
+        from src.models.backtest_signal_log import BacktestSignalLog
+
+        if not p.entries:
+            return
+        rows = [
+            {
+                "backtest_run_id": self._run_id,
+                "virtual_time": p.virtual_time,
+                "underlying_id": e.underlying_id,
+                "symbol": e.symbol,
+                "arm_id": e.arm_id,
+                "primitive_name": e.primitive_name,
+                "direction": e.direction,
+                "strength": Decimal(str(round(e.strength, 4))),
+                "rejection_reason": e.rejection_reason,
+                "posterior_mean": (
+                    Decimal(str(round(e.posterior_mean, 6)))
+                    if e.posterior_mean is not None
+                    else None
+                ),
+                "bandit_selected": e.bandit_selected,
+                "lots_sized": e.lots_sized,
+                # Python None on these JSONB columns becomes SQL NULL
+                # (not JSONB ``null`` literal) thanks to ``none_as_null``
+                # on the column type — see model.
+                "primitive_trace": e.primitive_trace,
+                "bandit_trace": e.bandit_trace,
+                "sizer_trace": e.sizer_trace,
+            }
+            for e in p.entries
+        ]
+        try:
+            async with session_scope() as session:
+                # Bulk insert keeps the per-tick write at a single round-trip.
+                # ~1-15 rows per tick × ~100 ticks × N days = trivial volume.
+                await session.execute(
+                    BacktestSignalLog.__table__.insert(), rows
+                )
+        except Exception as exc:
+            # Diagnostic logging is best-effort — never fail a tick because
+            # the funnel-log write hiccupped.
+            logger.warning(
+                f"BacktestTradeRecorder.record_signals: skipped "
+                f"{len(rows)} row(s) due to {exc!r}"
+            )

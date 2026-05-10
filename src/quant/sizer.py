@@ -39,6 +39,7 @@ def compute_lots(
     win_loss_ratio: float = 1.5,
     as_of=None,
     dryrun_run_id=None,
+    trace: dict | None = None,
 ) -> int:
     """Return the number of lots to trade (0 means skip).
 
@@ -58,50 +59,135 @@ def compute_lots(
         win_loss_ratio: b in Kelly formula. Default 1.5 (cold-start).
         as_of: Ignored; accepted for pipeline convention.
         dryrun_run_id: Ignored; accepted for pipeline convention.
+        trace: When non-None, the function records its inputs, constants,
+            and the 9-step Kelly cascade into this dict — used by the
+            Decision Inspector to render the sizer card. Caller owns the
+            dict; this function only mutates. Live mode passes None.
+
+    Trace shape (when populated):
+        {"inputs":     {posterior_mean, portfolio_capital, ...},
+         "constants":  {kelly_fraction, max_per_trade_pct, ...},
+         "cascade":    [{"step": <name>, "formula": <str>, "value": <num>},
+                        ... (9 steps in order) ...],
+         "final_lots": <int>,
+         "blocking_step": <step name that returned 0> | None}
     """
+    # Trace bookkeeping. We always populate the inputs/constants up-front so
+    # that an early-return path still produces a useful trace (the cascade
+    # may be partial, blocking_step pinpoints where we stopped).
+    cascade: list[dict] = []
+    blocking_step: str | None = None
+
+    def _record(step: str, formula: str, value) -> None:
+        if trace is not None:
+            cascade.append({"step": step, "formula": formula, "value": value})
+
+    if trace is not None:
+        trace["inputs"] = {
+            "posterior_mean": float(posterior_mean),
+            "portfolio_capital": float(portfolio_capital),
+            "max_loss_per_lot": float(max_loss_per_lot),
+            "estimated_costs": float(estimated_costs),
+            "expected_gross_pnl": float(expected_gross_pnl),
+            "open_exposure": float(open_exposure),
+            "lockin_active": bool(lockin_active),
+        }
+        trace["constants"] = {
+            "kelly_fraction": kelly_fraction,
+            "max_per_trade_pct": max_per_trade_pct,
+            "lockin_size_reduction": lockin_size_reduction,
+            "max_total_exposure_pct": max_total_exposure_pct,
+            "cost_gate_multiple": cost_gate_multiple,
+            "win_loss_ratio": win_loss_ratio,
+        }
+        trace["cascade"] = cascade  # mutable; we keep appending below
+        trace["final_lots"] = 0     # overwritten on success
+        trace["blocking_step"] = None
+
     # Step 1: probability of win via sigmoid on posterior mean
     p = max(0.05, min(0.95, _sigmoid(posterior_mean * 10)))  # ×10 to move away from 0.5
+    _record("p_sigmoid", "clamp(sigmoid(posterior_mean × 10), 0.05, 0.95)", float(p))
 
     # Step 2: win/loss ratio
     b = win_loss_ratio
+    _record("b_win_loss_ratio", "win_loss_ratio (constant)", float(b))
 
     # Step 3: Kelly fraction
     f_kelly = (p * b - (1 - p)) / b
+    _record("f_kelly", "(p × b − (1 − p)) / b", float(f_kelly))
 
     # Step 4: half-Kelly
     f = kelly_fraction * f_kelly
+    _record("f_half_kelly", "kelly_fraction × f_kelly", float(f))
 
     # Step 5: clamp to per-trade cap (apply lock-in reduction if active)
     effective_max = max_per_trade_pct
     if lockin_active:
         effective_max *= lockin_size_reduction
     f = max(0.0, min(f, effective_max))
+    _record(
+        "f_clamped",
+        f"clamp(f, 0, {effective_max:.4f}) [lockin {'on' if lockin_active else 'off'}]",
+        float(f),
+    )
 
     if f <= 0 or portfolio_capital <= 0 or max_loss_per_lot <= 0:
+        blocking_step = "f_clamped" if f <= 0 else "input_validation"
+        if trace is not None:
+            trace["blocking_step"] = blocking_step
         return 0
 
     # Step 6: risk budget
     risk_budget = Decimal(str(f)) * portfolio_capital
+    _record("risk_budget", "f × portfolio_capital", float(risk_budget))
 
     # Step 7: raw lots
     raw_lots = int(risk_budget / max_loss_per_lot)
+    _record("raw_lots", "floor(risk_budget / max_loss_per_lot)", raw_lots)
     if raw_lots == 0:
+        if trace is not None:
+            trace["blocking_step"] = "raw_lots"
         return 0
 
     # Step 8: total-exposure cap
     max_exposure = Decimal(str(max_total_exposure_pct)) * portfolio_capital
     remaining_exposure = max_exposure - open_exposure
     if remaining_exposure <= 0:
+        _record("exposure_cap", "remaining_exposure ≤ 0", 0)
+        if trace is not None:
+            trace["blocking_step"] = "exposure_cap"
         return 0
     if max_loss_per_lot > 0:
         lots_by_exposure = int(remaining_exposure / max_loss_per_lot)
         raw_lots = min(raw_lots, lots_by_exposure)
+        _record(
+            "exposure_cap",
+            "min(raw_lots, floor((max_exposure − open_exposure) / max_loss_per_lot))",
+            raw_lots,
+        )
 
     if raw_lots == 0:
+        if trace is not None:
+            trace["blocking_step"] = "exposure_cap"
         return 0
 
     # Step 9: cost gate — gross P&L must exceed multiple × costs
     if expected_gross_pnl < Decimal(str(cost_gate_multiple)) * estimated_costs:
+        _record(
+            "cost_gate",
+            "expected_gross_pnl ≥ cost_gate_multiple × estimated_costs",
+            "blocked",
+        )
+        if trace is not None:
+            trace["blocking_step"] = "cost_gate"
         return 0
+    _record(
+        "cost_gate",
+        "expected_gross_pnl ≥ cost_gate_multiple × estimated_costs",
+        "passed",
+    )
+
+    if trace is not None:
+        trace["final_lots"] = raw_lots
 
     return raw_lots

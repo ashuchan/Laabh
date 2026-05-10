@@ -25,6 +25,8 @@ class MomentumPrimitive(BasePrimitive):
         self,
         features: FeatureBundle,
         history: list[FeatureBundle],
+        *,
+        trace: dict | None = None,
     ) -> Signal | None:
         if not self._past_warmup(history):
             return None
@@ -53,6 +55,23 @@ class MomentumPrimitive(BasePrimitive):
             return None
 
         strength = self._clamp(self._tanh_strength(2.0 * weighted_mom / rv))
+
+        if trace is not None:
+            trace["name"] = self.name
+            trace["inputs"] = {
+                "rv_30min": rv,
+                "n_bars": _N_BARS,
+                "ltp_now": float(features.underlying_ltp),
+                "vol_now": float(features.underlying_volume_3min),
+            }
+            trace["intermediates"] = {
+                "total_volume": float(total_vol),
+                "weighted_mom": weighted_mom,
+            }
+            trace["formula"] = (
+                f"strength = tanh(2 × weighted_mom / rv) "
+                f"= tanh(2 × {weighted_mom:.6f} / {rv:.4f}) = {strength:.4f}"
+            )
 
         if weighted_mom > 0:
             return Signal(

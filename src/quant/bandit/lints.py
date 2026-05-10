@@ -30,6 +30,17 @@ ArmId: TypeAlias = str
 
 CONTEXT_DIM = 5
 
+# Stable, ordered names for the 5-dim context vector. Surfaced via the
+# bandit trace so the Decision Inspector can label dimensions without
+# duplicating the schema. Keep in lockstep with ``build_context`` below.
+_CONTEXT_DIM_NAMES: tuple[str, ...] = (
+    "vix_norm",
+    "tod_pct",
+    "day_pnl_norm",
+    "nifty_5d_norm",
+    "rv30_pctile",
+)
+
 
 @dataclass
 class LinTSArmState:
@@ -86,20 +97,66 @@ class LinTSSampler:
         *,
         context: np.ndarray,
         signal_strengths: dict[ArmId, float] | None = None,
+        trace: dict | None = None,
     ) -> ArmId | None:
-        """Pick arm by max(θ̃^T x × |signal_strength|)."""
+        """Pick arm by max(θ̃^T x × |signal_strength|).
+
+        When ``trace`` is non-None, the method records the per-arm draws
+        + scores so the Decision Inspector can render the tournament.
+        Random sampling is unchanged — the captured draws are the same
+        ones used for selection.
+
+        Trace shape (when populated):
+            {"algo": "lints",
+             "context_vector": [...5 floats...],
+             "context_dims": ["vix_norm", "tod_pct", "day_pnl_norm",
+                              "nifty_5d_norm", "rv30_pctile"],
+             "arms": {<arm_id>: {"posterior_mean":   <theta_hat·x>,
+                                 "posterior_var":    <x^T A_inv x>,
+                                 "sampled_mean":     <θ̃·x>,
+                                 "signal_strength":  <|s|>,
+                                 "score":            <pred × |s|>},
+                      ...},
+             "selected": <chosen_arm or None>,
+             "n_competitors": <int>}
+        """
         candidates = [a for a in signalling_arms if a in self._states]
         if not candidates:
+            if trace is not None:
+                trace["algo"] = "lints"
+                trace["context_vector"] = context.tolist()
+                trace["context_dims"] = list(_CONTEXT_DIM_NAMES)
+                trace["arms"] = {}
+                trace["selected"] = None
+                trace["n_competitors"] = 0
             return None
         x = context  # shape (CONTEXT_DIM,)
         scores: dict[ArmId, float] = {}
+        per_arm: dict[ArmId, dict] = {}
         for arm in candidates:
             state = self._states[arm]
             theta_sample = self._rng.multivariate_normal(state.theta_hat, state.a_inv)
             pred = float(theta_sample @ x)
             strength = abs((signal_strengths or {}).get(arm, 1.0))
-            scores[arm] = pred * strength
-        return max(scores, key=scores.__getitem__)
+            score = pred * strength
+            scores[arm] = score
+            if trace is not None:
+                per_arm[arm] = {
+                    "posterior_mean": float(state.theta_hat @ x),
+                    "posterior_var": float(x @ state.a_inv @ x),
+                    "sampled_mean": pred,
+                    "signal_strength": float(strength),
+                    "score": float(score),
+                }
+        chosen = max(scores, key=scores.__getitem__)
+        if trace is not None:
+            trace["algo"] = "lints"
+            trace["context_vector"] = context.tolist()
+            trace["context_dims"] = list(_CONTEXT_DIM_NAMES)
+            trace["arms"] = per_arm
+            trace["selected"] = chosen
+            trace["n_competitors"] = len(candidates)
+        return chosen
 
     def update(self, arm: ArmId, reward: float, *, context: np.ndarray) -> None:
         """Sherman-Morrison rank-1 update of A_inv (avoids full matrix invert)."""

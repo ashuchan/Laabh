@@ -1,6 +1,7 @@
 """SQLAlchemy ORM models — mirror the schema defined in database/schema.sql."""
 from src.models.analyst import Analyst
 from src.models.backtest_run import BacktestRun
+from src.models.backtest_signal_log import BacktestSignalLog
 from src.models.backtest_trade import BacktestTrade
 from src.models.bandit_arm_state import BanditArmState
 from src.models.content import RawContent
@@ -40,6 +41,7 @@ def register_all_models() -> None:
 __all__ = [
     "Analyst",
     "BacktestRun",
+    "BacktestSignalLog",
     "BacktestTrade",
     "BanditArmState",
     "ChainCollectionIssue",

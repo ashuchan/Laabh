@@ -29,6 +29,8 @@ class VWAPRevertPrimitive(BasePrimitive):
         self,
         features: FeatureBundle,
         history: list[FeatureBundle],
+        *,
+        trace: dict | None = None,
     ) -> Signal | None:
         if not self._past_warmup(history):
             return None
@@ -52,8 +54,32 @@ class VWAPRevertPrimitive(BasePrimitive):
         if self._is_trending(history):
             return None
 
+        fired = abs(z) > _Z_THRESHOLD
+        strength = (
+            self._clamp(self._tanh_strength(abs(z) - _Z_THRESHOLD)) if fired else 0.0
+        )
+
+        if trace is not None and fired:
+            trace["name"] = self.name
+            trace["inputs"] = {
+                "ltp": float(features.underlying_ltp),
+                "vwap_today": float(features.vwap_today),
+                "rv_30min": float(rv),
+                "history_n": n,
+            }
+            trace["intermediates"] = {
+                "price_mean": float(mean),
+                "price_std": float(price_std),
+                "z": float(z),
+                "z_threshold": float(_Z_THRESHOLD),
+            }
+            trace["formula"] = (
+                f"z = (ltp − vwap) / σ = ({features.underlying_ltp:.2f} − "
+                f"{features.vwap_today:.2f}) / {price_std:.4f} = {z:.4f}; "
+                f"strength = tanh(|z| − {_Z_THRESHOLD}) = {strength:.4f}"
+            )
+
         if z > _Z_THRESHOLD:
-            strength = self._clamp(self._tanh_strength(abs(z) - _Z_THRESHOLD))
             return Signal(
                 direction="bearish",
                 strength=strength,
@@ -63,7 +89,6 @@ class VWAPRevertPrimitive(BasePrimitive):
             )
 
         if z < -_Z_THRESHOLD:
-            strength = self._clamp(self._tanh_strength(abs(z) - _Z_THRESHOLD))
             return Signal(
                 direction="bullish",
                 strength=strength,
