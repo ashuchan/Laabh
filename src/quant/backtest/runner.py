@@ -136,11 +136,25 @@ class BacktestRunner:
             ``laabh_quant_backtest_iv_smile_method`` from settings.
         chain_source / underlying_source: Provenance tags written into every
             trade row so reports can flag synthesized vs real fills.
+        primitives_override: Explicit list of primitive names to enable.
+            When None (default), the runner derives the list from settings
+            minus ``_BACKTEST_DEAD_PRIMITIVES`` — which drops primitives
+            guaranteed to be silent under backtest data (OFI needs L1
+            quote-size deltas the backtest store stubs to 0; index_revert
+            needs index symbols which TopGainersUniverseSelector never
+            picks). Pass an explicit list to enable / disable specific
+            primitives for a particular run.
 
     The runner is stateless across days — each day's orchestrator run gets a
     fresh context. Bandit posteriors persist across days via the existing
     ``persistence.save_eod`` / ``load_morning`` pair, matching live behavior.
     """
+
+    # Primitives that are structurally silent in backtest mode. Enabling
+    # them only wastes bandit slots: every tick they take a candidate slot
+    # but always lose (they never produce a signal), which dilutes the
+    # bandit's ability to learn the productive arms.
+    _BACKTEST_DEAD_PRIMITIVES: frozenset[str] = frozenset({"ofi", "index_revert"})
 
     def __init__(
         self,
@@ -153,6 +167,7 @@ class BacktestRunner:
         chain_source: str = "synthesized",
         underlying_source: str = "dhan_intraday",
         enable_lookahead_guard: bool = True,
+        primitives_override: list[str] | None = None,
     ) -> None:
         self._portfolio_id = portfolio_id
         self._seed = seed
@@ -166,6 +181,17 @@ class BacktestRunner:
         # clock. The guard is clock-aware so the orchestrator doesn't need
         # to call mark_now per tick. Disable only for benchmarking.
         self._enable_lookahead_guard = enable_lookahead_guard
+        # Effective primitives list for backtest runs. Explicit override
+        # wins; otherwise drop the structurally-dead primitives from the
+        # settings list. Pre-computed in __init__ rather than per-day so
+        # ``config_snapshot`` lookup stays cheap.
+        if primitives_override is not None:
+            self._primitives_override = list(primitives_override)
+        else:
+            self._primitives_override = [
+                p for p in s.quant_primitives_list
+                if p not in self._BACKTEST_DEAD_PRIMITIVES
+            ]
 
     # ------------------------------------------------------------------
     # Public API
@@ -322,6 +348,9 @@ class BacktestRunner:
             universe_selector=universe_selector,
             recorder=recorder,
             nav_override=starting_nav,
+            # Phase-4 fix: drop primitives that are structurally silent
+            # in backtest mode (see ``_BACKTEST_DEAD_PRIMITIVES``).
+            primitives_override=self._primitives_override,
         )
 
     # ------------------------------------------------------------------
@@ -392,10 +421,13 @@ class BacktestRunner:
         """Capture the QuantSettings that drove this run.
 
         Only the fields the orchestrator actually reads are snapshotted —
-        dumping the entire Settings object would include secrets.
+        dumping the entire Settings object would include secrets. The
+        ``primitives`` field reflects the *effective* list this runner
+        will use (after applying the override / dead-primitives filter),
+        not the raw settings list — so reports show what actually ran.
         """
         return {
-            "primitives": s.quant_primitives_list,
+            "primitives": list(self._primitives_override),
             "bandit_algo": s.laabh_quant_bandit_algo,
             "forget_factor": s.laabh_quant_bandit_forget_factor,
             "kelly_fraction": s.laabh_quant_kelly_fraction,

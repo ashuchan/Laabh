@@ -52,11 +52,19 @@ class ThompsonSampler:
         self,
         signalling_arms: list[ArmId],
         *,
+        signal_strengths: dict[ArmId, float] | None = None,
         trace: dict | None = None,
     ) -> ArmId | None:
         """Pick the best arm from those currently signalling.
 
         Returns None if *signalling_arms* is empty or none match known arms.
+
+        ``signal_strengths`` (Phase-5 fix): per-arm primitive signal
+        strength, used to *weight* the sampled posterior — score is
+        ``sampled_mean × |signal_strength|``. Without it (or when None),
+        every arm gets weight 1.0 and selection is pure-Thompson — bit-for-
+        bit equivalent to the prior behaviour. With it, "stronger" signals
+        get bandit preference, matching how LinTS already weighted them.
 
         When ``trace`` is non-None, the method populates it with the
         full per-arm tournament so the Decision Inspector can render the
@@ -68,7 +76,8 @@ class ThompsonSampler:
              "arms": {<arm_id>: {"posterior_mean": ...,
                                  "posterior_var": ...,
                                  "sampled_mean": ...,
-                                 "score": <same as sampled_mean here>},
+                                 "signal_strength": ...,
+                                 "score": <sampled_mean × |strength|>},
                       ...},
              "selected": <chosen_arm or None>,
              "n_competitors": <int>}
@@ -81,8 +90,18 @@ class ThompsonSampler:
                 trace["selected"] = None
                 trace["n_competitors"] = 0
             return None
+        strengths = signal_strengths or {}
         samples = {arm: self._posteriors[arm].sample(self._rng) for arm in candidates}
-        chosen = max(samples, key=samples.__getitem__)
+        # Weight sample by |strength| — primitives carefully calibrate
+        # strength (saturating tanh, bounded [-1, 1]); the bandit ought
+        # to use that signal rather than ignoring it. Defaults to 1.0
+        # when an arm has no entry in the dict, preserving cold-start
+        # behaviour for new arms.
+        scores = {
+            arm: samples[arm] * abs(strengths.get(arm, 1.0))
+            for arm in candidates
+        }
+        chosen = max(scores, key=scores.__getitem__)
         if trace is not None:
             trace["algo"] = "thompson"
             trace["arms"] = {
@@ -90,7 +109,8 @@ class ThompsonSampler:
                     "posterior_mean": float(self._posteriors[arm].mean),
                     "posterior_var": float(self._posteriors[arm].var),
                     "sampled_mean": float(samples[arm]),
-                    "score": float(samples[arm]),
+                    "signal_strength": float(abs(strengths.get(arm, 1.0))),
+                    "score": float(scores[arm]),
                 }
                 for arm in candidates
             }

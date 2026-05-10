@@ -21,7 +21,7 @@ class OFIPrimitive(BasePrimitive):
     """Order Flow Imbalance."""
 
     name = "ofi"
-    warmup_minutes = _WARMUP_BARS
+    warmup_bars = _WARMUP_BARS
 
     def compute_signal(
         self,

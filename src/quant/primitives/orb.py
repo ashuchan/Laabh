@@ -20,7 +20,7 @@ class ORBPrimitive(BasePrimitive):
     """Opening Range Breakout."""
 
     name = "orb"
-    warmup_minutes = _WARMUP_BARS
+    warmup_bars = _WARMUP_BARS
 
     def compute_signal(
         self,

@@ -27,7 +27,7 @@ class IndexRevertPrimitive(BasePrimitive):
     """Index vs constituent basket reversion."""
 
     name = "index_revert"
-    warmup_minutes = _WARMUP_BARS
+    warmup_bars = _WARMUP_BARS
 
     def compute_signal(
         self,

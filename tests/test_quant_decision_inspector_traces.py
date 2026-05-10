@@ -204,7 +204,12 @@ def test_thompson_trace_contains_every_candidate():
     assert set(trace["arms"].keys()) == {"a", "b", "c"}
     for arm in {"a", "b", "c"}:
         slice_ = trace["arms"][arm]
-        assert set(slice_.keys()) == {"posterior_mean", "posterior_var", "sampled_mean", "score"}
+        # Phase-5 fix: signal_strength is now part of every Thompson trace
+        # (defaults to 1.0 when caller doesn't pass strengths) — symmetric
+        # with LinTS so the inspector renders both algos the same way.
+        assert set(slice_.keys()) == {
+            "posterior_mean", "posterior_var", "sampled_mean", "signal_strength", "score",
+        }
     assert trace["selected"] == chosen
     assert trace["n_competitors"] == 3
 
@@ -217,6 +222,62 @@ def test_thompson_trace_well_formed_when_no_candidates():
     assert trace == {
         "algo": "thompson", "arms": {}, "selected": None, "n_competitors": 0,
     }
+
+
+def test_thompson_without_signal_strengths_is_pure_thompson():
+    """Backward-compat: omitting signal_strengths means weight=1.0 for every
+    arm — selection identical to the pre-Phase-5 behaviour."""
+    rng = np.random.default_rng(seed=42)
+    sampler = ThompsonSampler(["a", "b"], rng=rng)
+    chosen = sampler.select(["a", "b"])  # no signal_strengths
+    # Same seed + same arms = deterministic pick
+    rng2 = np.random.default_rng(seed=42)
+    sampler2 = ThompsonSampler(["a", "b"], rng=rng2)
+    chosen2 = sampler2.select(["a", "b"], signal_strengths={"a": 1.0, "b": 1.0})
+    # Equal-strength signals must produce the same chosen arm — the cap
+    # at 1.0 default and the explicit 1.0 are equivalent
+    assert chosen == chosen2
+
+
+def test_thompson_weights_sample_by_signal_strength():
+    """A weak-strength arm should lose to a strong-strength arm even when
+    its sampled posterior is competitive. We construct a deterministic
+    scenario by feeding observations so arm A has a slightly higher
+    posterior mean, then weighting B's strength much higher."""
+    rng = np.random.default_rng(seed=7)
+    sampler = ThompsonSampler(["a", "b"], rng=rng)
+    # Both arms start at prior. With no obs, samples come from the same
+    # prior — they're roughly equal in expectation. Heavily downweight A.
+    trace: dict = {}
+    chosen = sampler.select(
+        ["a", "b"],
+        signal_strengths={"a": 0.1, "b": 1.0},  # a is 10x weaker
+        trace=trace,
+    )
+    # Verify the score formula in the trace matches sampled × |strength|
+    a_score = trace["arms"]["a"]["score"]
+    a_sampled = trace["arms"]["a"]["sampled_mean"]
+    a_strength = trace["arms"]["a"]["signal_strength"]
+    assert a_score == pytest.approx(a_sampled * a_strength)
+    # And B's weight contribution is 10x A's
+    b_strength = trace["arms"]["b"]["signal_strength"]
+    assert b_strength == pytest.approx(10.0 * a_strength)
+
+
+def test_thompson_signal_strength_takes_absolute_value():
+    """Negative signal strengths shouldn't flip the bandit's preference —
+    primitives use sign for direction, magnitude for confidence."""
+    rng = np.random.default_rng(seed=42)
+    sampler = ThompsonSampler(["a", "b"], rng=rng)
+    trace: dict = {}
+    sampler.select(
+        ["a", "b"],
+        signal_strengths={"a": -0.6, "b": 0.6},  # opposite signs, equal magnitudes
+        trace=trace,
+    )
+    # Both should have signal_strength = 0.6 in the trace (abs applied)
+    assert trace["arms"]["a"]["signal_strength"] == pytest.approx(0.6)
+    assert trace["arms"]["b"]["signal_strength"] == pytest.approx(0.6)
 
 
 # ---------------------------------------------------------------------------

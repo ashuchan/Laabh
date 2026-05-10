@@ -52,6 +52,13 @@ class OrchestratorContext:
     # Required for backtest compounding: the runner threads each day's
     # final NAV into the next day via this field. Live mode leaves it None.
     nav_override: float | None = None
+    # Phase-4 fix: when set, the orchestrator builds its primitives + arm
+    # universe from this list instead of ``settings.quant_primitives_list``.
+    # Used by the BacktestRunner to drop primitives that are guaranteed
+    # silent under backtest data (OFI needs L1 quotes; index_revert needs
+    # the universe to include indices). Live callers leave it None →
+    # settings drive everything as before.
+    primitives_override: list[str] | None = None
 
     @classmethod
     def live(cls) -> "OrchestratorContext":

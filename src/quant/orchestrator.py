@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import math
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -282,18 +281,28 @@ async def run_loop(
         logger.warning("[QUANT] Empty universe — aborting orchestrator loop")
         return
 
+    # Effective primitives list — backtest contexts can supply an override
+    # (Phase 4 fix) to drop primitives that are guaranteed silent under
+    # backtest data (e.g. OFI without L1 quotes). Live and other callers
+    # leave the override None and inherit ``settings.quant_primitives_list``.
+    effective_primitives_list = (
+        ctx.primitives_override
+        if ctx.primitives_override is not None
+        else settings.quant_primitives_list
+    )
+
     underlying_map: dict[str, uuid.UUID] = {u["symbol"]: u["id"] for u in universe}
     all_arms = [
         _make_arm_id(u["symbol"], p)
         for u in universe
-        for p in settings.quant_primitives_list
+        for p in effective_primitives_list
     ]
 
     # Pre-compute arm → (symbol, primitive_name) to avoid per-tick string splitting
     arm_meta: dict[str, tuple[str, str]] = {
         _make_arm_id(u["symbol"], p): (u["symbol"], p)
         for u in universe
-        for p in settings.quant_primitives_list
+        for p in effective_primitives_list
     }
 
     selector = await persistence.load_morning(
@@ -301,10 +310,15 @@ async def run_loop(
         as_of=as_of, dryrun_run_id=dryrun_run_id,
     )
 
-    primitives = _load_primitives(settings.quant_primitives_list)
-    max_history = max((p.warmup_minutes for p in primitives), default=30) + 5
-    # ceil so a 35-min warmup (not multiple of 3) keeps enough bars
-    max_history_bars = math.ceil(max_history / 3) + 2
+    primitives = _load_primitives(effective_primitives_list)
+    # Lookup table for primitive-aware exit dispatch (Phase 3 take-profit).
+    primitives_by_name = {p.name: p for p in primitives}
+    # History cap = the largest primitive's warmup (in BARS — was previously
+    # divided by 3 because the field was misnamed ``warmup_minutes``; that
+    # bug permanently blocked momentum (needs 11 bars) and vol_breakout
+    # (needs 20 bars). +2 buffer so the per-tick ``hist[:-1]`` slice still
+    # leaves enough bars for the largest warmup.
+    max_history_bars = max((p.warmup_bars for p in primitives), default=10) + 2
     history: dict[str, list] = {u["symbol"]: [] for u in universe}
 
     open_positions: list[OpenPosition] = []
@@ -324,7 +338,10 @@ async def run_loop(
         cooloff_minutes=settings.laabh_quant_cooloff_minutes,
     )
 
-    await _init_day_state(portfolio_id, today, starting_nav, universe, settings, ctx)
+    await _init_day_state(
+        portfolio_id, today, starting_nav, universe, settings, ctx,
+        primitives_list=effective_primitives_list,
+    )
 
     # Crash recovery: rebuild in-memory state from any open / closed trades
     # already written for today (e.g. after a process restart mid-session).
@@ -434,16 +451,28 @@ async def run_loop(
             # 3. Manage existing positions — close before NAV refresh so MTM
             #    only reflects still-open positions.
             for pos in list(open_positions):
-                symbol = arm_meta.get(pos.arm_id, (pos.arm_id, ""))[0]
+                symbol, primitive_name = arm_meta.get(pos.arm_id, (pos.arm_id, ""))
                 bundle = features_map.get(symbol)
                 if bundle is None:
                     continue
                 current_premium = _get_premium_from_bundle(pos, bundle)
                 arm_signals = [(aid, sig) for aid, _, sig in signals if aid == pos.arm_id]
-                close, reason = should_close(
-                    pos, current_premium, bundle.realized_vol_3min, current_time, arm_signals,
-                    hard_exit_time=hard_exit_time,
-                )
+                # Phase 3 — primitive-aware take-profit hook. The primitive
+                # owns its entry hypothesis; if its definition of "we got
+                # what we came for" is met, close now with reason
+                # ``take_profit`` regardless of the generic stop policy.
+                # Default ``BasePrimitive.should_take_profit`` returns False,
+                # so primitives without an override fall straight through
+                # to ``should_close``.
+                prim = primitives_by_name.get(primitive_name)
+                if prim is not None and prim.should_take_profit(pos, bundle):
+                    close, reason = True, "take_profit"
+                else:
+                    close, reason = should_close(
+                        pos, current_premium, bundle.realized_vol_3min,
+                        current_time, arm_signals,
+                        hard_exit_time=hard_exit_time,
+                    )
                 if close:
                     pnl = await _close_position(
                         pos, current_premium, reason, portfolio_id, current_time, ctx
@@ -882,15 +911,22 @@ async def _init_day_state(
     universe: list[dict],
     settings,
     ctx: OrchestratorContext,
+    *,
+    primitives_list: list[str],
 ) -> None:
-    """Delegate per-day setup to the recorder (live → quant_day_state, backtest → no-op)."""
+    """Delegate per-day setup to the recorder (live → quant_day_state, backtest → no-op).
+
+    ``primitives_list`` is the *effective* list (after any context override
+    is applied), so the persisted ``config_snapshot`` reflects what actually
+    ran rather than the raw settings list — important for backtest reports.
+    """
     payload = DayInitPayload(
         portfolio_id=portfolio_id,
         trading_date=today,
         starting_nav=starting_nav,
         universe=universe,
         config_snapshot={
-            "primitives": settings.quant_primitives_list,
+            "primitives": list(primitives_list),
             "bandit_algo": settings.laabh_quant_bandit_algo,
             "forget_factor": settings.laabh_quant_bandit_forget_factor,
             "lockin_target_pct": settings.laabh_quant_lockin_target_pct,

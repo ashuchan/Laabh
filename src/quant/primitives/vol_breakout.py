@@ -19,7 +19,7 @@ class VolBreakoutPrimitive(BasePrimitive):
     """Bollinger Band width expansion breakout."""
 
     name = "vol_breakout"
-    warmup_minutes = _WARMUP_BARS
+    warmup_bars = _WARMUP_BARS
 
     def compute_signal(
         self,

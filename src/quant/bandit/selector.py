@@ -63,7 +63,15 @@ class ArmSelector:
                 signal_strengths=signal_strengths,
                 trace=trace,
             )
-        return self._impl.select(signalling_arms, trace=trace)
+        # Thompson now also accepts signal_strengths (Phase-5 fix). Without
+        # it, Thompson would ignore the carefully-calibrated strength values
+        # primitives produce, treating a 0.4-strength arm and a 1.0-strength
+        # arm as identical bandit competitors.
+        return self._impl.select(
+            signalling_arms,
+            signal_strengths=signal_strengths,
+            trace=trace,
+        )
 
     def update(
         self,

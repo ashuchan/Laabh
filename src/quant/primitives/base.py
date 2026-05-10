@@ -24,7 +24,12 @@ class BasePrimitive(ABC):
     """Contract every primitive must satisfy."""
 
     name: str
-    warmup_minutes: int
+    # Number of *3-min bars* of history this primitive needs before it can
+    # emit a signal. Field name was historically ``warmup_minutes`` but the
+    # value was always a bar count — see commit history. The orchestrator
+    # used to divide by 3 (treating it as minutes), which permanently
+    # blocked momentum (needs 11 bars) and vol_breakout (needs 20 bars).
+    warmup_bars: int
 
     @abstractmethod
     def compute_signal(
@@ -38,7 +43,7 @@ class BasePrimitive(ABC):
 
         Args:
             features: Current-bar feature bundle.
-            history: Prior bars (oldest first), length may be < warmup_minutes
+            history: Prior bars (oldest first), length may be < warmup_bars
                      during startup. Return None if warmup not yet satisfied.
             trace: When non-None, the primitive populates this dict with
                    inputs / intermediates / a human-readable formula. Used by
@@ -55,7 +60,28 @@ class BasePrimitive(ABC):
 
     def _past_warmup(self, history: list[FeatureBundle]) -> bool:
         """Return True once enough history has accumulated."""
-        return len(history) >= self.warmup_minutes
+        return len(history) >= self.warmup_bars
+
+    def should_take_profit(
+        self,
+        position,
+        current_features: FeatureBundle,
+    ) -> bool:
+        """Should the orchestrator close this position because the primitive's
+        entry hypothesis has been fulfilled?
+
+        Default: ``False`` — the generic exit policy in ``src/quant/exits.py``
+        (trailing stop, profit ratchet, time stop, signal flip) handles the
+        cuts. Override when the primitive defines a "we got what we came for"
+        moment — e.g. a mean-reversion primitive should close once price has
+        reverted toward its anchor, regardless of whether the trailing stop
+        has triggered yet.
+
+        ``position`` is an ``src.quant.exits.OpenPosition``; left untyped
+        here to avoid a circular import. ``current_features`` is the
+        latest tick's FeatureBundle for the position's symbol.
+        """
+        return False
 
     @staticmethod
     def _clamp(value: float, lo: float = -1.0, hi: float = 1.0) -> float:
