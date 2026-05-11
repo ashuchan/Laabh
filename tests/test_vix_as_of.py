@@ -34,10 +34,15 @@ async def test_run_once_as_of_stamps_row():
 
 
 @pytest.mark.asyncio
-async def test_run_once_live_path_unchanged():
-    """run_once without as_of uses Angel One and datetime.now."""
+async def test_run_once_live_path_uses_yfinance():
+    """run_once without as_of uses the yfinance live fetch.
+
+    Live path was switched from Angel One to yfinance on 2026-05-11 after
+    Angel One's scrip-master cache stopped serving INDIA VIX (token 26017)
+    on the NSE exchange — see ``_fetch_vix_from_angel_one`` docstring.
+    """
     with (
-        patch("src.fno.vix_collector._fetch_vix_from_angel_one", new=AsyncMock(return_value=14.0)),
+        patch("src.fno.vix_collector._fetch_vix_live_yfinance", new=AsyncMock(return_value=14.0)),
         patch("src.fno.vix_collector.session_scope") as mock_scope,
     ):
         session_mock = AsyncMock()

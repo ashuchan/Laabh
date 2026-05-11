@@ -280,6 +280,33 @@ def test_thompson_signal_strength_takes_absolute_value():
     assert trace["arms"]["b"]["signal_strength"] == pytest.approx(0.6)
 
 
+def test_arm_selector_thompson_ignores_signal_strengths_in_production_path():
+    """Phase-5 revert: when ``ArmSelector`` uses Thompson, the wrapper does
+    NOT forward ``signal_strengths`` — production picks must match
+    pure-Thompson regardless of what strengths are passed.
+
+    The underlying ``ThompsonSampler.select`` still accepts the parameter
+    (kept for direct experimentation + research), but ``ArmSelector`` is
+    the production entrypoint and gates the behaviour off.
+
+    Why we reverted: cross-primitive strength comparison is incoherent —
+    each primitive's strength encodes a different unit (σ-distance vs BB
+    expansion vs vol-normalised return). Live backtest with weighting
+    enabled showed take_profit exits dropping to 0/run + win-rate halving.
+    """
+    from src.quant.bandit.selector import ArmSelector
+    sel_with = ArmSelector(["a", "b"], algo="thompson", seed=42)
+    sel_without = ArmSelector(["a", "b"], algo="thompson", seed=42)
+    # Heavily skewed strengths — would absolutely change the pick if forwarded
+    pick_with = sel_with.select(["a", "b"], signal_strengths={"a": 0.01, "b": 1.0})
+    pick_without = sel_without.select(["a", "b"])
+    assert pick_with == pick_without, (
+        "ArmSelector(thompson) must produce identical picks regardless of "
+        "signal_strengths — Phase-5 forwarding was reverted because the "
+        "weighting was mathematically incoherent across primitives."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bandit trace — LinTS
 # ---------------------------------------------------------------------------

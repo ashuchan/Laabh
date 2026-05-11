@@ -2,14 +2,22 @@
 
 Wraps either ThompsonSampler or LinTSSampler depending on config and exposes
 a uniform select() / update() / snapshot() / restore() API.
+
+Restless-bandit support
+-----------------------
+``replace_arm(evict, admit)`` evicts a weak arm, saves its posterior to an
+in-memory dormant pool keyed by arm_id, and admits a new arm — warm (from
+dormant pool) or cold (uniform prior). The dormant pool is session-scoped
+and persists across replacement cycles so previously-seen arms re-enter with
+their accumulated learning intact.
 """
 from __future__ import annotations
 
-from typing import TypeAlias
+from typing import TypeAlias, Union
 
 import numpy as np
 
-from src.quant.bandit.posterior import PosteriorState
+from src.quant.bandit.posterior import PosteriorState  # noqa: F401 — used in _dormant type
 from src.quant.bandit.thompson import ThompsonSampler
 from src.quant.bandit.lints import LinTSSampler, LinTSArmState, build_context
 
@@ -33,6 +41,13 @@ class ArmSelector:
         self._algo = algo
         self._prior_mean = prior_mean
         self._prior_var = prior_var
+        # Dormant pool: arm_id → saved posterior state from a previous eviction.
+        # Arms re-admitted from here get warm priors instead of cold start.
+        # Type is LinTSArmState when algo="lints", PosteriorState when algo="thompson".
+        # NOTE: the dormant pool is intentionally excluded from snapshot()/restore().
+        # snapshot() is used for crash-recovery replay of today's active arms only;
+        # dormant arms are session-scoped and start cold on a process restart.
+        self._dormant: dict[ArmId, Union[LinTSArmState, "PosteriorState"]] = {}
 
         if algo == "lints":
             self._impl = LinTSSampler(arms, self._rng, prior_var=prior_var)
@@ -63,15 +78,19 @@ class ArmSelector:
                 signal_strengths=signal_strengths,
                 trace=trace,
             )
-        # Thompson now also accepts signal_strengths (Phase-5 fix). Without
-        # it, Thompson would ignore the carefully-calibrated strength values
-        # primitives produce, treating a 0.4-strength arm and a 1.0-strength
-        # arm as identical bandit competitors.
-        return self._impl.select(
-            signalling_arms,
-            signal_strengths=signal_strengths,
-            trace=trace,
-        )
+        # Phase-5 reverted: cross-primitive strength weighting in Thompson is
+        # mathematically incoherent — different primitives compute strength
+        # in incomparable units (vwap_revert: σ-distance; vol_breakout: BB
+        # expansion ratio; momentum: vol-normalised return). Multiplying
+        # samples by these and comparing across arms biases selection
+        # toward whichever primitive produces the highest *numbers*, not
+        # the highest *expected return*. Live Phase-5 backtest confirmed
+        # the bias hurt: take_profit exits dropped to 0/run, win-rate
+        # halved. We keep ``ThompsonSampler.select``'s ``signal_strengths``
+        # parameter for direct experimentation, but the production path
+        # via ``ArmSelector`` no longer forwards it. LinTS keeps the
+        # weighting because its context vector at least scopes learning.
+        return self._impl.select(signalling_arms, trace=trace)
 
     def update(
         self,
@@ -106,7 +125,53 @@ class ArmSelector:
         return self._impl.n_obs(arm)
 
     def snapshot(self):
+        """Snapshot active arm posteriors. The dormant pool is NOT included —
+        it is session-scoped and does not need crash-recovery replay."""
         return self._impl.snapshot()
 
     def restore(self, snapshot) -> None:
+        """Restore active arm posteriors from *snapshot*. Dormant pool unchanged."""
         self._impl.restore(snapshot)
+
+    # ------------------------------------------------------------------
+    # Restless-bandit arm replacement (intraday universe expansion)
+    # ------------------------------------------------------------------
+
+    def evict_arm(self, arm: ArmId) -> None:
+        """Remove *arm* from the active set and save its state to the dormant pool.
+
+        Safe to call even if the arm is not currently active (no-op).
+        """
+        saved = self._impl.remove_arm(arm)
+        if saved is not None:
+            self._dormant[arm] = saved
+
+    def admit_arm(self, arm: ArmId) -> bool:
+        """Add *arm* to the active set.
+
+        If *arm* is in the dormant pool (previously seen this session) it is
+        re-admitted with its warm posterior. Otherwise it starts cold at the
+        prior. Returns True when admitted from dormant pool (warm), False when
+        cold-started.
+        """
+        warm_state = self._dormant.pop(arm, None)
+        if warm_state is not None:
+            self._impl.restore_arm(arm, warm_state)
+            return True
+        # Cold start
+        self.add_arm(arm)
+        return False
+
+    def replace_arm(self, evict: ArmId, admit: ArmId) -> bool:
+        """Atomically evict one arm and admit another.
+
+        Returns True when the admitted arm had warm priors from the dormant
+        pool, False when it started cold.
+        """
+        self.evict_arm(evict)
+        return self.admit_arm(admit)
+
+    @property
+    def dormant_arm_ids(self) -> list[ArmId]:
+        """Return the IDs currently in the dormant pool."""
+        return list(self._dormant.keys())

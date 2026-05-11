@@ -30,6 +30,7 @@ Decision Note (data source):
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
@@ -68,6 +69,9 @@ class TopGainersUniverseSelector(UniverseSelector):
         min_price: float | None = None,
         min_avg_volume_5d: int | None = None,
         size_cap: int | None = None,
+        sector_heat_enabled: bool | None = None,
+        sector_heat_threshold_pct: float | None = None,
+        sector_heat_count: int | None = None,
     ) -> None:
         s = get_settings()
         self._gainers = (
@@ -98,6 +102,21 @@ class TopGainersUniverseSelector(UniverseSelector):
             if size_cap is not None
             else s.laabh_quant_backtest_universe_size
         )
+        self._sector_heat_enabled = (
+            sector_heat_enabled
+            if sector_heat_enabled is not None
+            else s.laabh_quant_backtest_sector_heat_enabled
+        )
+        self._sector_heat_threshold_pct = (
+            sector_heat_threshold_pct
+            if sector_heat_threshold_pct is not None
+            else s.laabh_quant_backtest_sector_heat_threshold_pct
+        )
+        self._sector_heat_count = (
+            sector_heat_count
+            if sector_heat_count is not None
+            else s.laabh_quant_backtest_sector_heat_count
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -122,7 +141,7 @@ class TopGainersUniverseSelector(UniverseSelector):
             )
             return []
 
-        # Three rank dimensions, deduplicated.
+        # Four rank dimensions, deduplicated: gainers, movers, gappers, sector heat.
         gainers = sorted(
             candidates, key=lambda c: c["prev_day_return"], reverse=True
         )[: self._gainers]
@@ -134,10 +153,17 @@ class TopGainersUniverseSelector(UniverseSelector):
             key=lambda c: abs(c["overnight_gap"]),  # type: ignore[arg-type]
             reverse=True,
         )[: self._gappers]
+        sector_heat: list[dict] = []
+        if self._sector_heat_enabled:
+            sector_heat = self._build_sector_heat_bucket(
+                candidates,
+                threshold_pct=self._sector_heat_threshold_pct,
+                per_sector_count=self._sector_heat_count,
+            )
 
         seen: set[str] = set()
         out: list[dict] = []
-        for bucket in (gainers, movers, gappers):
+        for bucket in (gainers, movers, gappers, sector_heat):
             for c in bucket:
                 if c["symbol"] in seen:
                     continue
@@ -156,7 +182,8 @@ class TopGainersUniverseSelector(UniverseSelector):
 
         logger.info(
             f"TopGainersUniverseSelector: selected {len(out)} underlyings for "
-            f"{trading_date} (banned {len(ban_set)}, candidates {len(candidates)})"
+            f"{trading_date} (banned {len(ban_set)}, candidates {len(candidates)}, "
+            f"sector_heat_raw={len(sector_heat)} pre-dedup)"
         )
         return out
 
@@ -198,6 +225,7 @@ class TopGainersUniverseSelector(UniverseSelector):
                 Instrument.id,
                 Instrument.symbol,
                 Instrument.company_name.label("name"),
+                Instrument.sector,
                 PriceDaily.date,
                 PriceDaily.close,
                 PriceDaily.volume,
@@ -225,6 +253,7 @@ class TopGainersUniverseSelector(UniverseSelector):
                     "id": r.id,
                     "symbol": r.symbol,
                     "name": r.name,
+                    "sector": r.sector,
                     "date": r.date,
                     "close": float(r.close) if r.close is not None else None,
                     "volume": int(r.volume) if r.volume is not None else 0,
@@ -268,12 +297,51 @@ class TopGainersUniverseSelector(UniverseSelector):
                     "id": inst_id,
                     "symbol": d1["symbol"],
                     "name": d1["name"],
+                    "sector": d1.get("sector"),
                     "prev_day_return": prev_day_return,
                     "avg_volume_5d": avg_volume,
                     "prev_close": d1["close"],
                     "overnight_gap": overnight_gap,
                 }
             )
+        return out
+
+    @staticmethod
+    def _build_sector_heat_bucket(
+        candidates: list[dict[str, Any]],
+        *,
+        threshold_pct: float,
+        per_sector_count: int,
+    ) -> list[dict]:
+        """Add top N liquid names from any sector whose avg D-1 return >= threshold.
+
+        A sector is "hot" when its F&O members collectively moved >= threshold_pct
+        on the prior day — suggesting a rotation or macro catalyst that will likely
+        persist into D. We add the top movers from hot sectors regardless of their
+        individual rank in the gainers/movers buckets.
+        """
+        sector_returns: dict[str, list[float]] = defaultdict(list)
+        sector_candidates: dict[str, list[dict]] = defaultdict(list)
+        for c in candidates:
+            sector = c.get("sector")
+            if not sector:
+                continue
+            sector_returns[sector].append(c["prev_day_return"] * 100.0)
+            sector_candidates[sector].append(c)
+
+        out: list[dict] = []
+        for sector, returns in sector_returns.items():
+            avg_return = sum(returns) / len(returns)
+            if abs(avg_return) < threshold_pct:
+                continue
+            # Top movers within this hot sector
+            top_in_sector = sorted(
+                sector_candidates[sector],
+                key=lambda c: abs(c["prev_day_return"]),
+                reverse=True,
+            )[:per_sector_count]
+            out.extend(top_in_sector)
+
         return out
 
     @staticmethod
@@ -284,11 +352,19 @@ class TopGainersUniverseSelector(UniverseSelector):
         trading_date: date,
         prev_close: float,
     ) -> float | None:
-        """Return ``open[D] / prev_close - 1`` if intraday data is available, else None."""
+        """Return ``open[D] / prev_close - 1`` if intraday data is available, else None.
+
+        The window is 10 minutes (previously 5 min) because the 3-min bar that
+        spans 09:15–09:18 IST is written at bar-close time (~09:18) and may not
+        be present when the selector is called at exactly 09:15. A 10-minute
+        window reliably catches the first completed bar without straying into the
+        second bar's open.
+        """
         # First-bar of the day in IST → UTC: 09:15 IST = 03:45 UTC
         session_open_ist = _IST.localize(datetime.combine(trading_date, time(9, 15)))
-        # Window of 5 minutes around session open to catch the first bar
-        session_open_end = session_open_ist + timedelta(minutes=5)
+        # Widened to 10 min to catch the first completed 3-min bar even when
+        # universe selection runs slightly after 09:15.
+        session_open_end = session_open_ist + timedelta(minutes=10)
         q = (
             select(PriceIntraday.open)
             .where(

@@ -29,7 +29,20 @@ def classify_regime(vix_value: float) -> str:
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=2, max=30))
 async def _fetch_vix_from_angel_one() -> float:
-    """Fetch current India VIX value via Angel One REST API."""
+    """Fetch current India VIX value via Angel One REST API.
+
+    NOTE (2026-05-11 incident): Angel One's scrip-master cache stopped
+    serving INDIA VIX (token 26017) on the ``NSE`` exchange — every call
+    returns ``AB4046: Symbol token not found in scrip master cache for
+    the given exchange``, retried 5× by tenacity, generating ~10 ERROR
+    log lines per 5-min refresh. The orchestrator's exception handler
+    swallows the failure but the noise is intolerable.
+
+    The live path now goes through ``_fetch_vix_live_yfinance`` instead
+    (see ``run_once`` below). This function is preserved so that when
+    Angel One restores the symbol — or we identify the correct exchange
+    code — re-enabling it is a one-line flip in ``run_once``.
+    """
     import pyotp
     from SmartApi import SmartConnect  # type: ignore[import]
 
@@ -52,6 +65,31 @@ async def _fetch_vix_from_angel_one() -> float:
         raise RuntimeError(f"VIX ltp failed: {ltp_data.get('message')}")
 
     return float(ltp_data["data"]["ltp"])
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+async def _fetch_vix_live_yfinance() -> float:
+    """Live INDIA VIX from yfinance — replaces the broken Angel One path.
+
+    yfinance's ``^INDIAVIX`` ticker returns the latest close (typically
+    a few minutes lag during market hours, EOD value after close). For a
+    regime indicator that updates every 5 min on a CronTrigger, that lag
+    is well within tolerance.
+    """
+    import asyncio
+
+    def _sync_fetch() -> float:
+        import yfinance as yf
+        # ``period="5d"`` instead of "1d": yfinance returns an empty DataFrame
+        # for "1d" when called early in the session before the exchange publishes
+        # the first bar. A 5-day window guarantees at least the prior day's close;
+        # ``iloc[-1]`` always picks the most recent available bar.
+        hist = yf.Ticker("^INDIAVIX").history(period="5d")
+        if hist.empty:
+            raise RuntimeError("No live VIX data from yfinance")
+        return float(hist["Close"].iloc[-1])
+
+    return await asyncio.get_running_loop().run_in_executor(None, _sync_fetch)
 
 
 async def _fetch_vix_historical(as_of: datetime) -> float:
@@ -92,7 +130,10 @@ async def run_once(
     elif as_of is not None:
         vix_value = await _fetch_vix_historical(as_of)
     else:
-        vix_value = await _fetch_vix_from_angel_one()
+        # Live path: yfinance, not Angel One. See _fetch_vix_from_angel_one
+        # for the incident note. To re-enable Angel One when the scrip
+        # master is fixed, swap this back to ``_fetch_vix_from_angel_one()``.
+        vix_value = await _fetch_vix_live_yfinance()
 
     regime = classify_regime(vix_value)
     stamp = as_of if as_of is not None else datetime.now(tz=timezone.utc)

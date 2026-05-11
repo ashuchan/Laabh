@@ -20,9 +20,14 @@ class SignalService:
     async def notify_watchlist_signals(self, since_minutes: int = 10) -> int:
         """Find recent signals on watchlisted instruments and emit notifications.
 
+        Insert is atomic per signal: ``INSERT ... WHERE NOT EXISTS`` closes the
+        race window where two concurrent runs would both see "no notification"
+        and both insert. Only signal_ids whose row was actually created (via
+        ``RETURNING``) get pushed to Telegram.
+
         Returns number of notifications created.
         """
-        sql = text("""
+        select_sql = text("""
             SELECT s.id, s.action, s.confidence, s.target_price, s.reasoning,
                    i.symbol, i.company_name, i.id AS instrument_id
             FROM signals s
@@ -38,9 +43,18 @@ class SignalService:
                   WHERE n.signal_id = s.id AND n.type = 'signal_alert'
               )
         """)
+        insert_sql = text("""
+            INSERT INTO notifications (type, priority, title, body, instrument_id, signal_id)
+            SELECT 'signal_alert', 'high', :title, :body, :instrument_id, :signal_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM notifications
+                WHERE signal_id = :signal_id AND type = 'signal_alert'
+            )
+            RETURNING id
+        """)
         count = 0
         async with session_scope() as session:
-            rows = await session.execute(sql, {"mins": since_minutes})
+            rows = await session.execute(select_sql, {"mins": since_minutes})
             signals = list(rows.mappings())
 
         for row in signals:
@@ -48,15 +62,23 @@ class SignalService:
             conf = f" (conf {float(row['confidence']):.2f})" if row["confidence"] is not None else ""
             tgt = f"\nTarget: ₹{row['target_price']}" if row["target_price"] else ""
             body = f"{row['company_name']}{conf}{tgt}\n{row['reasoning'] or ''}"
-            await self.notifier.create(
-                type_="signal_alert",
-                title=title,
-                body=body,
-                priority="high",
-                instrument_id=row["instrument_id"],
-                signal_id=row["id"],
-            )
+            title = title[:200]
+            async with session_scope() as session:
+                result = await session.execute(
+                    insert_sql,
+                    {
+                        "title": title,
+                        "body": body,
+                        "instrument_id": row["instrument_id"],
+                        "signal_id": row["id"],
+                    },
+                )
+                inserted = result.scalar()
+            if inserted is None:
+                continue
             count += 1
+        if count:
+            await self.notifier.push_pending()
         logger.info(f"signal notifications emitted: {count}")
         return count
 

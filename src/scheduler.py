@@ -286,7 +286,12 @@ async def _fno_morning_brief() -> None:
 
 
 async def _quant_orchestrator_loop() -> None:
-    """Launch the quant bandit-orchestrated intraday loop (blocks until EOD)."""
+    """Launch the quant bandit-orchestrated intraday loop (blocks until EOD).
+
+    Uses ``HybridUniverseSelector`` so the starting universe combines the
+    deterministic top-gainers base with any Phase-3 LLM PROCEED candidates
+    identified during the morning pipeline.
+    """
     from src.db import session_scope
     from src.models.portfolio import Portfolio
     from sqlalchemy import select
@@ -302,8 +307,16 @@ async def _quant_orchestrator_loop() -> None:
             return
         portfolio_id = row.id
 
+    import dataclasses
     from src.quant.orchestrator import run_loop
-    await run_loop(portfolio_id)
+    from src.quant.context import OrchestratorContext
+    from src.quant.universe import HybridUniverseSelector
+
+    ctx = dataclasses.replace(
+        OrchestratorContext.live(),
+        universe_selector=HybridUniverseSelector(),
+    )
+    await run_loop(portfolio_id, ctx=ctx)
 
 
 async def _fno_phase4_entry() -> None:
@@ -376,23 +389,31 @@ def _runtime_dir() -> Path:
 
 
 async def _write_heartbeat() -> None:
-    """Atomically touch a heartbeat file. External monitors check its mtime."""
+    """Atomically touch a heartbeat file. External monitors check its mtime.
+
+    Transient FS races on Windows (AV/Defender briefly holding heartbeat.tmp,
+    indexer locks on heartbeat.txt) used to crash the job and spam Telegram
+    via _on_job_error. Heartbeat staleness is detected externally by file
+    mtime — this job is best-effort, so swallow transient OSError after a
+    short retry and log a warning instead of raising.
+    """
     state_dir = _runtime_dir() / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     target = state_dir / "heartbeat.txt"
     tmp = target.with_suffix(".tmp")
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    tmp.write_text(stamp + "\n", encoding="utf-8")
-    # On Windows, os.replace can lose a race with a watchdog or AV process
-    # holding the target open for read. Retry briefly before failing the job.
+    last_exc: OSError | None = None
     for attempt in range(3):
         try:
+            tmp.write_text(stamp + "\n", encoding="utf-8")
             os.replace(tmp, target)
             return
-        except PermissionError:
+        except (PermissionError, FileNotFoundError) as exc:
+            last_exc = exc
             if attempt == 2:
-                raise
+                break
             await asyncio.sleep(0.2 * (attempt + 1))
+    logger.warning(f"heartbeat write skipped after retries: {last_exc!r}")
 
 
 def _on_job_error(event: JobExecutionEvent) -> None:
@@ -710,9 +731,12 @@ def build_scheduler() -> AsyncIOScheduler:
             "[QUANT] intraday_mode=quant — Phase 4 agentic jobs skipped; "
             "quant orchestrator registered instead"
         )
+        # 09:18 IST — 3 min after open so the first 3-min bar is complete and
+        # price_intraday has data for the gapper bucket. Previously 09:15 which
+        # caused the gapper bucket to always return empty (bar not written yet).
         sched.add_job(
             _quant_orchestrator_loop,
-            CronTrigger(hour=9, minute=15, day_of_week="mon-fri", timezone=ist),
+            CronTrigger(hour=9, minute=18, day_of_week="mon-fri", timezone=ist),
             id="quant_orchestrator",
             max_instances=1,
             coalesce=True,

@@ -195,6 +195,16 @@ class LinTSSampler:
         if arm not in self._states:
             self._states[arm] = _cold_start(self._prior_var)
 
+    def remove_arm(self, arm: ArmId) -> LinTSArmState | None:
+        """Remove *arm* and return its state (for dormant pool). No-op if absent."""
+        return self._states.pop(arm, None)
+
+    def restore_arm(self, arm: ArmId, state: LinTSArmState) -> None:
+        """Re-admit *arm* with a previously saved state (warm prior)."""
+        self._states[arm] = LinTSArmState(
+            a_inv=state.a_inv.copy(), b=state.b.copy(), n_obs=state.n_obs
+        )
+
     def posterior_mean(self, arm: ArmId) -> float:
         if arm not in self._states:
             return 0.0

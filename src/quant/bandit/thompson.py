@@ -147,6 +147,14 @@ class ThompsonSampler:
         if arm not in self._posteriors:
             self._posteriors[arm] = PosteriorState(mean=prior_mean, var=self._prior_var)
 
+    def remove_arm(self, arm: ArmId) -> PosteriorState | None:
+        """Remove *arm* and return its posterior (for dormant pool). No-op if absent."""
+        return self._posteriors.pop(arm, None)
+
+    def restore_arm(self, arm: ArmId, state: PosteriorState) -> None:
+        """Re-admit *arm* with a previously saved posterior (warm prior)."""
+        self._posteriors[arm] = PosteriorState(state.mean, state.var, state.n_obs)
+
     def posterior_mean(self, arm: ArmId) -> float:
         """Return the current posterior mean for *arm* (0.0 if unknown)."""
         return self._posteriors[arm].mean if arm in self._posteriors else 0.0

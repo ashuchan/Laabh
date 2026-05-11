@@ -422,7 +422,7 @@ class Settings(BaseSettings):
         default=12, ge=1, alias="LAABH_QUANT_BACKTEST_DATA_WINDOW_MONTHS"
     )
     laabh_quant_backtest_universe_size: int = Field(
-        default=20, ge=1, alias="LAABH_QUANT_BACKTEST_UNIVERSE_SIZE"
+        default=40, ge=1, alias="LAABH_QUANT_BACKTEST_UNIVERSE_SIZE"
     )
     laabh_quant_backtest_use_synthesized_chains: bool = Field(
         default=True, alias="LAABH_QUANT_BACKTEST_USE_SYNTHESIZED_CHAINS"
@@ -430,18 +430,71 @@ class Settings(BaseSettings):
     laabh_quant_backtest_iv_smile_method: Literal["flat", "linear", "sabr"] = Field(
         default="linear", alias="LAABH_QUANT_BACKTEST_IV_SMILE_METHOD"
     )
-    # Top-gainers selector mix (10 + 5 + 5 = 20 by default)
+    # Top-gainers selector mix (20 + 8 + 12 = 40 by default).
+    # Expanded from 10+5+5=20 after 2026-05-08 backtest showed 9/10 daily
+    # top-gainers were outside the universe due to the hard 20-instrument cap.
     laabh_quant_backtest_top_gainers_count: int = Field(
-        default=10, ge=0, alias="LAABH_QUANT_BACKTEST_TOP_GAINERS_COUNT"
+        default=20, ge=0, alias="LAABH_QUANT_BACKTEST_TOP_GAINERS_COUNT"
     )
     laabh_quant_backtest_top_movers_count: int = Field(
-        default=5, ge=0, alias="LAABH_QUANT_BACKTEST_TOP_MOVERS_COUNT"
+        default=8, ge=0, alias="LAABH_QUANT_BACKTEST_TOP_MOVERS_COUNT"
     )
     laabh_quant_backtest_top_gappers_count: int = Field(
-        default=5, ge=0, alias="LAABH_QUANT_BACKTEST_TOP_GAPPERS_COUNT"
+        default=12, ge=0, alias="LAABH_QUANT_BACKTEST_TOP_GAPPERS_COUNT"
     )
     laabh_quant_backtest_min_price: float = Field(
         default=50.0, gt=0.0, alias="LAABH_QUANT_BACKTEST_MIN_PRICE"
+    )
+    # Sector-heat bucket: if a sector's average pct_change >= threshold, add
+    # up to sector_heat_count liquid F&O names from that sector regardless of
+    # their individual D-1 rank.
+    laabh_quant_backtest_sector_heat_enabled: bool = Field(
+        default=True, alias="LAABH_QUANT_BACKTEST_SECTOR_HEAT_ENABLED"
+    )
+    laabh_quant_backtest_sector_heat_threshold_pct: float = Field(
+        default=1.5, gt=0.0, alias="LAABH_QUANT_BACKTEST_SECTOR_HEAT_THRESHOLD_PCT"
+    )
+    laabh_quant_backtest_sector_heat_count: int = Field(
+        default=5, ge=1, alias="LAABH_QUANT_BACKTEST_SECTOR_HEAT_COUNT"
+    )
+    # Intraday universe expansion (live quant mode only).
+    # Scanner runs at 09:20, then every 30 min until stop_hour:stop_minute.
+    laabh_quant_intraday_scanner_enabled: bool = Field(
+        default=True, alias="LAABH_QUANT_INTRADAY_SCANNER_ENABLED"
+    )
+    # Minimum absolute intraday momentum (%) for a stock to be an admission candidate.
+    laabh_quant_intraday_scanner_min_momentum_pct: float = Field(
+        default=2.0, gt=0.0, alias="LAABH_QUANT_INTRADAY_SCANNER_MIN_MOMENTUM_PCT"
+    )
+    # Max arms replaced per scan cycle.
+    laabh_quant_intraday_scanner_max_replacements: int = Field(
+        default=3, ge=1, alias="LAABH_QUANT_INTRADAY_SCANNER_MAX_REPLACEMENTS"
+    )
+    # An arm needs at least this many bandit pulls before it can be evicted.
+    laabh_quant_intraday_scanner_min_pulls_before_evict: int = Field(
+        default=3, ge=0, alias="LAABH_QUANT_INTRADAY_SCANNER_MIN_PULLS_BEFORE_EVICT"
+    )
+    # Hysteresis: candidate must beat eviction target by at least this many pct points.
+    laabh_quant_intraday_scanner_hysteresis_pct: float = Field(
+        default=1.5, ge=0.0, alias="LAABH_QUANT_INTRADAY_SCANNER_HYSTERESIS_PCT"
+    )
+    # Hard stop time for expansion — no new arms after this (IST hour, minute).
+    laabh_quant_intraday_scanner_stop_hour: int = Field(
+        default=12, ge=9, le=15, alias="LAABH_QUANT_INTRADAY_SCANNER_STOP_HOUR"
+    )
+    laabh_quant_intraday_scanner_stop_minute: int = Field(
+        default=30, ge=0, le=59, alias="LAABH_QUANT_INTRADAY_SCANNER_STOP_MINUTE"
+    )
+    # Scan interval in minutes (how often to re-run the intraday scanner).
+    laabh_quant_intraday_scanner_interval_min: int = Field(
+        default=30, ge=5, alias="LAABH_QUANT_INTRADAY_SCANNER_INTERVAL_MIN"
+    )
+    # LLM supplement: add Phase-3 PROCEED candidates to the quant universe.
+    laabh_quant_llm_supplement_enabled: bool = Field(
+        default=True, alias="LAABH_QUANT_LLM_SUPPLEMENT_ENABLED"
+    )
+    laabh_quant_llm_supplement_max_add: int = Field(
+        default=5, ge=1, alias="LAABH_QUANT_LLM_SUPPLEMENT_MAX_ADD"
     )
     # Dhan historical loader rate limit (per minute)
     laabh_quant_backtest_dhan_rate_limit_per_min: int = Field(

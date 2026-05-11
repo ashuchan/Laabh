@@ -376,6 +376,29 @@ async def run_loop(
     # Keep last features_map for EOD close; initialise empty to avoid NameError
     features_map: dict[str, Any] = {}
 
+    # --- Intraday scanner setup (live quant mode only) ---
+    # The scanner is skipped entirely in backtest/replay mode — intraday data
+    # for future dates is not available, and universe expansion during replay
+    # would introduce look-ahead bias.
+    scanner = None
+    scan_interval = timedelta(minutes=settings.laabh_quant_intraday_scanner_interval_min)
+    # Seed last_scan_time so the first scan fires ~2 min after startup (≈09:20 IST)
+    # rather than immediately at 09:18. By 09:20 the opening 3-min bar is settled
+    # and momentum readings are meaningful. Without this seed the scan would run
+    # on the very first tick with an empty eviction pool anyway, but the DB
+    # round-trip is wasted.
+    last_scan_time: datetime | None = None
+    if (
+        ctx.mode == "live"
+        and not replay_mode
+        and settings.laabh_quant_intraday_scanner_enabled
+    ):
+        from src.quant.live_gainers_scanner import LiveGainersScanner
+        scanner = LiveGainersScanner()
+        # Pre-set so first real scan fires scan_interval - 2 min after startup
+        last_scan_time = current_time - scan_interval + timedelta(minutes=2)
+        logger.info("[QUANT] Intraday universe scanner enabled (first scan ~2 min after start)")
+
     # --- Main loop ---
     while True:
         if not replay_mode:
@@ -388,6 +411,64 @@ async def run_loop(
 
         tick_start = current_time
         logger.debug(f"[QUANT] tick at {now_ist.strftime('%H:%M:%S')} IST")
+
+        # --- Intraday scanner: replace weak arms with live movers ---
+        # Runs at most once per scan_interval. Only fires in live mode (scanner
+        # is None in backtest/replay). Arm mutations happen here, before feature
+        # reads, so the tick immediately benefits from any new instrument.
+        if scanner is not None and (
+            last_scan_time is None
+            or (current_time - last_scan_time) >= scan_interval
+        ):
+            try:
+                # Resolve symbols from arm_meta to handle underscores in names
+                # (e.g. BAJAJ_AUTO). arm_id.split("_")[0] would be wrong here.
+                open_position_symbols = {
+                    arm_meta.get(pos.arm_id, (pos.arm_id, ""))[0]
+                    for pos in open_positions
+                }
+                pairs = await scanner.compute_replacements(
+                    universe,
+                    selector,
+                    open_position_symbols,
+                    trading_date=today,
+                    primitives_list=effective_primitives_list,
+                )
+                for pair in pairs:
+                    evict_sym = pair.evict_symbol
+                    admit = pair.admit_instrument
+                    # Evict all primitive arms for evicted symbol
+                    for p in effective_primitives_list:
+                        selector.evict_arm(_make_arm_id(evict_sym, p))
+                    # Remove evicted symbol from universe and its history
+                    universe = [u for u in universe if u["symbol"] != evict_sym]
+                    history.pop(evict_sym, None)
+                    # Admit new symbol
+                    universe.append(admit)
+                    history[admit["symbol"]] = []
+                    underlying_map[admit["symbol"]] = admit["id"]
+                    for p in effective_primitives_list:
+                        new_arm = _make_arm_id(admit["symbol"], p)
+                        warm = selector.admit_arm(new_arm)
+                        arm_meta[new_arm] = (admit["symbol"], p)
+                        all_arms.append(new_arm)
+                        logger.info(
+                            f"[SCANNER] Admitted {new_arm} "
+                            f"({'warm' if warm else 'cold'} prior)"
+                        )
+                    # Clean up evicted arm meta + arm list
+                    for p in effective_primitives_list:
+                        old_arm = _make_arm_id(evict_sym, p)
+                        arm_meta.pop(old_arm, None)
+                        if old_arm in all_arms:
+                            all_arms.remove(old_arm)
+                    underlying_map.pop(evict_sym, None)
+                # Only advance last_scan_time on a successful cycle so that a
+                # transient DB failure retries on the next tick, not after a
+                # full scan_interval.
+                last_scan_time = current_time
+            except Exception as _scan_exc:
+                logger.warning(f"[SCANNER] scan cycle failed: {_scan_exc!r}")
 
         # Per-tick funnel-log scratch space. Populated as each gate fires so
         # the inner ``finally`` can hand a fully-classified set of rows to
