@@ -4,10 +4,12 @@ Phase 1 runs pre-market (7:00 AM IST) after the chain snapshot is collected.
 It scores every F&O instrument on three liquidity criteria and writes a
 `fno_candidates` row with phase=1 for each instrument that passes.
 
-Liquidity criteria (all three must pass):
-  1. ATM OI ≥ config.fno_phase1_min_atm_oi (default 5 000 contracts for Tier 1,
-     1 000 for Tier 2 / untiered — calibrated against live intraday OI;
-     see src/config.py for the rationale)
+Liquidity criteria (all must pass):
+  1. ATM OI ≥ config.fno_phase1_min_atm_oi (default 2 000 Tier 1, 1 000 Tier 2)
+     measured against the instrument's target expiry from next_weekly_expiry().
+     An additional OI-collapse guard rejects instruments whose current ATM OI
+     has dropped below fno_phase1_oi_collapse_pct (40%) of their 10-day rolling
+     average — catches corporate-action / circuit-breaker illiquidity.
   2. ATM bid-ask spread ≤ config.fno_phase1_max_spread_pct (default 1.5%)
   3. 5-day average equity volume ≥ config.fno_phase1_min_avg_volume (default 500 000 shares)
      (if no volume data, criterion is skipped — not treated as a fail)
@@ -17,7 +19,7 @@ IV-ban exclusion: any symbol on today's F&O ban list is skipped.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Sequence
 
@@ -28,6 +30,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from src.config import Settings
 from src.db import session_scope
 from src.fno.ban_list import get_banned_ids
+from src.fno.calendar import next_weekly_expiry
 from src.models.fno_candidate import FNOCandidate
 from src.models.fno_chain import OptionsChain
 from src.models.instrument import Instrument
@@ -132,16 +135,32 @@ async def _get_atm_chain_row(
     instrument_id: str,
     *,
     as_of: datetime | None = None,
+    expiry_date: date | None = None,
 ) -> tuple[int | None, float | None]:
-    """Return (atm_oi, atm_spread_pct) from latest chain snapshot on or before as_of."""
+    """Return (atm_oi, atm_spread_pct) from the latest chain snapshot for the
+    instrument, optionally bounded to a specific expiry and timestamp.
+
+    ``expiry_date`` should be the result of ``next_weekly_expiry(symbol, run_date)``
+    so the OI measurement covers only the expiry that Phase 3 will actually trade,
+    not a stale far-month contract that inflates or deflates the ATM figure.
+    """
     where_clauses = [OptionsChain.instrument_id == instrument_id]
     if as_of is not None:
         where_clauses.append(OptionsChain.snapshot_at <= as_of)
+    if expiry_date is not None:
+        where_clauses.append(OptionsChain.expiry_date == expiry_date)
     snap_subq = (
         select(func.max(OptionsChain.snapshot_at))
         .where(*where_clauses)
         .scalar_subquery()
     )
+
+    main_where = [
+        OptionsChain.instrument_id == instrument_id,
+        OptionsChain.snapshot_at == snap_subq,
+    ]
+    if expiry_date is not None:
+        main_where.append(OptionsChain.expiry_date == expiry_date)
 
     rows = await session.execute(
         select(
@@ -151,10 +170,7 @@ async def _get_atm_chain_row(
             OptionsChain.bid_price,
             OptionsChain.ask_price,
             OptionsChain.underlying_ltp,
-        ).where(
-            OptionsChain.instrument_id == instrument_id,
-            OptionsChain.snapshot_at == snap_subq,
-        )
+        ).where(*main_where)
     )
     rows = rows.all()
     if not rows:
@@ -282,11 +298,37 @@ async def run_phase1(
         )
         tier_by_id = {str(r.instrument_id): r.tier for r in tier_rows.all()}
 
+        # Rolling-average ATM OI per instrument: look back 14 calendar days
+        # (≈ 10 trading days) using Phase-1 history already written to
+        # fno_candidates.  Only instruments with ≥ fno_phase1_oi_collapse_min_days
+        # of history get the collapse guard — brand-new passers are skipped.
+        hist_rows = await session.execute(
+            select(
+                FNOCandidate.instrument_id,
+                func.avg(FNOCandidate.atm_oi).label("avg_oi"),
+            )
+            .where(
+                FNOCandidate.phase == 1,
+                FNOCandidate.run_date >= run_date - timedelta(days=14),
+                FNOCandidate.run_date < run_date,
+                FNOCandidate.atm_oi.isnot(None),
+                FNOCandidate.dryrun_run_id.is_(None),
+            )
+            .group_by(FNOCandidate.instrument_id)
+            .having(func.count(FNOCandidate.atm_oi) >= cfg.fno_phase1_oi_collapse_min_days)
+        )
+        rolling_avg_oi: dict[str, float] = {
+            str(r.instrument_id): float(r.avg_oi)
+            for r in hist_rows.all()
+            if r.avg_oi is not None
+        }
+
     if not instruments:
         logger.warning("fno.universe: no F&O instruments found")
         return []
 
     banned_ids = await get_banned_ids()
+    collapse_pct = cfg.fno_phase1_oi_collapse_pct
 
     results: list[LiquidityResult] = []
 
@@ -296,13 +338,16 @@ async def run_phase1(
             continue
 
         try:
+            # Target expiry for this instrument — Phase 1 measures OI against
+            # the same contract that Phase 3 will propose trading.
+            target_expiry = next_weekly_expiry(symbol, run_date)
+
             async with session_scope() as session:
-                atm_oi, spread = await _get_atm_chain_row(session, inst_id, as_of=as_of)
+                atm_oi, spread = await _get_atm_chain_row(
+                    session, inst_id, as_of=as_of, expiry_date=target_expiry
+                )
                 avg_vol = await _get_avg_volume_5d(session, inst_id, run_date, cutoff_date=run_date)
 
-            # Tier-aware OI threshold: Tier 1 large-caps face the strict
-            # 50k bar; Tier 2 mid/small-caps get the lower bar. Untiered
-            # instruments default to Tier 2 (charitable assumption).
             tier = tier_by_id.get(inst_id, 2)
             min_oi = min_oi_tier1 if tier == 1 else min_oi_tier2
             max_spread = max_spread_tier1 if tier == 1 else max_spread_tier2
@@ -311,6 +356,19 @@ async def run_phase1(
                 atm_oi, spread, avg_vol,
                 min_oi=min_oi, max_spread_pct=max_spread, min_volume=min_vol,
             )
+
+            # OI-collapse guard: reject if today's ATM OI has dropped below
+            # collapse_pct of the instrument's own rolling average.  Only fires
+            # when the instrument has enough Phase-1 history; new passers are
+            # admitted unconditionally so they can start building history.
+            if passed and atm_oi is not None:
+                rolling_avg = rolling_avg_oi.get(inst_id)
+                if rolling_avg is not None and atm_oi < collapse_pct * rolling_avg:
+                    passed = False
+                    fail_reason = (
+                        f"oi_collapse:{atm_oi}<"
+                        f"{collapse_pct*100:.0f}%_of_10d_avg_{rolling_avg:.0f}"
+                    )
 
             res = LiquidityResult(
                 instrument_id=inst_id,

@@ -81,6 +81,13 @@ class Settings(BaseSettings):
     fno_phase1_min_avg_volume_5d: int = Field(default=10000, alias="FNO_PHASE1_MIN_AVG_VOLUME_5D")
     fno_phase1_max_days_to_expiry: int = Field(default=3, alias="FNO_PHASE1_MAX_DAYS_TO_EXPIRY")
     fno_phase1_target_output: int = Field(default=50, alias="FNO_PHASE1_TARGET_OUTPUT")
+    # OI collapse guard: if today's ATM OI drops below this fraction of the
+    # instrument's own 10-day rolling average, Phase 1 rejects it even when
+    # the absolute floor is satisfied. Catches corporate-action / ban-list /
+    # circuit-breaker illiquidity that a static floor misses.
+    # Requires fno_phase1_oi_collapse_min_days of Phase-1 history to activate.
+    fno_phase1_oi_collapse_pct: float = Field(default=0.40, alias="FNO_PHASE1_OI_COLLAPSE_PCT")
+    fno_phase1_oi_collapse_min_days: int = Field(default=3, alias="FNO_PHASE1_OI_COLLAPSE_MIN_DAYS")
 
     # F&O Phase 2 (Catalyst scoring)
     fno_phase2_news_lookback_hours: int = Field(default=18, alias="FNO_PHASE2_NEWS_LOOKBACK_HOURS")
