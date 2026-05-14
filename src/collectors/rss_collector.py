@@ -35,9 +35,9 @@ class RSSCollector(BaseCollector):
 
         for source in sources:
             try:
-                count_new = await self._poll_source(source)
+                fetched, count_new = await self._poll_source(source)
                 result.items_new += count_new
-                result.items_fetched += count_new
+                result.items_fetched += fetched
             except Exception as exc:
                 logger.warning(f"RSS source {source.name} failed: {exc}")
                 result.errors.append(f"{source.name}: {exc}")
@@ -55,15 +55,20 @@ class RSSCollector(BaseCollector):
             r.raise_for_status()
             return r.text
 
-    async def _poll_source(self, source: DataSource) -> int:
-        """Fetch one RSS source; return count of new items inserted."""
+    async def _poll_source(self, source: DataSource) -> tuple[int, int]:
+        """Fetch one RSS source; return (fetched, new) counts."""
         url = source.config.get("url")
         if not url:
             logger.warning(f"RSS source {source.name} has no url; skipping")
-            return 0
+            return 0, 0
 
         body = await self._fetch(url)
         feed = await asyncio.to_thread(feedparser.parse, body)
+
+        total = len(feed.entries)
+        if total == 0:
+            logger.warning(f"RSS {source.name}: feed returned 0 entries (bozo={feed.bozo})")
+            return 0, 0
 
         new_count = 0
         async with session_scope() as session:
@@ -95,8 +100,9 @@ class RSSCollector(BaseCollector):
                 ))
                 new_count += 1
 
-        logger.info(f"RSS {source.name}: {new_count} new items")
-        return new_count
+        dupes = total - new_count
+        logger.info(f"RSS {source.name}: {new_count} new, {dupes} dupes (feed had {total} entries)")
+        return total, new_count
 
 
 def _parse_published(entry: Any) -> datetime | None:

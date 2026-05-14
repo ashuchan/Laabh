@@ -64,6 +64,11 @@ class BacktestTrade(Base):
     chain_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
     underlying_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
+    # Entry-time LinTS context vector — same purpose as quant_trades.entry_context.
+    # Required for accurate bandit replay during walk-forward backtest CV under
+    # LAABH_LLM_MODE='feature' (review fix P2 #5).
+    entry_context: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     __table_args__ = (
         Index("idx_backtest_trades_run", "backtest_run_id"),
         Index("idx_backtest_trades_arm", "arm_id"),

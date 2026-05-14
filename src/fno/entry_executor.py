@@ -47,6 +47,50 @@ _DEFAULT_LOT_SIZE = {
 _DEFAULT_EQUITY_LOT = 500  # NSE F&O equity median lot size
 
 
+async def _best_rv_annualised(instrument_id: str) -> float | None:
+    """Best-available annualised realised vol for ``instrument_id`` at entry.
+
+    Preference order (review fix P1 #5):
+      1. ``feature_store.rv_30min`` — intraday-accurate; available after the
+         first 30-min bar of the session is built (~09:45 IST).
+      2. ``iv_history.rv_20d`` — daily Yang-Zhang RV; always present once
+         the EOD pipeline has run.
+    Returns None when neither is available.
+    """
+    # 1. Try feature_store for the freshest intraday read. The fetch is
+    # cheap and short-circuits on None.
+    try:
+        import uuid as _uuid
+        from src.quant.feature_store import get as _fs_get
+        bundle = await _fs_get(_uuid.UUID(str(instrument_id)), datetime.now(tz=timezone.utc))
+        if bundle is not None and bundle.realized_vol_30min:
+            return float(bundle.realized_vol_30min)
+    except Exception:
+        # feature_store isn't always wired (e.g. pre-warmup, missing chain);
+        # we silently fall back to the EOD value.
+        pass
+
+    # 2. EOD fallback — latest iv_history.rv_20d for this instrument.
+    try:
+        from sqlalchemy import select
+        from src.db import session_scope
+        from src.models.fno_iv import IVHistory
+        async with session_scope() as session:
+            row = (await session.execute(
+                select(IVHistory.rv_20d)
+                .where(
+                    IVHistory.instrument_id == instrument_id,
+                    IVHistory.rv_20d.isnot(None),
+                )
+                .order_by(IVHistory.date.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+            return float(row) if row is not None else None
+    except Exception as exc:
+        logger.debug(f"entry_executor: rv lookup failed for {instrument_id}: {exc!r}")
+        return None
+
+
 def _lot_size_for(symbol: str) -> int:
     return _DEFAULT_LOT_SIZE.get(symbol.upper(), _DEFAULT_EQUITY_LOT)
 
@@ -207,6 +251,14 @@ async def _enter_one(proposal: EntryProposal, run_date: date) -> bool:
         for leg, fill in zip(proposal.legs, fills)
     ]
 
+    # Snapshot the best-available annualised realised vol at entry (review
+    # fix P1 #5). Used as the σ denominator for outcome_z when this signal
+    # eventually closes. Tries feature_store.rv_30min first (intraday-
+    # accurate); falls back to iv_history.rv_20d (daily) when intraday bars
+    # aren't ready yet (typical at 09:15 IST open). Failures are non-fatal —
+    # the column remains NULL and the attribution job re-derives at read.
+    rv_at_entry = await _best_rv_annualised(proposal.instrument_id)
+
     async with session_scope() as session:
         sig = FNOSignal(
             id=signal_id,
@@ -224,6 +276,7 @@ async def _enter_one(proposal: EntryProposal, run_date: date) -> bool:
                 else None,
             iv_regime_at_entry=None,
             vix_at_entry=None,
+            rv_annualised_at_entry=rv_at_entry,
             status="paper_filled",
             proposed_at=datetime.now(tz=timezone.utc),
             filled_at=datetime.now(tz=timezone.utc),
@@ -291,12 +344,13 @@ async def auto_enter(run_date: date | None = None) -> dict:
         iv_regime_by_inst: dict[str, str] = {}
         try:
             async with session_scope() as session:
+                from src.fno.llm_gate import phase3_gate_filters
                 rows = list((await session.execute(
                     _select(FNOCandidate.instrument_id, FNOCandidate.iv_regime)
                     .where(
                         FNOCandidate.run_date == run_date,
                         FNOCandidate.phase == 3,
-                        FNOCandidate.llm_decision == "PROCEED",
+                        *phase3_gate_filters(),
                     )
                 )).all())
             iv_regime_by_inst = {

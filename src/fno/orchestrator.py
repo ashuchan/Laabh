@@ -48,6 +48,19 @@ async def run_premarket_pipeline(
 
     logger.info(f"fno.orchestrator: starting premarket pipeline for {run_date}")
 
+    # Phase 0: market regime classification — runs before Phase 1 so regime_bias
+    # is available to Phase 2 and regime context feeds into Phase 3 prompt.
+    market_regime = None
+    try:
+        from src.fno.regime_classifier import compute_regime
+        market_regime = await compute_regime(run_date)
+        logger.info(
+            f"fno.orchestrator: market regime = {market_regime.regime.upper()} "
+            f"(conf={market_regime.confidence:.2f})"
+        )
+    except Exception as exc:
+        logger.warning(f"fno.orchestrator: regime classifier failed: {exc}")
+
     # Phase 1: liquidity filter — pass as_of so chain queries are bounded to the replay time
     phase1_results = await run_phase1(run_date, as_of=as_of)
     phase1_passed = sum(1 for r in phase1_results if r.passed)
@@ -89,10 +102,31 @@ async def run_premarket_pipeline(
     except Exception as exc:
         logger.warning(f"fno.orchestrator: phase2.5 fan-in failed: {exc}")
 
+    # Phase 2.75: vol surface — skew, term structure, OI walls for Phase-2 passers only.
+    # Scoped to passers (not all F&O instruments) to keep pre-market latency bounded.
+    try:
+        from src.fno.vol_surface import compute_for_instruments as compute_surface
+        phase2_ids = [r.instrument_id for r in phase2_results if r.passed]
+        surface_written = await compute_surface(run_date, instrument_ids=[str(i) for i in phase2_ids])
+        logger.info(f"fno.orchestrator: vol surface computed for {surface_written} instruments")
+    except Exception as exc:
+        logger.warning(f"fno.orchestrator: vol surface failed: {exc}")
+
     # Phase 3: thesis synthesis
-    phase3_results = await run_phase3(run_date)
+    phase3_results = await run_phase3(run_date, market_regime=market_regime)
     phase3_proceed = sum(1 for r in phase3_results if r.decision == "PROCEED")
     logger.info(f"fno.orchestrator: Phase 3 → {phase3_proceed} PROCEED decisions")
+
+    # Phase 0.5 shadow — deterministic six-factor baseline. Runs in parallel
+    # with the LLM pipeline so a 90-day Sharpe comparison is available by
+    # the time Phase 3 cuts over. Failures degrade the day's baseline row
+    # but do not block Phase 3.
+    baseline_written = 0
+    try:
+        from src.fno.deterministic_universe import run_deterministic_baseline
+        baseline_written = await run_deterministic_baseline(run_date, as_of=as_of)
+    except Exception as exc:
+        logger.warning(f"fno.orchestrator: deterministic baseline failed: {exc}")
 
     return {
         "run_date": run_date.isoformat(),
@@ -102,6 +136,7 @@ async def run_premarket_pipeline(
         "phase2_passed": phase2_passed,
         "phase3_total": len(phase3_results),
         "phase3_proceed": phase3_proceed,
+        "baseline_written": baseline_written,
     }
 
 
@@ -140,6 +175,22 @@ async def run_eod_tasks(run_date: date | None = None) -> None:
         logger.info(f"fno.orchestrator: IV history built for {upserted} instruments")
     except Exception as exc:
         logger.warning(f"fno.orchestrator: IV history builder failed: {exc}")
+
+    # VRP engine must run AFTER iv_history_builder — it reads the atm_iv just written.
+    try:
+        from src.fno.vrp_engine import compute_vrp_for_date
+        vrp_updated = await compute_vrp_for_date(run_date)
+        logger.info(f"fno.orchestrator: VRP computed for {vrp_updated} instruments")
+    except Exception as exc:
+        logger.warning(f"fno.orchestrator: VRP engine failed: {exc}")
+
+    # Vol surface EOD snapshot — archives end-of-session surface for all F&O instruments.
+    try:
+        from src.fno.vol_surface import compute_for_instruments as compute_surface
+        surface_eod = await compute_surface(run_date)
+        logger.info(f"fno.orchestrator: EOD vol surface archived for {surface_eod} instruments")
+    except Exception as exc:
+        logger.warning(f"fno.orchestrator: EOD vol surface failed: {exc}")
 
     try:
         await _send_daily_summary(run_date)
@@ -185,6 +236,7 @@ async def _send_morning_brief(run_date: date | None = None, mode_tag: str = "[AG
     from sqlalchemy import select
 
     from src.db import session_scope
+    from src.fno.llm_gate import phase3_gate_filters as _morning_brief_proceed_filters
     from src.fno.notifications import format_morning_brief
     from src.models.fno_candidate import FNOCandidate
     from src.models.instrument import Instrument
@@ -212,7 +264,7 @@ async def _send_morning_brief(run_date: date | None = None, mode_tag: str = "[AG
             .where(
                 FNOCandidate.run_date == run_date,
                 FNOCandidate.phase == 3,
-                FNOCandidate.llm_decision == "PROCEED",
+                *_morning_brief_proceed_filters(),
                 FNOCandidate.dryrun_run_id.is_(None),
             )
             .order_by(FNOCandidate.composite_score.desc().nulls_last())

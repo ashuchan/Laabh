@@ -111,12 +111,21 @@ async def load_morning(
     settings = get_settings()
     gamma = settings.laabh_quant_bandit_forget_factor
 
+    # Phase 3 cutover: when LAABH_LLM_MODE='feature', the LinTS context grows
+    # from 5 → 9 dims (four LLM-feature appendages). Pass the right shape so
+    # arm states are built at the correct size; persisted state from a prior
+    # mode is shape-mismatched and gets ignored by ``_patch_posterior``.
+    from src.quant.bandit.lints import CONTEXT_DIM, CONTEXT_DIM_WITH_LLM
+    use_llm = settings.laabh_llm_mode == "feature"
+    desired_dim = CONTEXT_DIM_WITH_LLM if use_llm else CONTEXT_DIM
+
     selector = ArmSelector(
         arms,
         algo=settings.laabh_quant_bandit_algo,
         prior_mean=settings.laabh_quant_bandit_prior_mean,
         prior_var=settings.laabh_quant_bandit_prior_var,
         seed=settings.laabh_quant_bandit_seed,
+        context_dim=desired_dim if settings.laabh_quant_bandit_algo == "lints" else None,
     )
 
     async with session_scope() as session:
@@ -197,9 +206,24 @@ def _patch_posterior(
         if a_inv is not None and b_vector is not None:
             import numpy as np
             from src.quant.bandit.lints import LinTSArmState
+            saved_a = np.array(a_inv)
+            saved_b = np.array(b_vector)
+            current_dim = getattr(impl, "context_dim", saved_a.shape[0])
+            # Dim-mismatch guard: persisted state from a prior LAABH_LLM_MODE
+            # cannot be reused under a different context_dim — the matrix
+            # shapes would be incompatible and multiply silently corrupt the
+            # posterior. Skip restore in that case; the arm cold-starts under
+            # the current dim, which is the right behaviour for a mode flip.
+            if saved_a.shape != (current_dim, current_dim) or saved_b.shape != (current_dim,):
+                logger.warning(
+                    f"persistence: skipping warm restore for {arm_id} — "
+                    f"saved shape {saved_a.shape}/{saved_b.shape} != current "
+                    f"dim {current_dim}. Cold-start under current LAABH_LLM_MODE."
+                )
+                return
             restored = LinTSArmState(
-                a_inv=np.array(a_inv) / gamma,  # γ-decay A_inv (widens posterior)
-                b=np.array(b_vector),
+                a_inv=saved_a / gamma,  # γ-decay A_inv (widens posterior)
+                b=saved_b,
                 n_obs=0,
             )
             impl._states[arm_id] = restored

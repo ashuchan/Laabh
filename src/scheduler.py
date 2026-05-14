@@ -111,6 +111,8 @@ async def _run_extractor() -> None:
 
 
 async def _run_signal_notifications() -> None:
+    if not get_settings().equity_trading_enabled:
+        return
     await SignalService().notify_watchlist_signals(since_minutes=10)
 
 
@@ -124,6 +126,24 @@ async def _run_notification_push() -> None:
 
 async def _run_resolve_expired() -> None:
     await SignalService().resolve_expired()
+
+
+async def _run_portfolio_greeks() -> None:
+    from src.fno.greeks_engine import snapshot_portfolio_greeks
+    await snapshot_portfolio_greeks()
+
+
+async def _run_ml_maintenance() -> None:
+    """Sunday 10:30 IST — auto-label closed ML shadow predictions + retrain check.
+
+    Module-level (not nested) so APScheduler's SQLAlchemyJobStore can pickle
+    the function reference. Nested functions break job persistence at startup.
+    """
+    from src.fno.ml_decision import label_closed_signals, check_retrain, get_agreement_stats
+    labeled = await label_closed_signals()
+    await check_retrain()
+    stats = await get_agreement_stats(lookback_days=30)
+    logger.info(f"ml_shadow: labeled={labeled} stats={stats}")
 
 
 # --- Phase 2 jobs ---
@@ -355,6 +375,45 @@ async def _fno_macro_collect() -> None:
     logger.info(f"macro collector: {n} records stored")
 
 
+async def _fno_llm_outcomes() -> None:
+    """Phase 0.3 outcome-attribution poll.
+
+    Walks llm_decision_log rows that don't yet have outcomes and tries to
+    attribute each one (closed signal, counterfactual at T+5, or timeout
+    at T+30). Cheap (single SELECT + per-row joins, bounded batch).
+    """
+    from src.fno.llm_outcomes import attribute_llm_outcomes
+    await attribute_llm_outcomes()
+
+
+@_logged("llm_calibration_weekly")
+async def _llm_calibration_weekly() -> None:
+    """Phase 2 weekly calibration — fit + maybe-promote each (feature, tier).
+
+    Runs Sundays 22:00 IST. Returns no-op when sample size is below the
+    floor (currently 100 observations per fit). New models only become
+    active when ECE improves by ≥5% AND residual variance doesn't worsen
+    by >5% vs the current active.
+    """
+    from src.fno.calibration import run_weekly_calibration
+    stats = await run_weekly_calibration()
+    logger.info(f"llm_calibration: weekly run -> {stats}")
+
+
+async def _llm_rollback_check() -> None:
+    """Phase 4 daily rollback-trigger evaluation. Read-only; never auto-flips
+    LAABH_LLM_MODE. Fires a Telegram advisory when any hard trigger trips."""
+    from src.fno.llm_monitoring import check_rollback_triggers
+    advisory = await check_rollback_triggers()
+    if advisory.fired:
+        try:
+            from src.services.notification_service import NotificationService
+            msg = "LLM rollback advisory:\n" + "\n".join(advisory.hard_triggers)
+            await NotificationService().send_text(msg)
+        except Exception as exc:
+            logger.warning(f"llm_rollback: telegram send failed: {exc!r}")
+
+
 @_logged("fno_fii_dii")
 async def _fno_fii_dii_collect() -> None:
     from src.collectors.fii_dii_collector import fetch_yesterday
@@ -552,6 +611,14 @@ def build_scheduler() -> AsyncIOScheduler:
         _run_check_pending_orders,
         IntervalTrigger(minutes=1),
         id="check_orders",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Greeks snapshot every 5 min during market hours
+    sched.add_job(
+        _run_portfolio_greeks,
+        CronTrigger(minute="*/5", hour="9-15", day_of_week="mon-fri", timezone=ist),
+        id="portfolio_greeks",
         max_instances=1,
         coalesce=True,
     )
@@ -796,12 +863,52 @@ def build_scheduler() -> AsyncIOScheduler:
         id="fno_fii_dii",
     )
 
+    # Every 5 min — Phase 0.3 LLM outcome attribution. Walks
+    # llm_decision_log pending rows, joins to closed fno_signals via the
+    # candidate lineage, and fills outcome_pnl_pct / outcome_z /
+    # outcome_class. Idempotent; bounded batch of 500 per tick.
+    sched.add_job(
+        _fno_llm_outcomes,
+        IntervalTrigger(minutes=5),
+        id="fno_llm_outcomes",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Sunday 22:00 IST — Phase 2 weekly calibration fit + maybe-promote.
+    # No-op when sample size is below the floor. Promotes only when ECE
+    # improves by ≥5% AND residual variance does not worsen by >5%.
+    sched.add_job(
+        _llm_calibration_weekly,
+        CronTrigger(hour=22, minute=0, day_of_week="sun", timezone=ist),
+        id="llm_calibration_weekly",
+    )
+
+    # 19:00 IST mon-fri — Phase 4 rollback-trigger advisory. Reads
+    # llm_decision_log + llm_calibration_models + fno_signals; logs and
+    # Telegram-alerts on hard triggers. Never auto-flips LAABH_LLM_MODE
+    # — operator decides.
+    sched.add_job(
+        _llm_rollback_check,
+        CronTrigger(hour=19, minute=0, day_of_week="mon-fri", timezone=ist),
+        id="llm_rollback_check",
+        max_instances=1,
+        coalesce=True,
+    )
+
     # --- OSS integrations: analyst backtest scoring ---
     # Sunday 10:00 IST (04:30 UTC) — backtests all analyst signals from the past 90 days
     sched.add_job(
         _run_analyst_backtest_scoring,
         CronTrigger(hour=10, minute=0, day_of_week="sun", timezone=ist),
         id="analyst_backtest_scoring",
+    )
+
+    # Sunday 10:30 IST — auto-label closed ML shadow predictions + retrain check
+    sched.add_job(
+        _run_ml_maintenance,
+        CronTrigger(hour=10, minute=30, day_of_week="sun", timezone=ist),
+        id="ml_shadow_maintenance",
     )
 
     # --- Service liveness heartbeat ---

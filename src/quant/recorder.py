@@ -54,6 +54,10 @@ class OpenTradePayload:
     kelly_fraction: float
     lots: int
     legs: dict | None = None
+    # LinTS context vector at entry — persisted so mid-session replay
+    # (and the close-time update) sees the same context the selector did
+    # (review fix P0 #1). Plain list of floats so JSONB stores cleanly.
+    entry_context: list | None = None
 
 
 @dataclass
@@ -200,6 +204,7 @@ class LiveTradeRecorder(TradeRecorder):
                     kelly_fraction=p.kelly_fraction,
                     lots=p.lots,
                     status="open",
+                    entry_context=p.entry_context,
                 )
                 session.add(trade)
                 await session.flush()
@@ -334,6 +339,7 @@ class BacktestTradeRecorder(TradeRecorder):
                     lots=p.lots,
                     chain_source=self._chain_source,
                     underlying_source=self._underlying_source,
+                    entry_context=p.entry_context,
                 )
                 session.add(trade)
                 await session.flush()

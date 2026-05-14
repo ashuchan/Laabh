@@ -134,12 +134,31 @@ class Settings(BaseSettings):
         default="NIFTY 50", alias="FNO_SENTIMENT_INDEX_SYMBOL"
     )
 
+    # F&O VRP Engine (Volatility Risk Premium — runs EOD after iv_history_builder)
+    # VRP = ATM_IV - RV_20d (both annualized decimal, e.g. 0.22 = 22% annual vol)
+    # Thresholds from Bhattacharyya & Madhavan (NSE Working Paper, 2019).
+    fno_vrp_lookback_days: int = Field(default=20, alias="FNO_VRP_LOOKBACK_DAYS")
+    fno_vrp_min_data_points: int = Field(default=10, alias="FNO_VRP_MIN_DATA_POINTS")
+    fno_vrp_rich_threshold: float = Field(default=0.02, alias="FNO_VRP_RICH_THRESHOLD")   # VRP > +2 vol pts
+    fno_vrp_cheap_threshold: float = Field(default=-0.01, alias="FNO_VRP_CHEAP_THRESHOLD") # VRP < -1 vol pt
+
+    # F&O Greeks Engine (portfolio-level Greeks budgets)
+    # All budgets are per-lot (lot_size=1 in current DB). Hard gate is warn-only by default.
+    fno_greeks_delta_budget: float = Field(default=10.0, alias="FNO_GREEKS_DELTA_BUDGET")   # max |net delta|
+    fno_greeks_vega_budget: float = Field(default=100.0, alias="FNO_GREEKS_VEGA_BUDGET")    # max |net vega|
+    fno_greeks_min_theta: float = Field(default=50.0, alias="FNO_GREEKS_MIN_THETA")          # max theta bleed/day
+    fno_greeks_hard_gate: bool = Field(default=False, alias="FNO_GREEKS_HARD_GATE")          # warn-only by default
+
     # F&O Phase 3 (Thesis synthesis)
     fno_phase3_target_output: int = Field(default=30, alias="FNO_PHASE3_TARGET_OUTPUT")
     fno_phase3_llm_model: str = Field(
         default="claude-sonnet-4-20250514", alias="FNO_PHASE3_LLM_MODEL"
     )
     fno_phase3_llm_temperature: float = Field(default=0.0, alias="FNO_PHASE3_LLM_TEMPERATURE")
+    # Fast-track: |composite - 5.0| >= this threshold in a confirmed trend + cheap VRP
+    # bypasses the LLM and issues a deterministic PROCEED on the appropriate debit spread.
+    # 1.0 = composite <= 4.0 (bearish) or >= 6.0 (bullish). Set to 99 to disable.
+    fno_phase3_fast_track_threshold: float = Field(default=1.0, alias="FNO_PHASE3_FAST_TRACK_THRESHOLD")
 
     # F&O Phase 4 (Intraday management)
     fno_phase4_no_entry_before_minutes: int = Field(
@@ -167,6 +186,19 @@ class Settings(BaseSettings):
     fno_vix_low_threshold: float = Field(default=12.0, alias="FNO_VIX_LOW_THRESHOLD")
     fno_vix_high_threshold: float = Field(default=18.0, alias="FNO_VIX_HIGH_THRESHOLD")
     fno_vix_recheck_interval_min: int = Field(default=5, alias="FNO_VIX_RECHECK_INTERVAL_MIN")
+
+    # F&O Regime Classifier thresholds — calibrated by scripts/calibrate_regime.py.
+    # fno_vix_high_threshold (above) is the shared VIX-level threshold; reused here
+    # to avoid a duplicate config key.  Re-run calibrate_regime.py after ~3 months
+    # of breadth data accumulates (MIN_BREADTH_DAYS=60 trading days required).
+    fno_regime_vix_spike: float = Field(default=0.08, alias="FNO_REGIME_VIX_SPIKE")
+    fno_regime_vix_drop: float = Field(default=-0.07, alias="FNO_REGIME_VIX_DROP")
+    fno_regime_trend_1d: float = Field(default=1.5, alias="FNO_REGIME_TREND_1D")
+    fno_regime_trend_1w: float = Field(default=2.5, alias="FNO_REGIME_TREND_1W")
+    fno_regime_breadth_bull: float = Field(default=65.0, alias="FNO_REGIME_BREADTH_BULL")
+    fno_regime_breadth_bear: float = Field(default=35.0, alias="FNO_REGIME_BREADTH_BEAR")
+    fno_regime_vrp_cheap: float = Field(default=0.01, alias="FNO_REGIME_VRP_CHEAP")
+    fno_regime_vrp_rich: float = Field(default=0.02, alias="FNO_REGIME_VRP_RICH")
 
     # Position sizing (vol-scaled)
     fno_sizing_risk_per_trade_pct: float = Field(
@@ -329,6 +361,16 @@ class Settings(BaseSettings):
     dryrun_llm_mode: str = Field(
         default="cached_or_live", alias="DRYRUN_LLM_MODE"
     )  # cached_or_live | mock | live
+
+    # --- LLM Feature Generator (docs/llm_feature_generator/implementation_plan.md) ---
+    # gate:    legacy behaviour — v9 PROCEED/SKIP/HEDGE is the trade gate.
+    # shadow:  v9 still gates, but v10 is also called and logged (cost ~2×).
+    # feature: v10 continuous features drive the bandit; v9 gate is removed.
+    # Default 'gate' preserves the current production path. The shadow / feature
+    # transitions are user-flipped per plan §3 — they are not data-gated.
+    laabh_llm_mode: Literal["gate", "shadow", "feature"] = Field(
+        default="gate", alias="LAABH_LLM_MODE"
+    )
 
     # --- Quant (bandit-orchestrated intraday F&O) ---
     # LAABH_INTRADAY_MODE=quant bypasses all LLM intraday agents.

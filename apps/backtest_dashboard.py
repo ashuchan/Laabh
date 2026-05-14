@@ -25,6 +25,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import psycopg2
 import psycopg2.extras
 import streamlit as st
@@ -547,6 +548,122 @@ def section_run() -> None:
             )
 
 
+def section_llm_monitor() -> None:
+    """LLM-feature-generator monitoring panel.
+
+    Plan reference: docs/llm_feature_generator/implementation_plan.md §4.1.
+
+    Reads from llm_decision_log + llm_calibration_models + fno_signals to
+    render reliability, drift, three-way Sharpe, cost, drawdown, and the
+    v9-vs-synthetic-v10 agreement matrix. Synchronous psycopg2 (matches
+    the rest of this dashboard); the production scheduler uses the async
+    helpers in ``src.fno.llm_monitoring``.
+    """
+    st.subheader("LLM feature generator — health panel")
+
+    # --- Active calibration models ---
+    st.markdown("**Active calibration models**")
+    with _conn() as c, c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT feature_name, instrument_tier, method, n_observations,
+                   cv_ece, cv_residual_var, fitted_at
+            FROM llm_calibration_models
+            WHERE is_active = TRUE
+            ORDER BY feature_name, instrument_tier
+        """)
+        active_rows = [dict(r) for r in cur.fetchall()]
+    if active_rows:
+        st.dataframe(active_rows, hide_index=True, use_container_width=True)
+    else:
+        st.info("No active calibration models yet. Wait for the weekly Sunday-22:00 fit job.")
+
+    # --- Feature drift (weekly means over last 28 days) ---
+    st.markdown("**Feature drift — weekly mean of each LLM dimension**")
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""
+            SELECT
+                DATE_TRUNC('week', run_date)::DATE,
+                AVG(directional_conviction),
+                AVG(thesis_durability),
+                AVG(catalyst_specificity),
+                AVG(risk_flag),
+                COUNT(*)
+            FROM llm_decision_log
+            WHERE prompt_version = 'v10_continuous'
+              AND run_date >= CURRENT_DATE - INTERVAL '28 days'
+            GROUP BY 1
+            ORDER BY 1
+        """)
+        drift_rows = cur.fetchall()
+    if drift_rows:
+        st.dataframe(
+            [
+                {
+                    "week": r[0].isoformat(),
+                    "dc": r[1], "td": r[2], "cs": r[3], "rf": r[4],
+                    "n": r[5],
+                }
+                for r in drift_rows
+            ],
+            hide_index=True, use_container_width=True,
+        )
+    else:
+        st.info("No v10 rows yet — flip LAABH_LLM_MODE=shadow to start logging.")
+
+    # --- Three-way Sharpe (v9 / v10 / deterministic) ---
+    st.markdown("**Three-way Sharpe (30-day rolling)**")
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""
+            SELECT COALESCE(l.prompt_version, 'v9') AS pv,
+                   s.final_pnl::FLOAT AS pnl
+            FROM fno_signals s
+            JOIN fno_candidates c ON c.id = s.candidate_id
+            LEFT JOIN llm_decision_log l
+              ON l.run_date = c.run_date
+             AND l.instrument_id = c.instrument_id
+             AND l.phase = 'fno_thesis'
+             AND l.prompt_version != 'v9'
+            WHERE s.status = 'closed'
+              AND s.closed_at >= NOW() - INTERVAL '30 days'
+              AND s.final_pnl IS NOT NULL
+        """)
+        pnl_rows = cur.fetchall()
+    pv_pnls: dict[str, list[float]] = {}
+    for pv, pnl in pnl_rows:
+        pv_pnls.setdefault(pv or "v9", []).append(float(pnl))
+
+    import math as _math
+    def _sharpe_local(p: list[float]) -> float | None:
+        if len(p) < 5:
+            return None
+        arr = np.array(p, dtype=float)
+        std = float(arr.std())
+        if std == 0:
+            return None
+        return float(arr.mean() / std * _math.sqrt(252))
+
+    sharpe_rows = []
+    for pv in ("v9", "v10_continuous"):
+        s = _sharpe_local(pv_pnls.get(pv, []))
+        sharpe_rows.append({"pipeline": pv, "n_trades": len(pv_pnls.get(pv, [])), "sharpe": s})
+    st.dataframe(sharpe_rows, hide_index=True, use_container_width=True)
+
+    # --- Reliability diagrams (PNG per fit) ---
+    st.markdown("**Reliability diagrams**")
+    static_dir = PROJECT_ROOT / "apps" / "static" / "calibration"
+    if static_dir.exists():
+        pngs = sorted(static_dir.glob("*.png"), reverse=True)[:6]
+        if pngs:
+            cols = st.columns(min(len(pngs), 3))
+            for i, p in enumerate(pngs):
+                with cols[i % len(cols)]:
+                    st.image(str(p), caption=p.stem, use_container_width=True)
+        else:
+            st.caption("No reliability PNGs yet — each calibration fit drops one here.")
+    else:
+        st.caption(f"PNG output directory not yet created: {static_dir}")
+
+
 def section_jobs() -> None:
     st.subheader("Background jobs")
     jobs = _job_state()
@@ -753,7 +870,9 @@ def main() -> None:
         "from the terminal won't appear here, but their writes show in the banner above)."
     )
 
-    tabs = st.tabs(["Overview", "Run", "Backfill", "Runs & reports", "Jobs"])
+    tabs = st.tabs(
+        ["Overview", "Run", "Backfill", "Runs & reports", "Jobs", "LLM monitor"]
+    )
     with tabs[0]:
         section_overview()
     with tabs[1]:
@@ -764,6 +883,8 @@ def main() -> None:
         section_runs_and_reports()
     with tabs[4]:
         section_jobs()
+    with tabs[5]:
+        section_llm_monitor()
 
     # Auto-refresh decision:
     #   * Always-on when ``auto`` is set and ``only_when_busy`` is not.

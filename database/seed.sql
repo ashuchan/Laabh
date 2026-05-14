@@ -35,12 +35,12 @@ INSERT INTO data_sources (name, type, config, poll_interval_sec, priority, extra
  '{"extract_signals": true, "extract_sentiment": true, "language_hint": "en"}'),
 
 ('NDTV Profit', 'rss_feed',
- '{"url": "https://www.ndtvprofit.com/rss/latest", "category": "market_news"}',
+ '{"url": "https://www.ndtvprofit.com/rss", "category": "market_news"}',
  600, 4,
  '{"extract_signals": true, "extract_sentiment": true, "language_hint": "en"}'),
 
 ('Reuters India Business', 'rss_feed',
- '{"url": "https://feeds.reuters.com/reuters/INbusinessNews", "category": "macro_news"}',
+ '{"url": "https://news.google.com/rss/search?q=reuters+india+business+economy&hl=en-IN&gl=IN&ceid=IN:en", "category": "macro_news"}',
  600, 5,
  '{"extract_signals": false, "extract_sentiment": true, "language_hint": "en"}');
 

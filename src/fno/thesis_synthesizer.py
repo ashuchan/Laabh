@@ -10,6 +10,7 @@ Writes audit log entries via llm_audit_log for every API call.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -27,15 +28,19 @@ from src.config import Settings
 from src.db import session_scope
 from src.fno.calendar import next_weekly_expiry
 from src.fno.catalyst_scorer import get_latest_fii_dii
+from src.fno.llm_features import LLMFeatureScore, parse_llm_features
 from src.fno.prompts import (
     FNO_THESIS_PROMPT_VERSION,
+    FNO_THESIS_PROMPT_VERSION_V10,
     FNO_THESIS_SYSTEM,
+    FNO_THESIS_SYSTEM_V10,
     FNO_THESIS_USER_TEMPLATE,
 )
 from src.fno.vix_collector import classify_regime
 from src.models.fno_candidate import FNOCandidate
 from src.models.instrument import Instrument
 from src.models.llm_audit_log import LLMAuditLog
+from src.models.llm_decision_log import LLMDecisionLog
 from src.models.signal import Signal
 
 _settings = Settings()
@@ -135,6 +140,11 @@ def build_user_prompt(
     dii_net_cr: float | None,
     macro_drivers: list[str],
     headlines: list[str],
+    vrp: float | None = None,
+    vrp_regime: str | None = None,
+    rv_20d: float | None = None,
+    vol_surface_block: str = "(surface unavailable)",
+    market_regime_block: str = "(regime unavailable)",
     extra_context: str = "",
     market_movers_context: str = "",
 ) -> str:
@@ -173,6 +183,17 @@ def build_user_prompt(
             f"DII net ₹{dii_net_cr:+.0f}Cr)"
         )
 
+    # VRP block — shown when the EOD pipeline has populated rv_20d/vrp
+    if vrp is not None and rv_20d is not None and vrp_regime is not None:
+        vrp_pct = vrp * 100.0       # convert decimal to vol-points for readability
+        rv_pct = rv_20d * 100.0
+        vrp_block = (
+            f"{vrp_regime.upper()} (VRP={vrp_pct:+.1f}vol pts: "
+            f"ATM IV={iv_rank_block}, RV_20d={rv_pct:.1f}%)"
+        )
+    else:
+        vrp_block = "(data unavailable — EOD VRP pipeline not yet run)"
+
     return FNO_THESIS_USER_TEMPLATE.format(
         symbol=symbol,
         sector=sector or "Unknown",
@@ -184,6 +205,9 @@ def build_user_prompt(
         news_score=news_score,
         sentiment_score=sentiment_score,
         fii_dii_block=fii_dii_block,
+        vrp_block=vrp_block,
+        vol_surface_block=vol_surface_block,
+        market_regime_block=market_regime_block,
         macro_align_score=macro_align_score,
         convergence_score=convergence_score,
         composite_score=composite_score,
@@ -217,16 +241,125 @@ def _call_claude(prompt: str, model: str, temperature: float) -> tuple[str, int,
     return text, msg.usage.input_tokens, msg.usage.output_tokens, latency_ms
 
 
+def _call_claude_v10(prompt: str, model: str, temperature: float) -> tuple[str, int, int, int]:
+    """v10 system-prompt variant. Mirrors ``_call_claude`` exactly except for
+    the system block and a slightly higher max_tokens budget (the v10
+    schema is wordier — strikes + reasoning_oneline)."""
+    client = anthropic.Anthropic(api_key=_settings.anthropic_api_key)
+    t0 = time.time()
+    msg = client.messages.create(
+        model=model,
+        max_tokens=600,
+        temperature=temperature,
+        system=FNO_THESIS_SYSTEM_V10,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    latency_ms = int((time.time() - t0) * 1000)
+    text = msg.content[0].text if msg.content else ""
+    return text, msg.usage.input_tokens, msg.usage.output_tokens, latency_ms
+
+
+async def _log_v10_shadow(
+    *,
+    prompt: str,
+    model: str,
+    run_date: date,
+    as_of: datetime | None,
+    dryrun_run_id: uuid.UUID | None,
+    instrument_id: str,
+) -> None:
+    """Fire-and-forget v10 call. Bounded timeout + single retry + exception
+    swallow so a v10 failure never affects the v9 production path
+    (plan §1.3 mandates the retry; review fix P1 #6).
+
+    Run inside ``asyncio.create_task`` from the caller. The Anthropic SDK
+    call is synchronous; wrap it with ``asyncio.to_thread`` so we don't
+    block the event loop, then bound the whole thing with ``wait_for``.
+    """
+    raw: str | None = None
+    tokens_in = tokens_out = latency_ms = 0
+    # Up to 2 attempts (initial + 1 retry per plan §1.3). Retry only on
+    # transient errors — timeout, network, SDK-level exception. Parse
+    # failures don't retry (the model will return the same garbage).
+    for attempt in range(2):
+        try:
+            loop_call = asyncio.to_thread(
+                _call_claude_v10, prompt, model, _settings.fno_phase3_llm_temperature
+            )
+            raw, tokens_in, tokens_out, latency_ms = await asyncio.wait_for(
+                loop_call, timeout=30.0
+            )
+            break
+        except asyncio.TimeoutError:
+            if attempt == 0:
+                logger.debug(f"v10 shadow: {instrument_id} timed out — retrying once")
+                continue
+            logger.warning(f"v10 shadow: {instrument_id} timed out twice — skipping log")
+            return
+        except Exception as exc:
+            if attempt == 0:
+                logger.debug(f"v10 shadow: {instrument_id} retry after {exc!r}")
+                continue
+            logger.warning(f"v10 shadow: {instrument_id} failed after retry: {exc!r}")
+            return
+
+    if raw is None:
+        return
+
+    try:
+        parsed = parse_llm_features(
+            raw, as_of=as_of, dryrun_run_id=dryrun_run_id
+        )
+        # Mirror v9's audit-log write so the cost-per-trade comparator
+        # has real v10 token counts to average against v9 (review fix
+        # P0 #1). Same row also doubles as the forensic trail for any
+        # v10 prompt regression debugging.
+        v10_ref_id = uuid.uuid4()
+        async with session_scope() as session:
+            await _write_audit_log(
+                session, v10_ref_id, model,
+                _settings.fno_phase3_llm_temperature,
+                prompt, raw,
+                (parsed.raw if parsed is not None else None),
+                tokens_in, tokens_out, latency_ms,
+                caller=f"{_CALLER}.v10",
+            )
+            await _write_llm_decision_log(
+                session,
+                run_date=run_date,
+                as_of=as_of or datetime.now(tz=timezone.utc),
+                dryrun_run_id=dryrun_run_id,
+                instrument_id=instrument_id,
+                phase="fno_thesis",
+                prompt_version=FNO_THESIS_PROMPT_VERSION_V10,
+                model_id=model,
+                decision_label=None,
+                raw_response=(parsed.raw if parsed is not None else {"raw_text": raw}),
+                directional_conviction=(parsed.directional_conviction if parsed else None),
+                thesis_durability=(parsed.thesis_durability if parsed else None),
+                catalyst_specificity=(parsed.catalyst_specificity if parsed else None),
+                risk_flag=(parsed.risk_flag if parsed else None),
+                raw_confidence=(parsed.raw_confidence if parsed else None),
+            )
+    except Exception as exc:
+        # Swallow on purpose — shadow path must never crash the v9 caller.
+        logger.warning(f"v10 shadow: {instrument_id} parse/log failed: {exc!r}")
+
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 
 async def _get_phase2_candidates(session, run_date: date) -> list[FNOCandidate]:
+    # Order by conviction strength — furthest from neutral (5.0) first. This
+    # handles both bullish days (composite > 5.5 ranked first) and bearish
+    # days (composite < 4.5 ranked first), so the Phase 3 target-output cap
+    # always picks the most actionable candidates regardless of market direction.
     result = await session.execute(
         select(FNOCandidate).where(
             FNOCandidate.run_date == run_date,
             FNOCandidate.phase == 2,
-        ).order_by(FNOCandidate.composite_score.desc())
+        ).order_by(func.abs(FNOCandidate.composite_score - 5.0).desc())
         .limit(_settings.fno_phase3_target_output)
     )
     return list(result.scalars().all())
@@ -289,43 +422,70 @@ async def _get_underlying_ltp(session, instrument_id: str) -> float | None:
     return None
 
 
-async def _get_iv_rank(session, instrument_id: str) -> tuple[float | None, float | None]:
-    """Latest (iv_rank_52w, atm_iv) from iv_history for an instrument.
+@dataclass(frozen=True)
+class _IVSnapshot:
+    """Typed container for IV + VRP data read from iv_history."""
+    iv_rank_52w: float | None       # 0-100 percentile; None = no history
+    atm_iv: float | None            # annualized decimal (e.g. 0.22 = 22%)
+    rv_20d: float | None            # Yang-Zhang realized vol, annualized decimal
+    vrp: float | None               # atm_iv - rv_20d; None = VRP not yet computed
+    vrp_regime: str | None          # 'rich' | 'fair' | 'cheap' | None
 
-    Returns (None, None) if no row exists. The IV history builder runs
-    EOD (15:40 IST) so on a normal market day this returns yesterday's
-    settled values — appropriate for the pre-market Phase 3 prompt.
 
-    Wires the IVHistory table that was always populated but never read
-    by Phase 3 — the previous code did
-    ``getattr(cand, "iv_rank_52w", None) or 50`` against an FNOCandidate
-    that never carried the field, so iv_rank was permanently 50.
+async def _get_iv_snapshot(session, instrument_id: str) -> _IVSnapshot:
+    """Latest IV rank, ATM IV, and VRP reading from iv_history.
+
+    Returns an _IVSnapshot with None fields when data is unavailable.
+    Callers should treat any None field as "missing" and render it
+    explicitly in the LLM prompt (never substitute silent defaults).
+
+    Replaces the retired _get_iv_rank() tuple return which leaked NoneType
+    handling into every call site and added a new tuple position whenever
+    the schema grew.
     """
     from src.models.fno_iv import IVHistory
 
     row = (await session.execute(
-        select(IVHistory.iv_rank_52w, IVHistory.atm_iv)
-        .where(IVHistory.instrument_id == instrument_id)
+        select(
+            IVHistory.iv_rank_52w,
+            IVHistory.atm_iv,
+            IVHistory.rv_20d,
+            IVHistory.vrp,
+            IVHistory.vrp_regime,
+        )
+        .where(
+            IVHistory.instrument_id == instrument_id,
+            IVHistory.dryrun_run_id.is_(None),
+        )
         .order_by(IVHistory.date.desc())
         .limit(1)
     )).first()
+
     if row is None:
-        return None, None
+        return _IVSnapshot(None, None, None, None, None)
+
+    # IV Rank validation — out-of-range values come from a historical unit
+    # mismatch (atm_iv stored as decimal 0.27 while history was in % 33.36).
+    # Clamp fix landed 2026-05-08; rows before that may carry garbage ranks.
     rank = float(row.iv_rank_52w) if row.iv_rank_52w is not None else None
-    # Defensive: historical iv_history rows written before the
-    # iv_history_builder clamp fix (2026-05-08) can have wildly out-of-range
-    # values (-6273, +8100, etc.) caused by a unit mismatch in the
-    # underlying chain iv column. Treat those as "no data" so the LLM sees
-    # a neutral default rather than nonsense like "-587% IV rank".
     if rank is not None and not (0.0 <= rank <= 100.0):
         logger.warning(
             f"thesis_synthesizer: out-of-range iv_rank_52w={rank} for "
-            f"instrument {instrument_id} — treating as missing. "
-            f"Re-run iv_history_builder after the clamp fix to refresh."
+            f"instrument {instrument_id} — treating as missing."
         )
         rank = None
-    atm = float(row.atm_iv) if row.atm_iv is not None else None
-    return rank, atm
+
+    # ATM IV normalization (same unit issue as iv_rank)
+    atm_raw = float(row.atm_iv) if row.atm_iv is not None else None
+    atm_dec = (atm_raw / 100.0 if (atm_raw and atm_raw > 3.0) else atm_raw)
+
+    return _IVSnapshot(
+        iv_rank_52w=rank,
+        atm_iv=atm_dec,
+        rv_20d=float(row.rv_20d) if row.rv_20d is not None else None,
+        vrp=float(row.vrp) if row.vrp is not None else None,
+        vrp_regime=row.vrp_regime,
+    )
 
 
 async def _get_chain_pcr(session, instrument_id: str) -> float | None:
@@ -444,6 +604,53 @@ async def _get_headlines(session, instrument_id: str, lookback_hours: int) -> li
 #     from src.fno.catalyst_scorer import get_latest_fii_dii
 
 
+async def _write_llm_decision_log(
+    session,
+    *,
+    run_date: date,
+    as_of: datetime,
+    dryrun_run_id: uuid.UUID | None,
+    instrument_id: str,
+    phase: str,
+    prompt_version: str,
+    model_id: str,
+    decision_label: str | None,
+    raw_response: dict,
+    # v10 continuous fields (Phase 1+ — None when called from v9 path)
+    directional_conviction: float | None = None,
+    thesis_durability: float | None = None,
+    catalyst_specificity: float | None = None,
+    risk_flag: float | None = None,
+    raw_confidence: float | None = None,
+) -> None:
+    """Insert one row into llm_decision_log for downstream calibration / outcome attribution.
+
+    Uses ON CONFLICT DO NOTHING on the unique key so a retry within the same
+    run_date / instrument / phase / prompt_version / dryrun_run_id tuple is a
+    no-op rather than a crash — fast-track + LLM both call this, and we don't
+    want duplicate writes when the same instrument is re-processed.
+    """
+    stmt = pg_insert(LLMDecisionLog).values(
+        run_date=run_date,
+        as_of=as_of,
+        dryrun_run_id=dryrun_run_id,
+        instrument_id=instrument_id,
+        phase=phase,
+        prompt_version=prompt_version,
+        model_id=model_id,
+        decision_label=decision_label,
+        directional_conviction=directional_conviction,
+        thesis_durability=thesis_durability,
+        catalyst_specificity=catalyst_specificity,
+        risk_flag=risk_flag,
+        raw_confidence=raw_confidence,
+        raw_response=raw_response,
+    ).on_conflict_do_nothing(
+        index_elements=["run_date", "instrument_id", "phase", "prompt_version", "dryrun_run_id"],
+    )
+    await session.execute(stmt)
+
+
 async def _write_audit_log(
     session,
     caller_ref_id: uuid.UUID,
@@ -455,9 +662,15 @@ async def _write_audit_log(
     tokens_in: int,
     tokens_out: int,
     latency_ms: int,
+    *,
+    caller: str = _CALLER,
 ) -> None:
+    """Write an llm_audit_log row. ``caller`` distinguishes v9 (default)
+    from v10 shadow calls (``fno.thesis_synthesizer.v10``) so the
+    cost-rollback comparator can compute a real ratio (review fix P0 #1).
+    """
     session.add(LLMAuditLog(
-        caller=_CALLER,
+        caller=caller,
         caller_ref_id=caller_ref_id,
         model=model,
         temperature=temperature,
@@ -515,6 +728,7 @@ async def run_phase3(
     *,
     as_of: datetime | None = None,
     dryrun_run_id: uuid.UUID | None = None,
+    market_regime=None,  # RegimeResult | None — avoids circular import
 ) -> list[ThesisResult]:
     """Run Phase 3 LLM thesis synthesis for top Phase-2 candidates.
 
@@ -609,27 +823,16 @@ async def run_phase3(
             async with session_scope() as session:
                 instrument = await _get_instrument(session, inst_id)
                 headlines = await _get_headlines(session, inst_id, lookback)
-                # Real LTP — replaces the prior bug of passing market_cap_cr.
-                # Tries OptionsChain.underlying_ltp first (intraday-fresh),
-                # falls back to PriceDaily.close (yesterday's settle).
                 underlying_ltp = await _get_underlying_ltp(session, inst_id)
-                # Real IV rank from the iv_history table that the EOD
-                # builder populates daily — wires data that was always
-                # there but never queried.
-                iv_rank_real, _atm_iv = await _get_iv_rank(session, inst_id)
-                # Put-Call Ratio from latest chain snapshot, summed across
-                # all strikes for the nearest expiry. None when chain has
-                # no rows for this instrument.
+                iv_snap = await _get_iv_snapshot(session, inst_id)
                 pcr = await _get_chain_pcr(session, inst_id)
-                # Per-instrument bullish / bearish signal counts. Anchor
-                # the lookback window to the Phase-2 cand row's created_at
-                # so the counts cover the SAME window Phase 2 used when it
-                # computed news_score — otherwise the LLM can see e.g.
-                # `news_score=10/10 (0 bullish, 0 bearish)` (signals aged
-                # past Phase 3's now-anchored window but not Phase 2's).
                 bullish_count, bearish_count = await _get_news_counts(
                     session, inst_id, lookback, anchor=cand.created_at
                 )
+
+            # Vol surface read is outside the session block — it opens its own session.
+            from src.fno.vol_surface import get_latest_surface
+            vol_surface = await get_latest_surface(inst_id, run_date)
 
             if instrument is None:
                 continue
@@ -646,13 +849,9 @@ async def run_phase3(
                 )
                 continue
 
-            # Pass real iv_rank through (may be None — build_user_prompt
-            # will render "unknown (no IV history)" + force iv_regime to
-            # 'unknown'). The previous `or 50.0` fallback masked missing
-            # data as a real "neutral" value, silently disabling the
-            # system prompt's REGIME GATE rule.
-            if iv_rank_real is not None:
-                iv_rank = iv_rank_real
+            # IV rank and regime — derived from typed snapshot
+            if iv_snap.iv_rank_52w is not None:
+                iv_rank = iv_snap.iv_rank_52w
                 iv_regime = (
                     "high" if iv_rank > 70
                     else ("low" if iv_rank < 30 else "neutral")
@@ -661,7 +860,7 @@ async def run_phase3(
                 iv_rank = None
                 iv_regime = "unknown"
 
-            # OI structure derived from real PCR (was hardcoded to "unknown")
+            # OI structure derived from real PCR
             oi_structure = classify_oi_structure(pcr)
 
             from src.collectors.macro_collector import get_macro_drivers
@@ -689,6 +888,18 @@ async def run_phase3(
                 if cand.fii_dii_score is not None else None
             )
 
+            vol_surface_block = (
+                vol_surface.as_prompt_block()
+                if vol_surface is not None
+                else "(surface unavailable — pre-market computation not yet run)"
+            )
+
+            market_regime_block = (
+                market_regime.as_prompt_block()
+                if market_regime is not None
+                else "(regime unavailable)"
+            )
+
             prompt = build_user_prompt(
                 symbol=instrument.symbol,
                 sector=instrument.sector,
@@ -710,13 +921,185 @@ async def run_phase3(
                 dii_net_cr=dii_net,
                 macro_drivers=macro_drivers,
                 headlines=headlines,
+                vrp=iv_snap.vrp,
+                vrp_regime=iv_snap.vrp_regime,
+                rv_20d=iv_snap.rv_20d,
+                vol_surface_block=vol_surface_block,
+                market_regime_block=market_regime_block,
                 market_movers_context=movers_block,
                 extra_context=extra_context,
             )
 
+            # -------------------------------------------------------------------
+            # Fast-track: deterministic PROCEED for extreme-conviction candidates
+            # in a confirmed trend with cheap VRP.
+            #
+            # Rationale: when |composite - 5.0| >= threshold AND regime is a
+            # confirmed directional trend AND VRP is cheap (realized vol > IV),
+            # debit spreads have a structural edge regardless of stock-specific
+            # narrative. Sending these to the LLM adds cost and latency while
+            # the outcome is nearly certain — the LLM was SKIPping them due to
+            # the THESIS DURABILITY rule misapplied to multi-session trends.
+            #
+            # Fast-track writes a synthetic PROCEED to fno_candidates and the
+            # audit log (model="fast_track_v1"), then `continue`s to skip the
+            # LLM call. The ML shadow still runs for data collection.
+            # -------------------------------------------------------------------
+            _fast_tracked = False
+            _composite_val = float(cand.composite_score or 5)
+            _deviation = abs(_composite_val - 5.0)
+            _ft_threshold = cfg.fno_phase3_fast_track_threshold
+
+            if (
+                _deviation >= _ft_threshold
+                and market_regime is not None
+                and market_regime.regime in ("trending_bear", "trending_bull")
+                and iv_snap.vrp_regime == "cheap"
+                and days_to_expiry >= 3
+            ):
+                _direction = "bearish" if _composite_val < 5 else "bullish"
+                _structure = "bear_put_spread" if _direction == "bearish" else "bull_call_spread"
+                _vrp_pts = (iv_snap.vrp or 0) * 100
+                _ft_confidence = round(min(0.85, 0.55 + (_deviation - _ft_threshold) * 0.15), 3)
+
+                _ft_parsed: dict[str, Any] = {
+                    "decision": "PROCEED",
+                    "direction": _direction,
+                    "thesis": (
+                        f"Fast-track PROCEED: extreme {_direction} conviction "
+                        f"(composite={_composite_val:.2f}, deviation={_deviation:.2f} from neutral). "
+                        f"Regime={market_regime.regime} confirmed over multiple sessions. "
+                        f"VRP={_vrp_pts:+.1f}vpts (cheap) gives debit buyer structural edge — "
+                        f"realized moves exceed premium paid. Structure: {_structure}."
+                    ),
+                    "risk_factors": [
+                        "trend_reversal_before_expiry",
+                        "theta_decay_if_trend_stalls",
+                    ],
+                    "confidence": _ft_confidence,
+                }
+
+                import json as _json
+                _ft_raw = _json.dumps(_ft_parsed)
+
+                async with session_scope() as session:
+                    await _write_audit_log(
+                        session, ref_id, "fast_track_v1", 0.0,
+                        f"[FAST-TRACK] {instrument.symbol} comp={_composite_val:.2f} "
+                        f"dev={_deviation:.2f} regime={market_regime.regime} "
+                        f"vrp={_vrp_pts:+.1f}vpts",
+                        _ft_raw, _ft_parsed,
+                        0, 0, 0,
+                    )
+                    await _upsert_phase3_candidate(
+                        session, inst_id, run_date,
+                        _ft_parsed["decision"], _ft_parsed["thesis"],
+                        True,
+                        iv_regime, oi_structure, f"{config_ver}_ft",
+                    )
+                    # Shadow row for the LLM-feature-generator data layer.
+                    # model_id is the synthetic 'fast_track_v1' so calibration
+                    # can stratify or exclude these — they bypass the LLM.
+                    await _write_llm_decision_log(
+                        session,
+                        run_date=run_date,
+                        as_of=as_of or datetime.now(tz=timezone.utc),
+                        dryrun_run_id=dryrun_run_id,
+                        instrument_id=inst_id,
+                        phase="fno_thesis",
+                        prompt_version=f"{FNO_THESIS_PROMPT_VERSION}_ft",
+                        model_id="fast_track_v1",
+                        decision_label=_ft_parsed["decision"],
+                        raw_response=_ft_parsed,
+                        raw_confidence=_ft_confidence,
+                    )
+
+                result = ThesisResult(
+                    instrument_id=inst_id,
+                    symbol=instrument.symbol,
+                    decision="PROCEED",
+                    direction=_direction,
+                    thesis=_ft_parsed["thesis"],
+                    risk_factors=_ft_parsed["risk_factors"],
+                    confidence=_ft_confidence,
+                    iv_regime=iv_regime,
+                    oi_structure=oi_structure,
+                )
+                results.append(result)
+                logger.info(
+                    f"fno.thesis: {instrument.symbol} FAST-TRACK -> PROCEED "
+                    f"({_structure}, conf={_ft_confidence:.2f}, "
+                    f"dev={_deviation:.2f}, vrp={_vrp_pts:+.1f}vpts)"
+                )
+                _fast_tracked = True
+
+            # ML shadow prediction — runs before the LLM call to avoid
+            # anchoring bias. The prediction is stored and later compared
+            # to the LLM decision for agreement tracking.
+            _ml_pred = _ml_conf = _ml_row_id = None
+            try:
+                from src.fno.ml_decision import extract_features, record_prediction
+                _ml_features = extract_features(
+                    candidate_id=str(cand.id),
+                    composite=float(cand.composite_score or 5),
+                    news=float(cand.news_score or 5),
+                    sentiment=float(cand.sentiment_score or 5),
+                    fii_dii=fii_dii_score,
+                    macro=float(cand.macro_align_score or 5),
+                    convergence=float(cand.convergence_score or 5),
+                    iv_rank=iv_snap.iv_rank_52w,
+                    vrp=iv_snap.vrp,
+                    vrp_regime=iv_snap.vrp_regime,
+                    skew_regime=vol_surface.skew_regime if vol_surface else None,
+                    term_regime=vol_surface.term_regime if vol_surface else None,
+                    pcr=vol_surface.pcr_near_expiry if vol_surface else None,
+                    vix=market_regime.vix_current if market_regime else None,
+                    market_regime=market_regime.regime if market_regime else None,
+                    days_to_expiry=days_to_expiry,
+                    atm_iv=iv_snap.atm_iv,
+                )
+                _ml_pred, _ml_conf, _ml_row_id = await record_prediction(
+                    str(cand.id), inst_id, run_date, _ml_features
+                )
+                logger.debug(
+                    f"fno.thesis: {instrument.symbol} ML={_ml_pred} ({_ml_conf:.2f}) "
+                    f"[shadow, LLM not yet called]"
+                )
+            except Exception as ml_exc:
+                logger.debug(f"fno.thesis: ML shadow failed: {ml_exc!r}")
+
+            if _fast_tracked:
+                # Even fast-track names get a v10 shadow score when the mode
+                # demands it — calibration needs to see the model's view on
+                # extreme-conviction setups as well as borderline ones.
+                if _settings.laabh_llm_mode in ("shadow", "feature"):
+                    asyncio.create_task(_log_v10_shadow(
+                        prompt=prompt,
+                        model=model,
+                        run_date=run_date,
+                        as_of=as_of,
+                        dryrun_run_id=dryrun_run_id,
+                        instrument_id=inst_id,
+                    ))
+                continue   # audit log + candidate already written above
+
             raw_response, tokens_in, tokens_out, latency_ms = _call_claude(
                 prompt, model, temperature
             )
+
+            # Fire-and-forget v10 shadow call. Runs in parallel with the v9
+            # write block below; bounded timeout (30s) and exception
+            # swallow inside the helper so a v10 failure cannot affect the
+            # v9 production path.
+            if _settings.laabh_llm_mode in ("shadow", "feature"):
+                asyncio.create_task(_log_v10_shadow(
+                    prompt=prompt,
+                    model=model,
+                    run_date=run_date,
+                    as_of=as_of,
+                    dryrun_run_id=dryrun_run_id,
+                    instrument_id=inst_id,
+                ))
 
             # Always persist the raw LLM call to the audit log first — even
             # if parsing fails we don't want to lose the forensic trail or
@@ -734,6 +1117,21 @@ async def run_phase3(
                     f"(raw response saved to llm_audit_log)"
                 )
 
+            # Update shadow prediction with actual LLM decision
+            if parsed is not None and _ml_pred is not None:
+                try:
+                    from src.fno.ml_decision import update_llm_outcome
+                    await update_llm_outcome(
+                        str(cand.id), parsed["decision"], parsed.get("confidence", 0.5)
+                    )
+                    agreed = _ml_pred == parsed["decision"]
+                    logger.debug(
+                        f"fno.thesis: {instrument.symbol} ML={_ml_pred} "
+                        f"LLM={parsed['decision']} agreed={agreed}"
+                    )
+                except Exception:
+                    pass
+
             async with session_scope() as session:
                 await _write_audit_log(
                     session, ref_id, model, temperature,
@@ -747,6 +1145,25 @@ async def run_phase3(
                         parsed["decision"] == "PROCEED",
                         iv_regime, oi_structure, config_ver,
                     )
+                # Shadow row for the LLM-feature-generator data layer.
+                # When the parse failed (parsed is None) we still record the
+                # raw text so calibration / audit can see the failure rate.
+                _raw_for_log: dict[str, Any] = (
+                    parsed if parsed is not None else {"raw_text": raw_response, "parse_error": parse_error}
+                )
+                await _write_llm_decision_log(
+                    session,
+                    run_date=run_date,
+                    as_of=as_of or datetime.now(tz=timezone.utc),
+                    dryrun_run_id=dryrun_run_id,
+                    instrument_id=inst_id,
+                    phase="fno_thesis",
+                    prompt_version=FNO_THESIS_PROMPT_VERSION,
+                    model_id=model,
+                    decision_label=(parsed["decision"] if parsed is not None else None),
+                    raw_response=_raw_for_log,
+                    raw_confidence=(parsed.get("confidence") if parsed is not None else None),
+                )
 
             if parsed is None:
                 # Skip the candidate but DON'T mark it failed in the outer

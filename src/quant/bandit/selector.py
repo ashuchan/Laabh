@@ -35,12 +35,14 @@ class ArmSelector:
         prior_mean: float = 0.0,
         prior_var: float = 0.01,
         seed: int | None = None,
+        context_dim: int | None = None,
     ) -> None:
         rng_seed = seed if seed is not None else np.random.SeedSequence().entropy
         self._rng = np.random.default_rng(rng_seed)
         self._algo = algo
         self._prior_mean = prior_mean
         self._prior_var = prior_var
+        self._context_dim = context_dim   # None = default 5 inside LinTS
         # Dormant pool: arm_id → saved posterior state from a previous eviction.
         # Arms re-admitted from here get warm priors instead of cold start.
         # Type is LinTSArmState when algo="lints", PosteriorState when algo="thompson".
@@ -50,11 +52,21 @@ class ArmSelector:
         self._dormant: dict[ArmId, Union[LinTSArmState, "PosteriorState"]] = {}
 
         if algo == "lints":
-            self._impl = LinTSSampler(arms, self._rng, prior_var=prior_var)
+            kwargs = {"prior_var": prior_var}
+            if context_dim is not None:
+                kwargs["context_dim"] = context_dim
+            self._impl = LinTSSampler(arms, self._rng, **kwargs)
         else:
             self._impl = ThompsonSampler(
                 arms, self._rng, prior_mean=prior_mean, prior_var=prior_var
             )
+
+    @property
+    def context_dim(self) -> int | None:
+        """Sampler context dimension when LinTS; ``None`` for Thompson."""
+        if self._algo == "lints" and hasattr(self._impl, "context_dim"):
+            return int(self._impl.context_dim)
+        return None
 
     def select(
         self,
@@ -63,6 +75,7 @@ class ArmSelector:
         context: np.ndarray | None = None,
         signal_strengths: dict[ArmId, float] | None = None,
         trace: dict | None = None,
+        contexts: dict[ArmId, np.ndarray] | None = None,
     ) -> ArmId | None:
         """Pick best arm from signalling candidates.
 
@@ -71,12 +84,13 @@ class ArmSelector:
         ``ThompsonSampler.select`` for the per-algo trace shape.
         """
         if self._algo == "lints":
-            ctx = context if context is not None else np.zeros(5)
+            ctx = context if context is not None else np.zeros(self._impl.context_dim)
             return self._impl.select(
                 signalling_arms,
                 context=ctx,
                 signal_strengths=signal_strengths,
                 trace=trace,
+                contexts=contexts,
             )
         # Phase-5 reverted: cross-primitive strength weighting in Thompson is
         # mathematically incoherent — different primitives compute strength
@@ -100,7 +114,7 @@ class ArmSelector:
         context: np.ndarray | None = None,
     ) -> None:
         if self._algo == "lints":
-            ctx = context if context is not None else np.zeros(5)
+            ctx = context if context is not None else np.zeros(self._impl.context_dim)
             self._impl.update(arm, reward, context=ctx)
         else:
             self._impl.update(arm, reward)
@@ -118,6 +132,16 @@ class ArmSelector:
         return self._impl.posterior_mean(arm)
 
     def posterior_var(self, arm: ArmId) -> float:
+        return self._impl.posterior_var(arm)
+
+    def posterior_var_for_context(self, arm: ArmId, context: np.ndarray) -> float:
+        """Prediction variance ``x^T A_inv x`` for LinTS; falls back to the
+        context-independent ``posterior_var`` for Thompson (which has no
+        context). Use this when ranking arms by exploration value under a
+        known per-arm context vector.
+        """
+        if self._algo == "lints" and hasattr(self._impl, "posterior_var_for_context"):
+            return float(self._impl.posterior_var_for_context(arm, context))
         return self._impl.posterior_var(arm)
 
     def n_obs(self, arm: ArmId) -> int:

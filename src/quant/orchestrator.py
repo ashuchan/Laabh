@@ -82,10 +82,15 @@ def _replay_bandit_updates(selector, closed_trades) -> None:
     (γ-decayed) and silently drops every reward observed so far today.
 
     Iterates trades sorted by entry_at and applies
-    selector.update(arm_id, (exit-entry)/entry) — the same per-lot return
-    ratio the live tick path uses, so n_obs and posterior_mean stay
-    consistent. Skips trades with missing exit_premium or zero entry to
-    keep the function total.
+    selector.update(arm_id, (exit-entry)/entry, context=trade.entry_context)
+    — the same per-lot return ratio + entry context the live tick path uses,
+    so n_obs and posterior_mean stay consistent. Skips trades with missing
+    exit_premium or zero entry to keep the function total.
+
+    Trades opened before the ``entry_context`` column existed get a None
+    context, which the LinTS update treats as a zero-vector — a legacy
+    no-op rather than a crash. The reward still increments n_obs but
+    won't shift the posterior; acceptable for a one-time backfill.
     """
     for trade in sorted(closed_trades, key=lambda t: t.entry_at):
         entry = trade.entry_premium_net
@@ -93,7 +98,9 @@ def _replay_bandit_updates(selector, closed_trades) -> None:
         if exit_ is None or not entry:
             continue
         reward = float(exit_ - entry) / float(entry)
-        selector.update(trade.arm_id, reward)
+        ctx_list = getattr(trade, "entry_context", None)
+        ctx_array = np.array(ctx_list, dtype=float) if ctx_list else None
+        selector.update(trade.arm_id, reward, context=ctx_array)
 
 
 def _seed_for_arm(portfolio_id: uuid.UUID, arm_id: str, day: date) -> int:
@@ -136,6 +143,8 @@ def _build_tick_context(
     """Build the 5-dim LinTS context vector for the current tick.
 
     Falls back gracefully when VIX or vol data is unavailable (e.g. warmup).
+    The shared base used by all arms; per-arm LLM augmentation happens in
+    :func:`_build_per_arm_contexts` when LAABH_LLM_MODE='feature'.
     """
     # Use VIX from any available bundle (all underlyings share the same VIX value)
     vix = 15.0
@@ -153,6 +162,54 @@ def _build_tick_context(
         nifty_5d_return=0.0,   # wired in when macro data is available
         realized_vol_30min_pctile=rv30_pctile,
     )
+
+
+async def _build_per_arm_contexts(
+    *,
+    base_context: np.ndarray,
+    active_arms: list[str],
+    arm_meta: dict[str, tuple[str, str]],
+    underlying_map: dict[str, "uuid.UUID"],
+    run_date: "date",
+) -> tuple[dict[str, np.ndarray], dict[str, int | None]]:
+    """Return (per_arm_contexts, per_arm_log_ids) under LAABH_LLM_MODE='feature'.
+
+    For each active arm, look up the latest calibrated LLM-feature row for
+    its underlying on ``run_date`` and append four LLM dims to the base
+    5-dim context. Arms whose underlying lacks an LLM row get a neutral
+    zero-tail (no LLM information ⇒ no LLM influence on that arm's score).
+
+    The second return value carries the source ``llm_decision_log.id`` per
+    arm so the orchestrator can write the bandit propensity back to that
+    specific row at decision time (IPS reweighting input).
+    """
+    from src.fno.llm_feature_lookup import get_latest_features
+
+    per_arm_ctx: dict[str, np.ndarray] = {}
+    per_arm_log: dict[str, int | None] = {}
+
+    for arm_id in active_arms:
+        symbol, _primitive = arm_meta.get(arm_id, (arm_id, ""))
+        underlying_id = underlying_map.get(symbol)
+        if underlying_id is None:
+            per_arm_ctx[arm_id] = np.concatenate([base_context, np.zeros(4)])
+            per_arm_log[arm_id] = None
+            continue
+        features = await get_latest_features(underlying_id, run_date)
+        # Direct concat — the base 5-dim vector is already normalised by
+        # build_context, and LLM features are already bounded by the
+        # calibration step. No round-trip through build_context_with_llm
+        # (review fix P3 #11).
+        llm_tail = np.array([
+            features.calibrated_conviction,
+            features.thesis_durability,
+            features.catalyst_specificity,
+            features.risk_flag,
+        ], dtype=float)
+        per_arm_ctx[arm_id] = np.concatenate([base_context, llm_tail])
+        per_arm_log[arm_id] = features.log_id if features.is_present else None
+
+    return per_arm_ctx, per_arm_log
 
 
 def _slice_bandit_trace(full: dict | None, arm_id: str) -> dict | None:
@@ -270,6 +327,12 @@ async def run_loop(
         f"[QUANT] Starting orchestrator loop for {today} "
         f"(portfolio={portfolio_id}, mode={ctx.mode})"
     )
+
+    # Schema guard: validate the live feature_store SQL probes before the loop
+    # begins. A column-name regression here used to silently kill every tick
+    # via the catch-all except; now it aborts startup with a clear error.
+    if ctx.mode == "live":
+        await feature_store.ensure_schema()
 
     # --- Bootstrap ---
     # Universe selection goes through the injected selector unconditionally.
@@ -488,10 +551,19 @@ async def run_loop(
 
         try:
           try:
-            # 1. Refresh features for each underlying
+            # 1. Refresh features for each underlying. Errors are isolated per
+            # symbol so one bad fetch (transient DB hiccup, missing chain row)
+            # doesn't tank every primitive on the tick.
             features_map = {}
             for u in universe:
-                bundle = await ctx.feature_getter(u["id"], current_time)
+                try:
+                    bundle = await ctx.feature_getter(u["id"], current_time)
+                except Exception as fetch_exc:
+                    logger.warning(
+                        f"[QUANT] feature fetch failed for {u['symbol']}: "
+                        f"{fetch_exc!r}"
+                    )
+                    continue
                 if bundle:
                     features_map[u["symbol"]] = bundle
                     sym_hist = history[u["symbol"]]
@@ -566,7 +638,9 @@ async def run_loop(
                         float(current_premium - pos.entry_premium_net) / float(pos.entry_premium_net)
                         if pos.entry_premium_net else 0.0
                     )
-                    selector.update(pos.arm_id, reward)
+                    # Replay the entry-time context so LinTS updates against
+                    # the same vector it sampled (review fix P0 #1).
+                    selector.update(pos.arm_id, reward, context=pos.entry_context)
                     if pnl > 0:
                         circuit.record_win(pos.arm_id)
                     else:
@@ -599,7 +673,19 @@ async def run_loop(
                 continue
 
             # 6. Capacity gate
-            if len(open_positions) >= settings.laabh_quant_max_concurrent_positions:
+            # Phase 3.4 (review fix P2 #8): when LAABH_LLM_MODE='feature',
+            # reserve 1 capacity slot for high-posterior-variance arms so
+            # exploration trades don't get crowded out by high-conviction
+            # trades. At max-1 occupancy we narrow the active arm set to
+            # the top-quartile-variance arms; at max we still gate.
+            max_concurrent = settings.laabh_quant_max_concurrent_positions
+            llm_feature_mode = settings.laabh_llm_mode == "feature"
+            reserve_slot_active = (
+                llm_feature_mode
+                and len(open_positions) == max_concurrent - 1
+                and max_concurrent >= 2
+            )
+            if len(open_positions) >= max_concurrent:
                 for _aid in strong_arm_set:
                     tick_disposition.setdefault(_aid, "capacity_full")
                 await _sleep_tick(settings, tick_start, replay_mode, ctx)
@@ -639,6 +725,52 @@ async def run_loop(
                 minutes_since_open=minutes_since_open,
                 day_running_pnl_pct=day_running_pnl_pct,
             )
+            # Phase 3 cutover: LAABH_LLM_MODE='feature' augments the context
+            # with calibrated LLM dims, one per arm. Build BEFORE the
+            # reserved-slot gate so the exploration-variance ranking uses
+            # the same vectors the selector will sample with.
+            per_arm_contexts: dict[str, "np.ndarray"] | None = None
+            per_arm_log_ids: dict[str, int | None] = {}
+            if settings.laabh_llm_mode == "feature":
+                per_arm_contexts, per_arm_log_ids = await _build_per_arm_contexts(
+                    base_context=context,
+                    active_arms=active_arms,
+                    arm_meta=arm_meta,
+                    underlying_map=underlying_map,
+                    run_date=today,
+                )
+
+            # Phase 3.4 exploration-slot reservation (review fix P2 #8):
+            # when the reserve is active, narrow active_arms to the top
+            # quartile by *contextual* posterior variance x^T A_inv x
+            # (review fix P3 #6 — uses the right quantity instead of the
+            # mean-of-diagonal proxy).
+            if reserve_slot_active and len(active_arms) >= 4:
+                if per_arm_contexts is not None:
+                    variances = [
+                        (a, selector.posterior_var_for_context(a, per_arm_contexts[a]))
+                        for a in active_arms
+                    ]
+                else:
+                    variances = [(a, selector.posterior_var(a)) for a in active_arms]
+                variances.sort(key=lambda t: t[1], reverse=True)
+                cutoff = max(1, len(variances) // 4)
+                high_var_set = {a for a, _ in variances[:cutoff]}
+                for a in active_arms:
+                    if a not in high_var_set:
+                        tick_disposition.setdefault(a, "reserved_slot_skipped")
+                active_arms = [a for a in active_arms if a in high_var_set]
+                # Narrow per_arm_contexts / log_ids to the surviving arms
+                # so the bandit and the propensity write stay consistent.
+                if per_arm_contexts is not None:
+                    per_arm_contexts = {a: per_arm_contexts[a] for a in active_arms}
+                    per_arm_log_ids = {a: per_arm_log_ids.get(a) for a in active_arms}
+                if not active_arms:
+                    await _sleep_tick(settings, tick_start, replay_mode, ctx)
+                    if replay_mode:
+                        current_time += poll_delta
+                    continue
+
             # Allocate the bandit-trace dict only when the recorder will use
             # it. The selector populates it with the full per-arm tournament
             # so the Decision Inspector can render the bandit card.
@@ -648,6 +780,7 @@ async def run_loop(
                 context=context,
                 signal_strengths=signal_strengths,
                 trace=bandit_trace_full,
+                contexts=per_arm_contexts,
             )
             if chosen_arm is None:
                 # Bandit declined to pick any arm this tick — every active arm
@@ -705,6 +838,13 @@ async def run_loop(
                 chosen_symbol, chosen_primitive = arm_meta.get(chosen_arm, (chosen_arm, ""))
                 chosen_underlying_id = underlying_map.get(chosen_symbol)
                 chosen_bundle = features_map.get(chosen_symbol)
+                # Pick the context the selector actually used for this arm
+                # so the post-close update sees the same vector (P0 #1).
+                chosen_context = (
+                    per_arm_contexts[chosen_arm]
+                    if per_arm_contexts is not None and chosen_arm in per_arm_contexts
+                    else context
+                )
                 pos = await _open_position(
                     arm_id=chosen_arm,
                     primitive_name=chosen_primitive,
@@ -718,9 +858,46 @@ async def run_loop(
                     kelly_fraction=settings.laabh_quant_kelly_fraction,
                     estimated_costs_per_lot=estimated_costs_per_lot,
                     ctx=ctx,
+                    entry_context=chosen_context,
                 )
                 if pos:
                     open_positions.append(pos)
+                    # Phase 3: stash bandit propensity on the linked
+                    # llm_decision_log row so IPS reweighting can use it.
+                    # Only fires when feature mode actually attached an
+                    # LLM-log id to this arm.
+                    if (
+                        settings.laabh_llm_mode == "feature"
+                        and per_arm_log_ids.get(chosen_arm) is not None
+                        and bandit_trace_full is not None
+                    ):
+                        try:
+                            from src.fno.llm_feature_lookup import write_bandit_propensity
+                            arms_block = bandit_trace_full.get("arms", {})
+                            chosen_block = arms_block.get(chosen_arm, {})
+                            others = [
+                                a["posterior_mean"] for k, a in arms_block.items()
+                                if k != chosen_arm and "posterior_mean" in a
+                            ]
+                            post_mean = float(chosen_block.get("posterior_mean", 0.0))
+                            post_var = float(chosen_block.get("posterior_var", 1e-6))
+                            tau = max(post_var ** 0.5, 1e-3)
+                            # Softmax-equivalent propensity from logged
+                            # posteriors (plan §2.2).
+                            import math as _math
+                            exps = [_math.exp(post_mean / tau)] + [
+                                _math.exp(om / tau) for om in others
+                            ]
+                            denom = sum(exps) or 1.0
+                            propensity = exps[0] / denom
+                            await write_bandit_propensity(
+                                per_arm_log_ids[chosen_arm],
+                                posterior_mean=post_mean,
+                                posterior_var=post_var,
+                                propensity=propensity,
+                            )
+                        except Exception as exc:
+                            logger.warning(f"[QUANT] propensity write failed: {exc!r}")
                 tick_disposition.setdefault(chosen_arm, "opened")
             else:
                 tick_disposition.setdefault(chosen_arm, "sized_zero")
@@ -897,6 +1074,7 @@ async def _open_position(
     kelly_fraction: float,
     estimated_costs_per_lot: Decimal,
     ctx: OrchestratorContext,
+    entry_context: np.ndarray | None = None,
 ) -> OpenPosition | None:
     """Record a new trade via the recorder and return an in-memory OpenPosition."""
     if underlying_id is None:
@@ -910,6 +1088,9 @@ async def _open_position(
     bandit_seed = _seed_for_arm(portfolio_id, arm_id, now.date())
     estimated_costs = estimated_costs_per_lot * Decimal(lots)
 
+    entry_context_list = (
+        entry_context.tolist() if entry_context is not None else None
+    )
     payload = OpenTradePayload(
         portfolio_id=portfolio_id,
         underlying_id=underlying_id,
@@ -926,6 +1107,7 @@ async def _open_position(
         kelly_fraction=kelly_fraction,
         lots=lots,
         legs={},
+        entry_context=entry_context_list,
     )
     trade_id = await ctx.recorder.open_trade(payload)
     if trade_id is None:
@@ -939,6 +1121,7 @@ async def _open_position(
         entry_at=now,
         lots=lots,
         trade_id=trade_id,
+        entry_context=entry_context,
     )
     pos.initial_risk_r = entry_premium * Decimal("0.2")
     logger.info(f"[QUANT] Opened {arm_id} × {lots} lots @ {entry_premium}")

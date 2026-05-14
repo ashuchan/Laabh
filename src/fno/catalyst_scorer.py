@@ -634,7 +634,11 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
                 regime_bias=regime_bias,
             )
 
-            passed = comp_s >= min_score
+            # Bidirectional gate: pass bullish conviction (>= min_score) OR
+            # bearish conviction (<= 10 - min_score). Both reach Phase 3 which
+            # handles directional theses in either direction.
+            deviation = min_score - 5.0  # e.g. 0.5 when min_score=5.5
+            passed = abs(comp_s - 5.0) >= deviation
             res = Phase2Result(
                 instrument_id=inst_id,
                 symbol=symbol,
@@ -663,9 +667,10 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
                         conv_s, comp_s,
                         config_ver,
                     )
-                logger.debug(f"fno.catalyst: {symbol} PASS composite={comp_s:.1f}")
+                direction = "BULLISH" if comp_s >= min_score else "BEARISH"
+                logger.debug(f"fno.catalyst: {symbol} PASS [{direction}] composite={comp_s:.1f}")
             else:
-                logger.debug(f"fno.catalyst: {symbol} FAIL composite={comp_s:.1f}<{min_score}")
+                logger.debug(f"fno.catalyst: {symbol} FAIL composite={comp_s:.1f} (neutral band)")
 
         except Exception as exc:
             logger.warning(f"fno.catalyst: {symbol} error: {exc}")

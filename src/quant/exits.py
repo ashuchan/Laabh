@@ -14,6 +14,10 @@ from __future__ import annotations
 
 import math
 import uuid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
 from decimal import Decimal
@@ -36,6 +40,10 @@ class OpenPosition:
     entry_at: datetime
     lots: int = 1
     trade_id: uuid.UUID | None = None   # DB row id, set by orchestrator after flush
+    # The exact LinTS context vector seen by the selector at open time. Read
+    # at close to pass to ``selector.update`` so the bandit learns against
+    # the same context it sampled from (review fix P0 #1).
+    entry_context: "np.ndarray | None" = None
     peak_premium: Decimal = field(init=False)
     initial_risk_r: Decimal = Decimal("0")   # set by orchestrator after open
 

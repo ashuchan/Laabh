@@ -18,12 +18,20 @@ def test_vwap_uniform_volume():
     assert _compute_vwap(ltps, vols) == pytest.approx(100.0, rel=1e-6)
 
 
-def test_vwap_zero_volume():
+def test_vwap_zero_volume_falls_back_to_arithmetic_mean():
+    # Live mode never has underlying spot volume in options_chain, so every
+    # vols vector arrives as zeros. Falling back to the *last* LTP would make
+    # VWAP ≡ LTP and the vwap_revert primitive could never fire. Use the
+    # arithmetic mean of the window instead so the primitive has a meaningful
+    # anchor.
     ltps = [100.0, 102.0]
     vols = [0.0, 0.0]
     result = _compute_vwap(ltps, vols)
-    # Falls back to last LTP
-    assert result == pytest.approx(102.0)
+    assert result == pytest.approx(101.0)
+
+
+def test_vwap_empty_returns_zero():
+    assert _compute_vwap([], []) == 0.0
 
 
 def test_realized_vol_flat():

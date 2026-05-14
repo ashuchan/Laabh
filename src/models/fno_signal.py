@@ -43,6 +43,12 @@ class FNOSignal(Base):
 
     iv_regime_at_entry: Mapped[str | None] = mapped_column(String(15))
     vix_at_entry: Mapped[float | None] = mapped_column(Numeric(8, 4))
+    # Best-available annualised realised vol at entry — outcome attribution
+    # divides by this to get outcome_z (plan §0.3). The writer prefers
+    # feature_store.rv_30min when intraday bars exist; falls back to
+    # iv_history.rv_20d otherwise. NULL on legacy rows opened before this
+    # column existed (attribution then re-derives at read time).
+    rv_annualised_at_entry: Mapped[float | None] = mapped_column(Numeric(8, 4))
 
     status: Mapped[str] = mapped_column(String(15), server_default="proposed")
     proposed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

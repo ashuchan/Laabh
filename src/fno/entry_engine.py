@@ -26,6 +26,7 @@ from sqlalchemy import select
 
 from src.db import session_scope
 from src.fno.calendar import next_weekly_expiry
+from src.fno.llm_gate import phase3_gate_filters as _phase3_gate_filters
 from src.fno.strategies.base import Leg, StrategyRecommendation
 from src.fno.strategies.bear_put_spread import BearPutSpreadStrategy
 from src.fno.strategies.bull_call_spread import BullCallSpreadStrategy
@@ -151,7 +152,7 @@ async def propose_entries(run_date: date | None = None) -> list[EntryProposal]:
             .where(
                 FNOCandidate.run_date == run_date,
                 FNOCandidate.phase == 3,
-                FNOCandidate.llm_decision == "PROCEED",
+                *_phase3_gate_filters(),
                 FNOCandidate.dryrun_run_id.is_(None),
             )
         )

@@ -146,6 +146,7 @@ class HybridUniverseSelector(UniverseSelector):
         """Return instruments with Phase-3 PROCEED decision for trading_date."""
         from src.models.fno_candidate import FNOCandidate
 
+        from src.fno.llm_gate import phase3_gate_filters
         async with session_scope() as session:
             q = (
                 select(FNOCandidate, Instrument)
@@ -153,7 +154,7 @@ class HybridUniverseSelector(UniverseSelector):
                 .where(
                     FNOCandidate.run_date == trading_date,
                     FNOCandidate.phase == 3,
-                    FNOCandidate.llm_decision == "PROCEED",
+                    *phase3_gate_filters(),
                 )
                 .order_by(desc(FNOCandidate.composite_score))
             )

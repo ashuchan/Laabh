@@ -49,6 +49,12 @@ class QuantTrade(Base):
     exit_reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
     status: Mapped[str] = mapped_column(String(15), server_default="open")
 
+    # Entry-time LinTS context vector (list of floats). Used by the update
+    # path so the bandit learns against the same context it sampled from at
+    # selection. NULL on rows opened before the column was added, in which
+    # case the update degrades to a zero-context no-op (legacy behaviour).
+    entry_context: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

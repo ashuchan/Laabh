@@ -28,7 +28,13 @@ import numpy as np
 
 ArmId: TypeAlias = str
 
+# Backwards-compat default dimension. The 4-dim LLM-features extension lifts
+# this to 9 at runtime when LAABH_LLM_MODE='feature' — passed in via
+# LinTSSampler's ``context_dim`` constructor arg. Code paths that still call
+# the unparameterised public helpers (e.g. tests, the deterministic backtest)
+# keep getting the 5-dim shape and behaviour unchanged.
 CONTEXT_DIM = 5
+CONTEXT_DIM_WITH_LLM = 9
 
 # Stable, ordered names for the 5-dim context vector. Surfaced via the
 # bandit trace so the Decision Inspector can label dimensions without
@@ -39,6 +45,15 @@ _CONTEXT_DIM_NAMES: tuple[str, ...] = (
     "day_pnl_norm",
     "nifty_5d_norm",
     "rv30_pctile",
+)
+
+# LLM-extended dim names (Phase 3 cutover). Append-only — order MUST match
+# the assembly in ``build_context_with_llm``.
+_CONTEXT_DIM_NAMES_LLM: tuple[str, ...] = _CONTEXT_DIM_NAMES + (
+    "llm_calibrated_conviction",
+    "llm_thesis_durability",
+    "llm_catalyst_specificity",
+    "llm_risk_flag",
 )
 
 
@@ -71,7 +86,13 @@ class LinTSArmState:
 
 
 class LinTSSampler:
-    """Contextual Linear Thompson Sampling — same API as ThompsonSampler."""
+    """Contextual Linear Thompson Sampling — same API as ThompsonSampler.
+
+    ``context_dim`` defaults to 5 (legacy shape). Pass 9 to extend with the
+    four LLM-feature dimensions; the sampler builds the cold-start state at
+    the requested dimension and exposes ``context_dim`` for callers to
+    validate persisted state on reload.
+    """
 
     def __init__(
         self,
@@ -79,13 +100,19 @@ class LinTSSampler:
         rng: np.random.Generator,
         *,
         prior_var: float = 0.01,
+        context_dim: int = CONTEXT_DIM,
     ) -> None:
         self._rng = rng
         self._prior_var = prior_var
+        self._context_dim = context_dim
         self._states: dict[ArmId, LinTSArmState] = {
-            arm: _cold_start(prior_var) for arm in arms
+            arm: _cold_start(prior_var, dim=context_dim) for arm in arms
         }
         self._obs_var = prior_var
+
+    @property
+    def context_dim(self) -> int:
+        return self._context_dim
 
     # ------------------------------------------------------------------
     # Core API (matches ThompsonSampler)
@@ -98,6 +125,7 @@ class LinTSSampler:
         context: np.ndarray,
         signal_strengths: dict[ArmId, float] | None = None,
         trace: dict | None = None,
+        contexts: dict[ArmId, np.ndarray] | None = None,
     ) -> ArmId | None:
         """Pick arm by max(θ̃^T x × |signal_strength|).
 
@@ -125,16 +153,21 @@ class LinTSSampler:
             if trace is not None:
                 trace["algo"] = "lints"
                 trace["context_vector"] = context.tolist()
-                trace["context_dims"] = list(_CONTEXT_DIM_NAMES)
+                trace["context_dims"] = list(self._dim_names())
                 trace["arms"] = {}
                 trace["selected"] = None
                 trace["n_competitors"] = 0
             return None
-        x = context  # shape (CONTEXT_DIM,)
+        # Phase 3 (LAABH_LLM_MODE='feature') passes per-arm contexts so each
+        # arm's prediction uses its own underlying's LLM features. When
+        # ``contexts`` is None we fall back to the shared ``context`` for
+        # all arms — backwards-compatible with every existing caller.
+        shared_x = context
         scores: dict[ArmId, float] = {}
         per_arm: dict[ArmId, dict] = {}
         for arm in candidates:
             state = self._states[arm]
+            x = contexts.get(arm, shared_x) if contexts is not None else shared_x
             theta_sample = self._rng.multivariate_normal(state.theta_hat, state.a_inv)
             pred = float(theta_sample @ x)
             strength = abs((signal_strengths or {}).get(arm, 1.0))
@@ -147,16 +180,25 @@ class LinTSSampler:
                     "sampled_mean": pred,
                     "signal_strength": float(strength),
                     "score": float(score),
+                    # When per-arm contexts differ from the shared one, surface
+                    # the arm's actual x so the Decision Inspector can show it.
+                    "context_vector": x.tolist() if contexts is not None else None,
                 }
         chosen = max(scores, key=scores.__getitem__)
         if trace is not None:
             trace["algo"] = "lints"
             trace["context_vector"] = context.tolist()
-            trace["context_dims"] = list(_CONTEXT_DIM_NAMES)
+            trace["context_dims"] = list(self._dim_names())
             trace["arms"] = per_arm
             trace["selected"] = chosen
             trace["n_competitors"] = len(candidates)
         return chosen
+
+    def _dim_names(self) -> tuple[str, ...]:
+        """Return the dim-name tuple matching this sampler's context dim."""
+        if self._context_dim == CONTEXT_DIM_WITH_LLM:
+            return _CONTEXT_DIM_NAMES_LLM
+        return _CONTEXT_DIM_NAMES
 
     def update(self, arm: ArmId, reward: float, *, context: np.ndarray) -> None:
         """Sherman-Morrison rank-1 update of A_inv (avoids full matrix invert)."""
@@ -193,7 +235,7 @@ class LinTSSampler:
 
     def add_arm(self, arm: ArmId) -> None:
         if arm not in self._states:
-            self._states[arm] = _cold_start(self._prior_var)
+            self._states[arm] = _cold_start(self._prior_var, dim=self._context_dim)
 
     def remove_arm(self, arm: ArmId) -> LinTSArmState | None:
         """Remove *arm* and return its state (for dormant pool). No-op if absent."""
@@ -214,6 +256,21 @@ class LinTSSampler:
         if arm not in self._states:
             return self._prior_var
         return float(np.diag(self._states[arm].a_inv).mean())
+
+    def posterior_var_for_context(self, arm: ArmId, context: np.ndarray) -> float:
+        """Prediction variance ``x^T A_inv x`` for ``arm`` under ``context``.
+
+        This is the *contextual* posterior variance — the right quantity to
+        rank arms by exploration value when the bandit has been updated
+        non-uniformly across context dimensions. ``posterior_var(arm)``
+        above is a context-independent proxy (mean of A_inv's diagonal);
+        use this when the caller already has the per-arm context.
+        """
+        state = self._states.get(arm)
+        if state is None:
+            return self._prior_var
+        x = context
+        return float(x @ state.a_inv @ x)
 
     def n_obs(self, arm: ArmId) -> int:
         """Return the count of observations folded into *arm*'s posterior."""
@@ -253,8 +310,44 @@ def build_context(
     ], dtype=float)
 
 
-def _cold_start(prior_var: float) -> LinTSArmState:
+def _cold_start(prior_var: float, *, dim: int = CONTEXT_DIM) -> LinTSArmState:
     return LinTSArmState(
-        a_inv=np.eye(CONTEXT_DIM) * prior_var,
-        b=np.zeros(CONTEXT_DIM),
+        a_inv=np.eye(dim) * prior_var,
+        b=np.zeros(dim),
     )
+
+
+def build_context_with_llm(
+    *,
+    vix_value: float,
+    time_of_day_pct: float,
+    day_running_pnl_pct: float,
+    nifty_5d_return: float,
+    realized_vol_30min_pctile: float,
+    llm_calibrated_conviction: float,
+    llm_thesis_durability: float,
+    llm_catalyst_specificity: float,
+    llm_risk_flag: float,
+) -> np.ndarray:
+    """9-dim context vector — Phase 3 LLM-feature extension.
+
+    First five components mirror :func:`build_context` exactly so the
+    deterministic features stay calibrated. LLM scores are appended in the
+    order declared by ``_CONTEXT_DIM_NAMES_LLM``; they are NOT normalised
+    further because the calibration step already produced bounded outputs
+    (-3..+3 for calibrated_conviction; [0,1] / [-1,0] for the rest).
+    """
+    base = build_context(
+        vix_value=vix_value,
+        time_of_day_pct=time_of_day_pct,
+        day_running_pnl_pct=day_running_pnl_pct,
+        nifty_5d_return=nifty_5d_return,
+        realized_vol_30min_pctile=realized_vol_30min_pctile,
+    )
+    llm_tail = np.array([
+        float(llm_calibrated_conviction),
+        float(llm_thesis_durability),
+        float(llm_catalyst_specificity),
+        float(llm_risk_flag),
+    ], dtype=float)
+    return np.concatenate([base, llm_tail])
