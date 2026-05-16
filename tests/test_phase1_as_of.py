@@ -10,6 +10,34 @@ import pytest
 from src.fno.universe import run_phase1
 
 
+def _fake_execute_result(rows: list | None = None) -> MagicMock:
+    """Build a session.execute() return value whose ``.all()`` returns
+    ``rows`` synchronously.
+
+    Required because ``run_phase1`` reads tier + rolling-OI history via
+    raw ``session.execute(...)`` calls (not through patched helpers).
+    With AsyncMock alone, the chained ``.all()`` returns a coroutine,
+    breaking the dict-comprehension at universe.py:303 with
+    "coroutine object is not iterable".
+    """
+    result = MagicMock()
+    result.all = MagicMock(return_value=rows or [])
+    return result
+
+
+def _make_session_mock() -> AsyncMock:
+    """Session mock whose execute() always returns an empty fake result.
+
+    The two unpatched session.execute(...) call sites in run_phase1
+    (tier lookup + rolling-OI history) both call ``.all()`` on the
+    awaited result. Returning an empty list keeps the downstream
+    dict-comprehensions valid without leaking test state.
+    """
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=_fake_execute_result([]))
+    return session
+
+
 @pytest.mark.asyncio
 async def test_run_phase1_as_of_derives_run_date():
     """run_phase1 with as_of but no run_date derives run_date from as_of.date()."""
@@ -20,7 +48,7 @@ async def test_run_phase1_as_of_derives_run_date():
         patch("src.fno.universe.get_banned_ids", new=AsyncMock(return_value=set())),
         patch("src.fno.universe._get_fno_instruments", new=AsyncMock(return_value=[])),
     ):
-        session_mock = AsyncMock()
+        session_mock = _make_session_mock()
         mock_scope.return_value.__aenter__ = AsyncMock(return_value=session_mock)
         mock_scope.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -37,7 +65,11 @@ async def test_run_phase1_as_of_passes_to_atm_chain_query():
     inst_id = uuid.uuid4()
     captured_as_of: list[datetime | None] = []
 
-    async def fake_atm_chain_row(session, instrument_id, as_of=None):
+    async def fake_atm_chain_row(session, instrument_id, *, as_of=None, expiry_date=None):
+        # `expiry_date` was added to _get_atm_chain_row when Phase 1
+        # started pinning OI measurements to the target expiry. The
+        # stub mirrors the real signature so changes to the production
+        # contract surface here as immediate test failures.
         captured_as_of.append(as_of)
         return (5000, 0.3)
 
@@ -52,7 +84,7 @@ async def test_run_phase1_as_of_passes_to_atm_chain_query():
         patch("src.fno.universe._get_avg_volume_5d", side_effect=fake_avg_vol),
         patch("src.fno.universe._upsert_candidate", new=AsyncMock()),
     ):
-        session_mock = AsyncMock()
+        session_mock = _make_session_mock()
         mock_scope.return_value.__aenter__ = AsyncMock(return_value=session_mock)
         mock_scope.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -68,7 +100,11 @@ async def test_run_phase1_live_uses_no_as_of_filter():
     inst_id = uuid.uuid4()
     captured_as_of: list[datetime | None] = []
 
-    async def fake_atm_chain_row(session, instrument_id, as_of=None):
+    async def fake_atm_chain_row(session, instrument_id, *, as_of=None, expiry_date=None):
+        # `expiry_date` was added to _get_atm_chain_row when Phase 1
+        # started pinning OI measurements to the target expiry. The
+        # stub mirrors the real signature so changes to the production
+        # contract surface here as immediate test failures.
         captured_as_of.append(as_of)
         return (5000, 0.3)
 
@@ -83,7 +119,7 @@ async def test_run_phase1_live_uses_no_as_of_filter():
         patch("src.fno.universe._get_avg_volume_5d", side_effect=fake_avg_vol),
         patch("src.fno.universe._upsert_candidate", new=AsyncMock()),
     ):
-        session_mock = AsyncMock()
+        session_mock = _make_session_mock()
         mock_scope.return_value.__aenter__ = AsyncMock(return_value=session_mock)
         mock_scope.return_value.__aexit__ = AsyncMock(return_value=False)
 

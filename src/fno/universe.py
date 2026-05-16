@@ -239,6 +239,8 @@ async def _upsert_candidate(
     atm_spread_pct: float | None,
     avg_volume_5d: int | None,
     config_version: str,
+    *,
+    instrument_tier: str | None = None,
 ) -> None:
     stmt = pg_insert(FNOCandidate).values(
         instrument_id=instrument_id,
@@ -249,6 +251,7 @@ async def _upsert_candidate(
         atm_spread_pct=Decimal(str(atm_spread_pct)) if atm_spread_pct is not None else None,
         avg_volume_5d=avg_volume_5d,
         config_version=config_version,
+        instrument_tier=instrument_tier,
         created_at=datetime.now(tz=timezone.utc),
     ).on_conflict_do_update(
         index_elements=["instrument_id", "run_date", "phase"],
@@ -258,6 +261,7 @@ async def _upsert_candidate(
             "atm_spread_pct": Decimal(str(atm_spread_pct)) if atm_spread_pct is not None else None,
             "avg_volume_5d": avg_volume_5d,
             "config_version": config_version,
+            "instrument_tier": instrument_tier,
         }
     )
     await session.execute(stmt)
@@ -382,10 +386,16 @@ async def run_phase1(
             results.append(res)
 
             if passed:
+                # Snapshot the tier label ("T1" / "T2") onto the row so
+                # downstream backfill replays carry the tier that was in
+                # effect on run_date. Indices live in tier_manager as tier=1
+                # so they surface as "T1".
+                tier_label = "T1" if tier == 1 else "T2"
                 async with session_scope() as session:
                     await _upsert_candidate(
                         session, inst_id, run_date, True,
                         atm_oi, spread, avg_vol, config_ver,
+                        instrument_tier=tier_label,
                     )
                 logger.debug(f"fno.universe: {symbol} PASS oi={atm_oi} spread={spread}")
             else:

@@ -41,16 +41,27 @@ async def _fetch_csv(url: str) -> str:
 
 
 def _parse_symbols(csv_text: str) -> list[str]:
-    """Extract symbol column from NSE ban-list CSV."""
+    """Extract symbol column from NSE ban-list CSV.
+
+    NSE 2026 format: ``1,KAYNES\\n2,SAIL`` — row index in col 0, symbol in col 1.
+    Legacy format had the symbol in col 0. Detect a numeric col 0 and fall
+    through to col 1; otherwise use col 0.
+    """
     symbols: list[str] = []
     reader = csv.reader(io.StringIO(csv_text))
     for row in reader:
         if not row:
             continue
-        # First column is the symbol; skip header rows
-        sym = row[0].strip().upper()
-        if sym and sym not in {"SECURITY", "SYMBOL", "SECURITIES", ""}:
-            symbols.append(sym)
+        first = row[0].strip()
+        if first.isdigit() and len(row) >= 2:
+            sym = row[1].strip().upper()
+        else:
+            sym = first.upper()
+        if not sym or sym in {"SECURITY", "SYMBOL", "SECURITIES"}:
+            continue
+        if "SECURITIES IN BAN" in sym:
+            continue
+        symbols.append(sym)
     return symbols
 
 

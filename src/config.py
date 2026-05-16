@@ -364,12 +364,22 @@ class Settings(BaseSettings):
 
     # --- LLM Feature Generator (docs/llm_feature_generator/implementation_plan.md) ---
     # gate:    legacy behaviour — v9 PROCEED/SKIP/HEDGE is the trade gate.
-    # shadow:  v9 still gates, but v10 is also called and logged (cost ~2×).
+    # shadow:  v9 still gates, v10 also drives nothing yet (kept as a sentinel
+    #          for monitoring scripts that special-case the shadow phase).
     # feature: v10 continuous features drive the bandit; v9 gate is removed.
-    # Default 'gate' preserves the current production path. The shadow / feature
-    # transitions are user-flipped per plan §3 — they are not data-gated.
+    # Mode controls BANDIT SEMANTICS only. v10 logging is now governed by
+    # laabh_llm_v10_logging_enabled below — see plan §0.4 (always log).
     laabh_llm_mode: Literal["gate", "shadow", "feature"] = Field(
         default="gate", alias="LAABH_LLM_MODE"
+    )
+    # When true, every Phase-3 v9 call also fires a parallel v10 LLM call
+    # whose continuous features are written to llm_decision_log. This is the
+    # only mechanism that produces calibration-ready data on live decisions,
+    # so it defaults to ON regardless of mode. Disable as a kill-switch if
+    # Anthropic cost or rate-limits become a problem — calibration will
+    # stop accumulating new rows but live trading is unaffected.
+    laabh_llm_v10_logging_enabled: bool = Field(
+        default=True, alias="LAABH_LLM_V10_LOGGING_ENABLED"
     )
 
     # --- Quant (bandit-orchestrated intraday F&O) ---
@@ -377,6 +387,15 @@ class Settings(BaseSettings):
     # Default "agentic" keeps existing behaviour unchanged.
     laabh_intraday_mode: Literal["agentic", "quant"] = Field(
         default="agentic", alias="LAABH_INTRADAY_MODE"
+    )
+    # One-shot mid-day resume for the quant intraday loop. Set to today's
+    # date (YYYY-MM-DD) to schedule a one-time DateTrigger run at boot+15s
+    # in addition to the regular 09:18 cron — recovery after a mid-session
+    # crash. The orchestrator's _load_open_positions + idempotent init_day
+    # make this safe. Guard fires only when the date matches today AND
+    # we're inside market hours on a mon-fri. Leave empty for normal runs.
+    laabh_quant_resume_date: str = Field(
+        default="", alias="LAABH_QUANT_RESUME_DATE"
     )
     laabh_quant_poll_interval_sec: int = Field(
         default=180, ge=1, le=3600, alias="LAABH_QUANT_POLL_INTERVAL_SEC"

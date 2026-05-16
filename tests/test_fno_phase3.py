@@ -184,51 +184,75 @@ async def test_get_underlying_ltp_filters_zero_chain_value() -> None:
     assert ltp == 987.65
 
 
-@pytest.mark.asyncio
-async def test_get_iv_rank_returns_real_values() -> None:
-    from src.fno.thesis_synthesizer import _get_iv_rank
+# NOTE: ``_get_iv_rank`` (tuple return) was retired in favour of
+# ``_get_iv_snapshot`` (dataclass return + rv_20d / vrp / vrp_regime
+# fields + automatic atm_iv % → decimal normalisation). The three
+# tests below were originally written against the old API; rewrites
+# below assert the same semantics against the new function.
 
-    row = MagicMock(iv_rank_52w=78.5, atm_iv=23.4)
+
+@pytest.mark.asyncio
+async def test_get_iv_snapshot_returns_real_values() -> None:
+    from src.fno.thesis_synthesizer import _get_iv_snapshot
+
+    # Row shape mirrors what IVHistory.select(...).first() returns.
+    # atm_iv=23.4 is a percent-form value (> 3.0), so the snapshot
+    # normalises it to 0.234 decimal.
+    row = MagicMock(
+        iv_rank_52w=78.5, atm_iv=23.4, rv_20d=0.22, vrp=0.01, vrp_regime="fair"
+    )
     session = _mock_session_with_results(_first_result(row))
-    rank, atm = await _get_iv_rank(session, "fake-id")
-    assert rank == 78.5
-    assert atm == 23.4
+    snap = await _get_iv_snapshot(session, "fake-id")
+    assert snap.iv_rank_52w == 78.5
+    assert snap.atm_iv == pytest.approx(0.234)
+    assert snap.rv_20d == 0.22
+    assert snap.vrp == 0.01
+    assert snap.vrp_regime == "fair"
 
 
 @pytest.mark.asyncio
-async def test_get_iv_rank_returns_none_on_no_history() -> None:
-    """Instruments without iv_history rows must return (None, None) so the
-    caller can fall back to a neutral default."""
-    from src.fno.thesis_synthesizer import _get_iv_rank
+async def test_get_iv_snapshot_returns_nones_on_no_history() -> None:
+    """Instruments without iv_history rows must return a snapshot of all
+    Nones so the caller can fall back to neutral defaults."""
+    from src.fno.thesis_synthesizer import _get_iv_snapshot
 
     session = _mock_session_with_results(_first_result(None))
-    rank, atm = await _get_iv_rank(session, "fake-id")
-    assert rank is None
-    assert atm is None
+    snap = await _get_iv_snapshot(session, "fake-id")
+    assert snap.iv_rank_52w is None
+    assert snap.atm_iv is None
+    assert snap.rv_20d is None
+    assert snap.vrp is None
+    assert snap.vrp_regime is None
 
 
 @pytest.mark.asyncio
-async def test_get_iv_rank_clamps_out_of_range_to_none() -> None:
+async def test_get_iv_snapshot_clamps_out_of_range_rank_to_none() -> None:
     """Historical iv_history rows written before the clamp fix can have
     nonsense values like -587 or +8100 (chain iv unit mismatch). Those
     should be discarded so the LLM sees a neutral default, not garbage."""
-    from src.fno.thesis_synthesizer import _get_iv_rank
+    from src.fno.thesis_synthesizer import _get_iv_snapshot
 
-    # -587 is outside [0, 100] → treat as missing
+    # -587 is outside [0, 100] → treat rank as missing
     session = _mock_session_with_results(
-        _first_result(MagicMock(iv_rank_52w=-587.2, atm_iv=33.4))
+        _first_result(MagicMock(
+            iv_rank_52w=-587.2, atm_iv=33.4,
+            rv_20d=None, vrp=None, vrp_regime=None,
+        ))
     )
-    rank, atm = await _get_iv_rank(session, "fake-id")
-    assert rank is None
-    # atm_iv still surfaces — caller may want to log it for diagnostics
-    assert atm == 33.4
+    snap = await _get_iv_snapshot(session, "fake-id")
+    assert snap.iv_rank_52w is None
+    # atm_iv still surfaces (% → decimal normalisation kicks in)
+    assert snap.atm_iv == pytest.approx(0.334)
 
     # 8100 is outside [0, 100] → treat as missing
     session = _mock_session_with_results(
-        _first_result(MagicMock(iv_rank_52w=8100.0, atm_iv=42.0))
+        _first_result(MagicMock(
+            iv_rank_52w=8100.0, atm_iv=42.0,
+            rv_20d=None, vrp=None, vrp_regime=None,
+        ))
     )
-    rank, atm = await _get_iv_rank(session, "fake-id")
-    assert rank is None
+    snap = await _get_iv_snapshot(session, "fake-id")
+    assert snap.iv_rank_52w is None
 
 
 def test_compute_iv_rank_clamps_negative() -> None:

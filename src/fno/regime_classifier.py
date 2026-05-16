@@ -40,6 +40,7 @@ Research basis:
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -377,17 +378,42 @@ async def _upsert_regime(session, result: RegimeResult) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def compute_regime(run_date: date | None = None) -> RegimeResult:
-    """Classify today's market regime and persist to market_regime_snapshot.
+async def compute_regime(
+    run_date: date | None = None,
+    *,
+    as_of: datetime | None = None,
+    dryrun_run_id: uuid.UUID | None = None,
+) -> RegimeResult:
+    """Classify the market regime for ``run_date`` and persist to
+    ``market_regime_snapshot``.
 
-    Returns RegimeResult regardless of DB errors (always returns a usable regime).
+    ``as_of`` and ``dryrun_run_id`` follow the CLAUDE.md pipeline convention.
+    When ``as_of`` is supplied (historical replay), every time-series read is
+    bounded to that timestamp so the result reflects what was knowable on
+    that morning — not today's latest values. When ``as_of`` is None we
+    fall back to ``run_date`` (which itself falls back to today).
+
+    ``dryrun_run_id`` is accepted for signature symmetry with the rest of
+    the pipeline; the regime classifier writes one row per run_date and
+    has no replay-scoped split, so the value is currently unused. Stamping
+    it here lets a future change start scoping the snapshot per dry-run
+    without touching the call sites.
+
+    Returns RegimeResult regardless of DB errors (always returns a usable
+    regime).
     """
+    _ = dryrun_run_id  # reserved — see docstring
     if run_date is None:
-        run_date = date.today()
+        run_date = (as_of.date() if as_of is not None else date.today())
 
     # For historical replay: bound all time-series reads to run_date so we
     # read data as it was known on that day, not today's latest values.
-    hist_cutoff = run_date if run_date != date.today() else None
+    # ``as_of`` takes precedence when supplied; otherwise fall back to the
+    # date-only heuristic so existing live behaviour is unchanged.
+    if as_of is not None:
+        hist_cutoff = run_date
+    else:
+        hist_cutoff = run_date if run_date != date.today() else None
 
     async with session_scope() as session:
         vix_current, vix_prev = await _get_latest_vix(session, before_date=hist_cutoff)

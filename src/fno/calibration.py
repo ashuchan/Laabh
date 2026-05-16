@@ -92,7 +92,13 @@ _FEATURE_TO_COLUMN: dict[str, str] = {
 
 @dataclass
 class CalibrationModel:
-    """In-memory representation of a fitted calibration curve."""
+    """In-memory representation of a fitted calibration curve.
+
+    ``holdout_ece`` / ``holdout_residual_var`` are populated by
+    :func:`fit_calibration` when a holdout window is supplied; otherwise
+    ``None``. The bootstrap-calibration backfill uses these to gate
+    promotion on out-of-sample performance (plan §4 Phase D).
+    """
 
     method: str                          # 'platt' | 'isotonic'
     params: dict                         # platt: {a, b}; isotonic: {x_knots, y_knots}
@@ -103,6 +109,8 @@ class CalibrationModel:
     prompt_version: str
     phase: str
     instrument_tier: str
+    holdout_ece: float | None = None
+    holdout_residual_var: float | None = None
     fitted_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
 
@@ -130,6 +138,10 @@ async def fit_calibration(
     *,
     as_of: datetime | None = None,
     dryrun_run_id: uuid.UUID | None = None,
+    lookback_days: int = 90,
+    exclude_dates_after: date | None = None,
+    holdout_start: date | None = None,
+    holdout_end: date | None = None,
 ) -> CalibrationModel | None:
     """Fit one calibration curve. Returns None when sample size is short.
 
@@ -141,6 +153,18 @@ async def fit_calibration(
     ``apps/static/calibration/<feature>_<prompt>_<phase>_<tier>_<ts>.png``
     when a fit completes (review fix P3 #10, plan §2.4). Failures to
     write are non-fatal — the fit returns normally.
+
+    Backfill / bootstrap parameters (plan §4 Phase D):
+      * ``lookback_days`` — window of rows to consider. Default 90 matches
+        the live weekly fit; backfill passes 180.
+      * ``exclude_dates_after`` — fit rows must have ``run_date <``
+        this date. Used to carve out the holdout window from the fit set.
+      * ``holdout_start`` / ``holdout_end`` — inclusive holdout date range.
+        When both are supplied, the function additionally loads holdout
+        rows and computes ``holdout_ece`` + ``holdout_residual_var`` using
+        the freshly-fitted model. The holdout fit is the true
+        out-of-sample metric; ``cv_ece`` is walk-forward within the fit
+        set (within-sample relative to the holdout).
     """
     rows = await _load_calibration_rows(
         feature_name=feature_name,
@@ -149,6 +173,8 @@ async def fit_calibration(
         instrument_tier=instrument_tier,
         as_of=as_of,
         dryrun_run_id=dryrun_run_id,
+        lookback_days=lookback_days,
+        exclude_dates_after=exclude_dates_after,
     )
     if len(rows) < _MIN_N_FOR_FIT:
         logger.info(
@@ -167,6 +193,39 @@ async def fit_calibration(
     method = "platt" if len(rows) < _ISOTONIC_THRESHOLD else "isotonic"
     fit_full = _fit_one(method, x, y, w)
     cv_ece, cv_resid = _walk_forward_metrics(rows, method=method)
+
+    # Holdout scoring (plan §4 Phase D step 4). Load the rows whose
+    # run_date falls in [holdout_start, holdout_end] and score them
+    # against the fit fit_full produced from the (earlier) fit set.
+    holdout_ece: float | None = None
+    holdout_rv: float | None = None
+    if holdout_start is not None and holdout_end is not None:
+        holdout_rows = await _load_calibration_rows(
+            feature_name=feature_name,
+            prompt_version=prompt_version,
+            phase=phase,
+            instrument_tier=instrument_tier,
+            as_of=None,                        # ignore as_of so we can read the tail
+            dryrun_run_id=dryrun_run_id,
+            lookback_days=None,                # explicit date range below
+            run_date_min=holdout_start,
+            run_date_max=holdout_end,
+        )
+        if holdout_rows:
+            holdout_ece = _ece(holdout_rows, method=method, params=fit_full)
+            holdout_rv = _residual_var(holdout_rows, method=method, params=fit_full)
+            logger.info(
+                f"calibration: holdout scored — N={len(holdout_rows)} "
+                f"ECE={holdout_ece:.4f} RV={holdout_rv:.4f} "
+                f"(fit ECE={cv_ece}, RV={cv_resid})"
+            )
+        else:
+            logger.warning(
+                f"calibration: holdout window {holdout_start}..{holdout_end} "
+                f"contained 0 rows for {feature_name}/{instrument_tier} — "
+                "skipping holdout metrics"
+            )
+
     model = CalibrationModel(
         method=method,
         params=fit_full,
@@ -177,6 +236,8 @@ async def fit_calibration(
         prompt_version=prompt_version,
         phase=phase,
         instrument_tier=instrument_tier,
+        holdout_ece=holdout_ece,
+        holdout_residual_var=holdout_rv,
     )
     _emit_reliability_png(rows, model=model)
     return model
@@ -191,9 +252,16 @@ async def promote_if_better(
     """Persist ``candidate`` and activate it only if metrics beat the
     currently-active model on the same key.
 
-    Promotion criteria (plan §2.4):
+    Promotion criteria (plan §2.4 + backfill plan §4 Phase D):
       - ECE improves by ≥ 5% (relative).
       - Residual variance does not worsen by more than 5% (relative).
+
+    Metric preference: when ``holdout_ece`` is populated on BOTH the
+    candidate and the current active model, we compare holdout metrics
+    (true out-of-sample). Otherwise fall back to ``cv_ece`` /
+    ``cv_residual_var``. This keeps the live weekly-fit promotion logic
+    unchanged (it never computes holdout) while letting the backfill
+    bootstrap (which always computes holdout) gate on the harder bar.
     """
     persisted_id = await _persist_model(candidate)
 
@@ -208,14 +276,34 @@ async def promote_if_better(
         logger.info(
             f"calibration: ACTIVATED first model — {candidate.feature_name}/"
             f"{candidate.prompt_version}/{candidate.phase}/{candidate.instrument_tier} "
-            f"(ECE={candidate.cv_ece}, RV={candidate.cv_residual_var})"
+            f"(ECE={candidate.cv_ece}, RV={candidate.cv_residual_var}, "
+            f"holdout_ECE={candidate.holdout_ece})"
         )
         return True
 
-    ece_now = candidate.cv_ece if candidate.cv_ece is not None else float("inf")
-    ece_prev = current.cv_ece if current.cv_ece is not None else float("inf")
-    rv_now = candidate.cv_residual_var if candidate.cv_residual_var is not None else float("inf")
-    rv_prev = current.cv_residual_var if current.cv_residual_var is not None else float("inf")
+    use_holdout = (
+        candidate.holdout_ece is not None and current.holdout_ece is not None
+    )
+    if use_holdout:
+        ece_now = candidate.holdout_ece
+        ece_prev = current.holdout_ece
+        rv_now = (
+            candidate.holdout_residual_var
+            if candidate.holdout_residual_var is not None
+            else float("inf")
+        )
+        rv_prev = (
+            current.holdout_residual_var
+            if current.holdout_residual_var is not None
+            else float("inf")
+        )
+        metric_label = "holdout"
+    else:
+        ece_now = candidate.cv_ece if candidate.cv_ece is not None else float("inf")
+        ece_prev = current.cv_ece if current.cv_ece is not None else float("inf")
+        rv_now = candidate.cv_residual_var if candidate.cv_residual_var is not None else float("inf")
+        rv_prev = current.cv_residual_var if current.cv_residual_var is not None else float("inf")
+        metric_label = "cv"
 
     ece_relative_drop = (ece_prev - ece_now) / max(ece_prev, 1e-9)
     rv_relative_rise = (rv_now - rv_prev) / max(rv_prev, 1e-9)
@@ -223,13 +311,15 @@ async def promote_if_better(
     if ece_relative_drop >= _ECE_IMPROVE_MIN and rv_relative_rise <= _RESID_VAR_WORSEN_MAX:
         await _set_active(persisted_id, candidate)
         logger.info(
-            f"calibration: PROMOTED — ECE {ece_prev:.4f}→{ece_now:.4f} "
+            f"calibration: PROMOTED ({metric_label}) — "
+            f"ECE {ece_prev:.4f}→{ece_now:.4f} "
             f"(rel drop {ece_relative_drop:.1%}), RV {rv_prev:.4f}→{rv_now:.4f}"
         )
         return True
 
     logger.info(
-        f"calibration: kept current — new ECE drop {ece_relative_drop:.1%} "
+        f"calibration: kept current ({metric_label}) — "
+        f"new ECE drop {ece_relative_drop:.1%} "
         f"< {_ECE_IMPROVE_MIN:.0%} or RV rose {rv_relative_rise:.1%} "
         f"> {_RESID_VAR_WORSEN_MAX:.0%}"
     )
@@ -240,31 +330,64 @@ async def run_weekly_calibration(
     *,
     as_of: datetime | None = None,
     dryrun_run_id: uuid.UUID | None = None,
+    lookback_days: int = 90,
+    exclude_dates_after: date | None = None,
+    holdout_start: date | None = None,
+    holdout_end: date | None = None,
+    promote: bool = True,
+    prompt_version: str = "v10_continuous",
+    phase: str = "fno_thesis",
+    features: tuple[str, ...] = ("directional_conviction", "raw_confidence"),
+    tiers: tuple[str, ...] = ("pooled", "T1", "T2"),
 ) -> dict[str, int]:
     """Top-level entry — fit + maybe-promote every (feature, tier) pair.
 
-    Scoped today to (v10_continuous, fno_thesis). Adds rows for tier
-    'pooled' first so a per-tier failure does not block the safe-default
-    pooled model.
+    Live weekly job invocation (no kwargs): scoped to
+    (v10_continuous, fno_thesis) over a 90-day rolling window, promote on.
+
+    Bootstrap-calibration invocation (backfill plan §4 Phase D): pass
+    ``lookback_days=180``, ``exclude_dates_after=holdout_start``,
+    ``holdout_start``/``holdout_end`` so the fit excludes the held-out
+    tail and the resulting model carries true out-of-sample metrics.
+    Pass ``promote=False`` to print fit metrics without activating
+    anything (bootstrap is research, not production — plan §4 Phase E).
+
+    Returns ``{'promoted': N, 'skipped': M}`` — the same shape the
+    scheduler has been logging for months. Bootstrap callers that want
+    the fitted models themselves should call ``fit_calibration`` directly
+    in a loop (see ``scripts/promote_bootstrap_calibration.py``) instead
+    of inflating this entry point's return type.
     """
     promoted = skipped = 0
-    for feature_name in ("directional_conviction", "raw_confidence"):
-        for tier in ("pooled", "T1", "T2"):
+    for feature_name in features:
+        for tier in tiers:
             try:
                 model = await fit_calibration(
                     feature_name=feature_name,
-                    prompt_version="v10_continuous",
-                    phase="fno_thesis",
+                    prompt_version=prompt_version,
+                    phase=phase,
                     instrument_tier=tier,
                     as_of=as_of,
                     dryrun_run_id=dryrun_run_id,
+                    lookback_days=lookback_days,
+                    exclude_dates_after=exclude_dates_after,
+                    holdout_start=holdout_start,
+                    holdout_end=holdout_end,
                 )
                 if model is None:
                     skipped += 1
                     continue
-                if await promote_if_better(model, as_of=as_of, dryrun_run_id=dryrun_run_id):
-                    promoted += 1
+                if promote:
+                    if await promote_if_better(
+                        model, as_of=as_of, dryrun_run_id=dryrun_run_id
+                    ):
+                        promoted += 1
+                    else:
+                        skipped += 1
                 else:
+                    # Bootstrap mode: persist but don't activate (so the
+                    # row is available to the dashboard / promotion script).
+                    await _persist_model(model)
                     skipped += 1
             except Exception as exc:
                 logger.warning(
@@ -272,6 +395,57 @@ async def run_weekly_calibration(
                 )
                 skipped += 1
     return {"promoted": promoted, "skipped": skipped}
+
+
+# Outcome-class taxonomy. Single source of truth for both the calibration
+# weight composition AND the SQL filter — adding a new variant means
+# adding it here ONCE, no inline-list maintenance.
+_COUNTERFACTUAL_OUTCOME_CLASSES = frozenset({
+    "counterfactual",
+    "counterfactual_eod",
+    "counterfactual_intraday",
+})
+_TRADED_OUTCOME_CLASS = "traded"
+
+# Quote-and-comma-join the known outcome-class values for direct SQL
+# interpolation. Safe-by-construction: values come from frozensets of
+# compile-time constants, not from user input. ``sorted()`` keeps the
+# rendered list stable for log/debug diffability.
+_OUTCOME_CLASS_SQL_LIST = ", ".join(
+    f"'{c}'" for c in sorted({_TRADED_OUTCOME_CLASS} | _COUNTERFACTUAL_OUTCOME_CLASSES)
+)
+
+
+def _compose_calibration_weight(
+    *,
+    propensity: float | None,
+    outcome_class: str | None,
+    propensity_source: str | None,
+) -> float:
+    """Compute the IPS weight for one calibration row.
+
+    Pure function — no DB. Extracted out of ``_load_calibration_rows`` so
+    the stacking semantics can be unit-tested without spinning a DB.
+
+    Composition:
+      1. Base weight = 1/propensity, clipped to ``_IPS_WEIGHT_CLIP``.
+         Missing propensity → treated as 1.0 (weight clipped to upper
+         bound).
+      2. If ``outcome_class`` is any counterfactual variant, multiply by
+         ``_COUNTERFACTUAL_WEIGHT_MULT`` (the outcome is inferred).
+      3. If ``propensity_source == 'imputed'``, multiply by
+         ``_COUNTERFACTUAL_WEIGHT_MULT`` again (the propensity is
+         heuristic). Stacks with (2) — see _load_calibration_rows
+         docstring for the rationale.
+    """
+    prop = float(propensity) if propensity is not None else 1.0
+    w = 1.0 / max(prop, 1e-9)
+    w = max(_IPS_WEIGHT_CLIP[0], min(_IPS_WEIGHT_CLIP[1], w))
+    if outcome_class in _COUNTERFACTUAL_OUTCOME_CLASSES:
+        w *= _COUNTERFACTUAL_WEIGHT_MULT
+    if propensity_source == "imputed":
+        w *= _COUNTERFACTUAL_WEIGHT_MULT
+    return w
 
 
 # ---------------------------------------------------------------------------
@@ -287,19 +461,80 @@ async def _load_calibration_rows(
     instrument_tier: str,
     as_of: datetime | None,
     dryrun_run_id: uuid.UUID | None,
+    lookback_days: int | None = 90,
+    exclude_dates_after: date | None = None,
+    run_date_min: date | None = None,
+    run_date_max: date | None = None,
 ) -> list[dict]:
-    """Pull (raw, outcome_z, ips_weight, run_date) tuples for the key."""
+    """Pull (raw, outcome_z, ips_weight, run_date) tuples for the key.
+
+    Window selection rules:
+      * If ``run_date_min`` / ``run_date_max`` are passed, they override
+        everything else — used to load the holdout slab in
+        :func:`fit_calibration`.
+      * Otherwise the window is ``[as_of - lookback_days, as_of]`` with
+        ``exclude_dates_after`` carving out the holdout tail.
+
+    Tier filter:
+      * ``instrument_tier='pooled'`` returns every row (no tier predicate).
+      * Any other value (``'T1'``, ``'T2'``, ``'index'``) returns only
+        rows whose ``llm_decision_log.instrument_tier`` matches exactly.
+        Legacy rows with NULL tier are excluded from per-tier fits — this
+        is intentional, since calibrating per-tier on untyped data would
+        leak T2 noise into a T1 model.
+
+    IPS weight construction:
+      * Base weight = 1 / propensity, clipped to ``_IPS_WEIGHT_CLIP``.
+      * Counterfactual rows take an additional ``_COUNTERFACTUAL_WEIGHT_MULT``
+        multiplier (legacy hygiene).
+      * Backfill rows with ``propensity_source='imputed'`` take the same
+        0.3× multiplier (plan §3.2): the propensity is a heuristic, not
+        a real bandit decision, so we discount it the same way as a
+        counterfactual outcome.
+    """
     column = _FEATURE_TO_COLUMN.get(feature_name)
     if column is None:
         raise ValueError(f"unknown feature_name: {feature_name}")
 
-    # Window: 90-day rolling (plan §0.1 retention comment). 'pooled' tier
-    # ignores any tier predicate; per-tier needs a tier lookup we don't yet
-    # persist on llm_decision_log, so pooled is the only working option in
-    # Phase 0 — T1 / T2 will return zero rows until tier hydration lands.
-    # When that lands, this WHERE will gain a tier predicate.
-    upper_bound = as_of or datetime.now(tz=timezone.utc)
-    lower_bound = upper_bound - timedelta(days=90)
+    # Compose the WHERE clause dynamically so the three call modes
+    # (live weekly, backfill fit, backfill holdout) share one SQL body.
+    where_parts: list[str] = [
+        "l.prompt_version = :pv",
+        "l.phase          = :ph",
+        f"l.{column}       IS NOT NULL",
+        "l.outcome_z      IS NOT NULL",
+        # Outcome-class IN list comes from the module-level frozensets so
+        # adding a Stage-3 variant later only requires touching one place
+        # (see _COUNTERFACTUAL_OUTCOME_CLASSES at the top of the module).
+        f"l.outcome_class  IN ({_OUTCOME_CLASS_SQL_LIST})",
+        "((:dryrun_run_id IS NULL  AND l.dryrun_run_id IS NULL) "
+        " OR l.dryrun_run_id = :dryrun_run_id)",
+    ]
+    params: dict = {
+        "pv": prompt_version,
+        "ph": phase,
+        "dryrun_run_id": str(dryrun_run_id) if dryrun_run_id else None,
+    }
+
+    if run_date_min is not None and run_date_max is not None:
+        where_parts.append("l.run_date >= :rmin AND l.run_date <= :rmax")
+        params["rmin"] = run_date_min
+        params["rmax"] = run_date_max
+    else:
+        upper_bound = as_of or datetime.now(tz=timezone.utc)
+        if lookback_days is not None:
+            lower_bound = upper_bound - timedelta(days=lookback_days)
+            where_parts.append("l.as_of >= :lo")
+            params["lo"] = lower_bound
+        where_parts.append("l.as_of <= :hi")
+        params["hi"] = upper_bound
+        if exclude_dates_after is not None:
+            where_parts.append("l.run_date < :exclude_after")
+            params["exclude_after"] = exclude_dates_after
+
+    if instrument_tier != "pooled":
+        where_parts.append("l.instrument_tier = :tier")
+        params["tier"] = instrument_tier
 
     sql = text(f"""
         SELECT
@@ -307,35 +542,22 @@ async def _load_calibration_rows(
             l.outcome_z                   AS outcome_z,
             l.outcome_class               AS outcome_class,
             l.bandit_arm_propensity       AS propensity,
+            l.propensity_source           AS propensity_source,
             l.run_date                    AS run_date
         FROM llm_decision_log l
-        WHERE l.prompt_version = :pv
-          AND l.phase          = :ph
-          AND l.{column}       IS NOT NULL
-          AND l.outcome_z      IS NOT NULL
-          AND l.outcome_class  IN ('traded', 'counterfactual')
-          AND l.as_of >= :lo
-          AND l.as_of <= :hi
-          AND ((:dryrun_run_id IS NULL  AND l.dryrun_run_id IS NULL)
-            OR  l.dryrun_run_id = :dryrun_run_id)
+        WHERE {' AND '.join(where_parts)}
     """)
     async with session_scope() as session:
-        result = await session.execute(sql, {
-            "pv": prompt_version,
-            "ph": phase,
-            "lo": lower_bound,
-            "hi": upper_bound,
-            "dryrun_run_id": str(dryrun_run_id) if dryrun_run_id else None,
-        })
+        result = await session.execute(sql, params)
         raw_rows = result.mappings().all()
 
     out: list[dict] = []
     for r in raw_rows:
-        prop = float(r["propensity"]) if r["propensity"] is not None else 1.0
-        w = 1.0 / max(prop, 1e-9)
-        w = max(_IPS_WEIGHT_CLIP[0], min(_IPS_WEIGHT_CLIP[1], w))
-        if r["outcome_class"] == "counterfactual":
-            w *= _COUNTERFACTUAL_WEIGHT_MULT
+        w = _compose_calibration_weight(
+            propensity=r["propensity"],
+            outcome_class=r["outcome_class"],
+            propensity_source=r["propensity_source"],
+        )
         out.append({
             "raw": float(r["raw"]),
             "outcome_z": float(r["outcome_z"]),
@@ -550,6 +772,8 @@ async def _persist_model(m: CalibrationModel) -> int:
             params=m.params,
             cv_ece=m.cv_ece,
             cv_residual_var=m.cv_residual_var,
+            holdout_ece=m.holdout_ece,
+            holdout_residual_var=m.holdout_residual_var,
             is_active=False,
         )
         session.add(record)
@@ -561,7 +785,9 @@ async def _load_active_model(
     *, feature_name: str, prompt_version: str, phase: str, instrument_tier: str
 ) -> CalibrationModel | None:
     sql = text("""
-        SELECT id, method, params, n_observations, cv_ece, cv_residual_var,
+        SELECT id, method, params, n_observations,
+               cv_ece, cv_residual_var,
+               holdout_ece, holdout_residual_var,
                fitted_at
         FROM llm_calibration_models
         WHERE feature_name    = :fn
@@ -589,6 +815,10 @@ async def _load_active_model(
         prompt_version=prompt_version,
         phase=phase,
         instrument_tier=instrument_tier,
+        holdout_ece=float(row.holdout_ece) if row.holdout_ece is not None else None,
+        holdout_residual_var=(
+            float(row.holdout_residual_var) if row.holdout_residual_var is not None else None
+        ),
         fitted_at=row.fitted_at,
     )
 

@@ -442,3 +442,73 @@ async def load_universe_from_db(
             "first."
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point — invoked as `python -m src.quant.backtest.data_loaders.dhan_historical`
+# from the backfill plan (§5 Phase F) and the original quant backtest runbook.
+# ---------------------------------------------------------------------------
+
+
+def _parse_date_cli(s: str) -> date:
+    from datetime import datetime as _dt
+    return _dt.strptime(s, "%Y-%m-%d").date()
+
+
+async def _run_cli(
+    *,
+    start_date: date,
+    end_date: date,
+    only_fno: bool,
+    limit: int | None,
+    rate_limit_per_min: int | None,
+) -> int:
+    instruments = await load_universe_from_db(only_fno=only_fno, limit=limit)
+    if not instruments:
+        logger.error(
+            "dhan_historical CLI: no instruments resolved — "
+            "ensure bootstrap_fno_universe.py has populated dhan_security_id."
+        )
+        return 1
+    totals = await backfill(
+        instruments=instruments,
+        start_date=start_date,
+        end_date=end_date,
+        rate_limit_per_min=rate_limit_per_min,
+    )
+    logger.info(f"dhan_historical CLI: completed — {totals}")
+    return 0 if totals.get("failed_calls", 0) == 0 else 1
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Backfill price_intraday from Dhan v2 historical intraday API. "
+            "Idempotent on (instrument_id, timestamp). Resume point is the "
+            "max timestamp already stored per instrument."
+        )
+    )
+    parser.add_argument("--start", type=_parse_date_cli, required=True,
+                        help="Inclusive start date (YYYY-MM-DD).")
+    parser.add_argument("--end", type=_parse_date_cli, required=True,
+                        help="Inclusive end date (YYYY-MM-DD).")
+    parser.add_argument("--only-fno", action="store_true", default=True,
+                        help="Restrict to F&O underlyings (default true).")
+    parser.add_argument("--all-instruments", dest="only_fno",
+                        action="store_false",
+                        help="Include every active instrument, not just F&O.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Cap on instrument count — useful for smoke runs.")
+    parser.add_argument("--rate-limit-per-min", type=int, default=None,
+                        help="Override the configured Dhan req/min ceiling.")
+    args = parser.parse_args()
+
+    raise SystemExit(asyncio.run(_run_cli(
+        start_date=args.start,
+        end_date=args.end,
+        only_fno=args.only_fno,
+        limit=args.limit,
+        rate_limit_per_min=args.rate_limit_per_min,
+    )))

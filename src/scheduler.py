@@ -13,6 +13,7 @@ from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobExecutionEv
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 from pytz import timezone as tz
@@ -808,6 +809,48 @@ def build_scheduler() -> AsyncIOScheduler:
             max_instances=1,
             coalesce=True,
         )
+        # One-shot mid-day resume: when LAABH_QUANT_RESUME_DATE matches today
+        # AND we're inside market hours on a weekday, register a DateTrigger
+        # at boot+15s. The orchestrator's _load_open_positions + idempotent
+        # init_day make this safe — recovered open positions and replayed
+        # closed-trade rewards feed straight back into the bandit. The date
+        # guard prevents accidental double-firing on later boots.
+        if settings.laabh_quant_resume_date:
+            from datetime import date as _date, timedelta as _td
+            try:
+                resume_for = _date.fromisoformat(settings.laabh_quant_resume_date)
+            except ValueError:
+                logger.warning(
+                    f"[QUANT] LAABH_QUANT_RESUME_DATE="
+                    f"{settings.laabh_quant_resume_date!r} is not YYYY-MM-DD — "
+                    "ignoring"
+                )
+            else:
+                now_ist = datetime.now(tz=ist)
+                if (
+                    resume_for == now_ist.date()
+                    and now_ist.time() < settings.laabh_quant_hard_exit_time
+                    and now_ist.weekday() < 5
+                ):
+                    resume_at = now_ist + _td(seconds=15)
+                    sched.add_job(
+                        _quant_orchestrator_loop,
+                        DateTrigger(run_date=resume_at, timezone=ist),
+                        id="quant_orchestrator_resume",
+                        max_instances=1,
+                        coalesce=True,
+                    )
+                    logger.warning(
+                        f"[QUANT] LAABH_QUANT_RESUME_DATE={resume_for} matches "
+                        f"today — one-shot resume scheduled at "
+                        f"{resume_at.strftime('%H:%M:%S')} IST. Unset the env "
+                        "var after this run."
+                    )
+                else:
+                    logger.info(
+                        f"[QUANT] LAABH_QUANT_RESUME_DATE={resume_for} does not "
+                        "match today/market window — no resume scheduled"
+                    )
     else:
         # --- Agentic mode: existing Phase 4 jobs ---
         # 09:15 IST — Phase 4 entry: open paper positions for each PROCEED.

@@ -16,6 +16,7 @@ proceed to Phase 3 (thesis synthesis).
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -336,16 +337,26 @@ async def _get_news_counts(
     session,
     instrument_id: str,
     lookback_hours: int,
+    *,
+    as_of: datetime | None = None,
 ) -> tuple[int, int]:
-    """Return (bullish_count, bearish_count) from signals in the lookback window."""
+    """Return (bullish_count, bearish_count) from signals in the lookback window.
+
+    When ``as_of`` is supplied (historical replay), the window is
+    ``[as_of - lookback, as_of]`` so signals created AFTER the replay
+    timestamp don't leak future information into the score. Default
+    behaviour (None) is unchanged: window ends at ``now()``.
+    """
     from src.models.signal import Signal
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
+    upper = as_of if as_of is not None else datetime.now(tz=timezone.utc)
+    cutoff = upper - timedelta(hours=lookback_hours)
 
     result = await session.execute(
         select(Signal.action, func.count(Signal.id))
         .where(
             Signal.instrument_id == instrument_id,
             Signal.created_at >= cutoff,
+            Signal.created_at <= upper,
         )
         .group_by(Signal.action)
     )
@@ -430,19 +441,29 @@ async def _get_latest_macro(session) -> dict[str, float]:
     return snapshots
 
 
-async def _get_policy_articles(session, lookback_hours: int) -> list[dict]:
+async def _get_policy_articles(
+    session,
+    lookback_hours: int,
+    *,
+    as_of: datetime | None = None,
+) -> list[dict]:
     """Pull `is_policy_related=true` extractions from the last `lookback_hours`.
 
     Returns a list of dicts with sectors_mentioned + market_sentiment, each
     canonicalised. Reads RawContent.extraction_result JSON column written by
     LLMExtractor._mark_processed.
+
+    Honors ``as_of`` for historical replay so policy articles fetched
+    AFTER the replay timestamp are excluded.
     """
     from src.extraction.llm_extractor import _canonicalise_sector
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
+    upper = as_of if as_of is not None else datetime.now(tz=timezone.utc)
+    cutoff = upper - timedelta(hours=lookback_hours)
     result = await session.execute(
         select(RawContent.extraction_result)
         .where(
             RawContent.fetched_at >= cutoff,
+            RawContent.fetched_at <= upper,
             RawContent.is_processed == True,  # noqa: E712
             RawContent.extraction_result.is_not(None),
         )
@@ -498,12 +519,18 @@ async def _upsert_phase2_candidate(
     convergence: float,
     composite: float,
     config_version: str,
+    *,
+    instrument_tier: str | None = None,
+    dryrun_run_id: uuid.UUID | None = None,
 ) -> None:
     """Upsert a Phase 2 candidate row.
 
     ``fii_dii`` may be ``None`` to indicate the underlying FII/DII data
     was unavailable for this run — Phase 3 reads None and renders
     "(data unavailable)" rather than a misleading "5/10".
+
+    ``instrument_tier`` snapshots the row's tier ('T1' / 'T2' / None) so a
+    historical replay carries the tier that was in effect on the run_date.
     """
     fii_dii_decimal = Decimal(str(fii_dii)) if fii_dii is not None else None
     stmt = pg_insert(FNOCandidate).values(
@@ -517,6 +544,8 @@ async def _upsert_phase2_candidate(
         convergence_score=Decimal(str(convergence)),
         composite_score=Decimal(str(composite)),
         config_version=config_version,
+        instrument_tier=instrument_tier,
+        dryrun_run_id=dryrun_run_id,
         created_at=datetime.now(tz=timezone.utc),
     ).on_conflict_do_update(
         index_elements=["instrument_id", "run_date", "phase"],
@@ -528,6 +557,7 @@ async def _upsert_phase2_candidate(
             "convergence_score": Decimal(str(convergence)),
             "composite_score": Decimal(str(composite)),
             "config_version": config_version,
+            "instrument_tier": instrument_tier,
         }
     )
     await session.execute(stmt)
@@ -554,14 +584,24 @@ class Phase2Result:
     composite_score: float = 5.0
 
 
-async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
+async def run_phase2(
+    run_date: date | None = None,
+    *,
+    as_of: datetime | None = None,
+    dryrun_run_id: uuid.UUID | None = None,
+) -> list[Phase2Result]:
     """Run Phase 2 catalyst scoring for all Phase-1 passing instruments.
 
     Returns list of Phase2Result; instruments meeting min_composite_score
     have a phase=2 fno_candidates row written.
+
+    ``as_of`` (CLAUDE.md convention): when supplied, all news / policy
+    lookback windows are anchored on it so a historical replay sees only
+    information available before that moment. ``dryrun_run_id`` is
+    stamped on the written rows for replay scoping.
     """
     if run_date is None:
-        run_date = date.today()
+        run_date = (as_of.date() if as_of is not None else date.today())
 
     cfg = _settings
     min_score = cfg.fno_phase2_min_composite_score
@@ -573,7 +613,7 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
         fii_net, dii_net = await get_latest_fii_dii(session)
         macro_snaps = await _get_latest_macro(session)
         sentiment = await _get_sentiment_score(session)
-        policy_articles = await _get_policy_articles(session, lookback)
+        policy_articles = await _get_policy_articles(session, lookback, as_of=as_of)
 
     # Track whether FII/DII data is real or missing. When missing, we
     # compute the composite using a neutral 5.0 contribution (so downstream
@@ -594,16 +634,23 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
 
     results: list[Phase2Result] = []
 
+    # Resolve tier label once per row at write time. tier_manager is the
+    # source of truth — we don't recompute from volume here.
+    from src.fno.tier_manager import get_tier_label
+
     for inst_id, symbol in candidates:
         try:
             async with session_scope() as session:
-                bullish_ct, bearish_ct = await _get_news_counts(session, inst_id, lookback)
+                bullish_ct, bearish_ct = await _get_news_counts(
+                    session, inst_id, lookback, as_of=as_of
+                )
                 inst_row = await session.execute(
                     select(Instrument.sector).where(Instrument.id == inst_id)
                 )
                 sector = inst_row.scalar_one_or_none()
                 # Per-stock pct_change for the FII/DII alignment proxy
                 stock_pct = await _get_recent_pct_change(session, inst_id)
+                tier_label = await get_tier_label(inst_id, session=session)
 
             news_s = score_news(bullish_ct, bearish_ct)
             # Per-instrument FII/DII: market-wide flow modulated by this
@@ -666,6 +713,8 @@ async def run_phase2(run_date: date | None = None) -> list[Phase2Result]:
                         news_s, sentiment, fii_dii_s_real, macro_s,
                         conv_s, comp_s,
                         config_ver,
+                        instrument_tier=tier_label,
+                        dryrun_run_id=dryrun_run_id,
                     )
                 direction = "BULLISH" if comp_s >= min_score else "BEARISH"
                 logger.debug(f"fno.catalyst: {symbol} PASS [{direction}] composite={comp_s:.1f}")

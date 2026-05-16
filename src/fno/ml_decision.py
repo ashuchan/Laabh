@@ -241,7 +241,7 @@ async def record_prediction(
                     (fno_candidate_id, instrument_id, run_date,
                      model_version, feature_vector, ml_prediction, ml_confidence)
                 VALUES
-                    (:cid, :iid, :rd, :mv, :fv::jsonb, :pred, :conf)
+                    (:cid, :iid, :rd, :mv, CAST(:fv AS jsonb), :pred, :conf)
                 ON CONFLICT (fno_candidate_id) DO UPDATE SET
                     ml_prediction = EXCLUDED.ml_prediction,
                     ml_confidence = EXCLUDED.ml_confidence,
@@ -273,9 +273,9 @@ async def update_llm_outcome(candidate_id: str | None, llm_decision: str, llm_co
         async with session_scope() as session:
             await session.execute(text("""
                 UPDATE ml_shadow_prediction
-                SET llm_decision  = :ld,
+                SET llm_decision  = CAST(:ld AS varchar),
                     llm_confidence = :lc,
-                    agreed = (ml_prediction = :ld)
+                    agreed = (ml_prediction = CAST(:ld AS varchar))
                 WHERE fno_candidate_id = :cid
             """), {"ld": llm_decision, "lc": llm_confidence, "cid": candidate_id})
     except Exception as exc:

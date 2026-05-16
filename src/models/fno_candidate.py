@@ -51,5 +51,11 @@ class FNOCandidate(Base):
     llm_decision: Mapped[str | None] = mapped_column(String(10))
     config_version: Mapped[str | None] = mapped_column(String(20))
 
+    # Tier snapshot at write time (migration 0015) — 'T1', 'T2', 'index',
+    # or NULL when the instrument isn't in fno_collection_tier. Stored on
+    # the row so a backfill of historical run_dates agrees with the tier
+    # that was in effect for that day.
+    instrument_tier: Mapped[str | None] = mapped_column(String(10))
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     dryrun_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

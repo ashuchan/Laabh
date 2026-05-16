@@ -1125,6 +1125,16 @@ async def _open_position(
     )
     pos.initial_risk_r = entry_premium * Decimal("0.2")
     logger.info(f"[QUANT] Opened {arm_id} × {lots} lots @ {entry_premium}")
+    await _notify_trade_open(
+        arm_id=arm_id,
+        direction=signal.direction,
+        lots=lots,
+        entry_premium=entry_premium,
+        signal_strength=signal.strength,
+        kelly_fraction=kelly_fraction,
+        now=now,
+        portfolio_id=portfolio_id,
+    )
     return pos
 
 
@@ -1165,7 +1175,130 @@ async def _close_position(
         raise
 
     logger.info(f"[QUANT] Closed {pos.arm_id} × {pos.lots} → P&L={pnl:.2f} ({reason})")
+    await _notify_trade_close(
+        arm_id=pos.arm_id,
+        direction=pos.direction,
+        lots=pos.lots,
+        entry_premium=pos.entry_premium_net,
+        exit_premium=exit_premium,
+        pnl=pnl,
+        reason=reason,
+        entry_at=pos.entry_at,
+        exit_at=now,
+        portfolio_id=portfolio_id,
+    )
     return pnl
+
+
+_IST_TZ = pytz.timezone("Asia/Kolkata")
+
+
+async def _portfolio_snapshot_text(portfolio_id: uuid.UUID, now: datetime) -> str:
+    """Return a Telegram-friendly portfolio snapshot for today.
+
+    Single cheap SELECT against quant_trades — caller-safe; any failure
+    returns an empty string so the parent notification still goes out.
+    """
+    try:
+        from sqlalchemy import text as _text
+        from src.db import session_scope
+        today_ist = now.astimezone(_IST_TZ).date()
+        async with session_scope() as session:
+            r = await session.execute(_text("""
+                SELECT arm_id, direction, lots, status, entry_premium_net,
+                       entry_at, realized_pnl, exit_reason
+                FROM quant_trades
+                WHERE portfolio_id = :pid
+                  AND DATE(entry_at AT TIME ZONE 'Asia/Kolkata') = :d
+                ORDER BY entry_at ASC
+            """), {"pid": portfolio_id, "d": today_ist})
+            rows = r.fetchall()
+    except Exception as exc:
+        logger.warning(f"[QUANT] portfolio snapshot query failed: {exc!r}")
+        return ""
+
+    open_rows = [row for row in rows if row.status == "open"]
+    closed_rows = [row for row in rows if row.status == "closed"]
+    realized = sum(float(row.realized_pnl or 0) for row in closed_rows)
+    wins = sum(1 for row in closed_rows if (row.realized_pnl or 0) > 0)
+    losses = sum(1 for row in closed_rows if (row.realized_pnl or 0) < 0)
+
+    lines = ["", "📋 Portfolio"]
+    if open_rows:
+        lines.append(f"   Open positions: {len(open_rows)}")
+        # Cap to 15 visible to keep the message under Telegram's 4096 limit
+        for row in open_rows[:15]:
+            age_min = (
+                max(0.0, (now - row.entry_at).total_seconds() / 60.0)
+                if row.entry_at else 0.0
+            )
+            lines.append(
+                f"     • {row.arm_id:<22s} {row.direction.upper():<7s} × {row.lots}"
+                f"   entry ₹{float(row.entry_premium_net):.2f}   ({age_min:.0f}m ago)"
+            )
+        if len(open_rows) > 15:
+            lines.append(f"     … +{len(open_rows) - 15} more")
+    else:
+        lines.append("   Open positions: 0")
+    lines.append(
+        f"   Closed: {len(closed_rows)}  ({wins}W / {losses}L)   "
+        f"Realized P&L: ₹{realized:+,.2f}"
+    )
+    return "\n".join(lines)
+
+
+async def _notify_trade_open(
+    *,
+    arm_id: str,
+    direction: str,
+    lots: int,
+    entry_premium: Decimal,
+    signal_strength: float,
+    kelly_fraction: float,
+    now: datetime,
+    portfolio_id: uuid.UUID,
+) -> None:
+    """Telegram ping on quant entry. Failures never block the trading loop."""
+    try:
+        from src.services.notification_service import NotificationService
+        when = now.astimezone(_IST_TZ).strftime("%H:%M:%S IST")
+        msg = (
+            f"🟢 [QUANT] OPEN {arm_id}  {direction.upper()} × {lots} lots @ ₹{entry_premium:.2f}\n"
+            f"   sig={signal_strength:.2f}  k={kelly_fraction:.2f}  {when}"
+        )
+        msg += await _portfolio_snapshot_text(portfolio_id, now)
+        await NotificationService().send_text(msg, parse_mode=None)
+    except Exception as exc:
+        logger.warning(f"[QUANT] trade-open notification failed: {exc!r}")
+
+
+async def _notify_trade_close(
+    *,
+    arm_id: str,
+    direction: str,
+    lots: int,
+    entry_premium: Decimal,
+    exit_premium: Decimal,
+    pnl: Decimal,
+    reason: str,
+    entry_at: datetime,
+    exit_at: datetime,
+    portfolio_id: uuid.UUID,
+) -> None:
+    """Telegram ping on quant exit. Failures never block the trading loop."""
+    try:
+        from src.services.notification_service import NotificationService
+        held_min = max(0.0, (exit_at - entry_at).total_seconds() / 60.0)
+        when = exit_at.astimezone(_IST_TZ).strftime("%H:%M:%S IST")
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        msg = (
+            f"{emoji} [QUANT] CLOSE {arm_id}  {direction.upper()} × {lots}  P&L ₹{float(pnl):+,.2f}  ({reason})\n"
+            f"   entry ₹{entry_premium:.2f} → exit ₹{exit_premium:.2f}  held {held_min:.0f}m  {when}"
+        )
+        msg += await _portfolio_snapshot_text(portfolio_id, exit_at)
+        await NotificationService().send_text(msg, parse_mode=None)
+    except Exception as exc:
+        logger.warning(f"[QUANT] trade-close notification failed: {exc!r}")
 
 
 async def _init_day_state(

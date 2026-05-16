@@ -244,14 +244,27 @@ def _call_claude(prompt: str, model: str, temperature: float) -> tuple[str, int,
 def _call_claude_v10(prompt: str, model: str, temperature: float) -> tuple[str, int, int, int]:
     """v10 system-prompt variant. Mirrors ``_call_claude`` exactly except for
     the system block and a slightly higher max_tokens budget (the v10
-    schema is wordier — strikes + reasoning_oneline)."""
+    schema is wordier — strikes + reasoning_oneline).
+
+    Prompt caching: the v10 system prompt is invariant across every call in
+    a backfill run, so flagging it with ``cache_control: ephemeral`` lets
+    Anthropic serve the cached copy and shaves ~30-50% of input-token cost
+    on Sonnet (plan §3.2). Precedent at
+    ``src/agents/runtime/workflow_runner.py:1117``.
+    """
     client = anthropic.Anthropic(api_key=_settings.anthropic_api_key)
     t0 = time.time()
     msg = client.messages.create(
         model=model,
         max_tokens=600,
         temperature=temperature,
-        system=FNO_THESIS_SYSTEM_V10,
+        system=[
+            {
+                "type": "text",
+                "text": FNO_THESIS_SYSTEM_V10,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         messages=[{"role": "user", "content": prompt}],
     )
     latency_ms = int((time.time() - t0) * 1000)
@@ -267,6 +280,9 @@ async def _log_v10_shadow(
     as_of: datetime | None,
     dryrun_run_id: uuid.UUID | None,
     instrument_id: str,
+    news_cutoff_at: datetime | None = None,
+    instrument_tier: str | None = None,
+    propensity_source: str = "live",
 ) -> None:
     """Fire-and-forget v10 call. Bounded timeout + single retry + exception
     swallow so a v10 failure never affects the v9 production path
@@ -275,6 +291,16 @@ async def _log_v10_shadow(
     Run inside ``asyncio.create_task`` from the caller. The Anthropic SDK
     call is synchronous; wrap it with ``asyncio.to_thread`` so we don't
     block the event loop, then bound the whole thing with ``wait_for``.
+
+    Optional audit-trail params (backfill plan §3.2 + §8):
+      * ``news_cutoff_at`` — the latest ``published_at`` allowed in the
+        prompt. NULL for live calls (no cutoff). Persisted as
+        ``llm_decision_log.news_cutoff_at`` for the audit SQL.
+      * ``instrument_tier`` — 'T1' / 'T2' snapshot so calibration can
+        stratify fits without rejoining to fno_collection_tier.
+      * ``propensity_source`` — 'live' (real bandit decision) | 'imputed'
+        (backfill, 1/n_arms heuristic). Calibration applies a 0.3× weight
+        multiplier to imputed rows.
     """
     raw: str | None = None
     tokens_in = tokens_out = latency_ms = 0
@@ -340,6 +366,9 @@ async def _log_v10_shadow(
                 catalyst_specificity=(parsed.catalyst_specificity if parsed else None),
                 risk_flag=(parsed.risk_flag if parsed else None),
                 raw_confidence=(parsed.raw_confidence if parsed else None),
+                news_cutoff_at=news_cutoff_at,
+                instrument_tier=instrument_tier,
+                propensity_source=propensity_source,
             )
     except Exception as exc:
         # Swallow on purpose — shadow path must never crash the v9 caller.
@@ -581,19 +610,43 @@ async def _get_news_counts(
     return bullish, bearish
 
 
-async def _get_headlines(session, instrument_id: str, lookback_hours: int) -> list[str]:
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
+async def _get_headlines(
+    session,
+    instrument_id: str,
+    lookback_hours: int,
+    *,
+    news_cutoff: datetime | None = None,
+) -> list[str]:
+    """Return the most recent ≤5 ``Signal.reasoning`` strings for the
+    instrument, sanitised for prompt-injection.
+
+    ``news_cutoff`` is the latest ``Signal.created_at`` allowed in the
+    result; when None (live path), the upper bound is ``now()``. When set
+    (historical replay), the window is ``[upper - lookback, upper]`` so
+    signals created AFTER the replay timestamp can't leak future
+    information into the prompt (backfill plan §3.2).
+
+    Each row is run through ``news_sanitizer.sanitize_news_item`` so a
+    poisoned RSS headline can't smuggle instructions into the LLM prompt
+    (backfill plan §7.7).
+    """
+    from src.fno.news_sanitizer import sanitize_news_item
+
+    upper = news_cutoff if news_cutoff is not None else datetime.now(tz=timezone.utc)
+    cutoff = upper - timedelta(hours=lookback_hours)
     result = await session.execute(
         select(Signal.reasoning)
         .where(
             Signal.instrument_id == instrument_id,
             Signal.created_at >= cutoff,
+            Signal.created_at <= upper,
             Signal.reasoning.isnot(None),
         )
         .order_by(Signal.created_at.desc())
         .limit(5)
     )
-    return [r for (r,) in result.all() if r]
+    raw_rows = [r for (r,) in result.all() if r]
+    return [s for s in (sanitize_news_item(r) for r in raw_rows) if s]
 
 
 # `_get_latest_fii_dii` previously lived here as a copy-paste of the
@@ -622,6 +675,11 @@ async def _write_llm_decision_log(
     catalyst_specificity: float | None = None,
     risk_flag: float | None = None,
     raw_confidence: float | None = None,
+    # Backfill audit / calibration-hygiene fields (migration 0015)
+    news_cutoff_at: datetime | None = None,
+    instrument_tier: str | None = None,
+    propensity_source: str | None = None,
+    bandit_arm_propensity: float | None = None,
 ) -> None:
     """Insert one row into llm_decision_log for downstream calibration / outcome attribution.
 
@@ -629,23 +687,37 @@ async def _write_llm_decision_log(
     run_date / instrument / phase / prompt_version / dryrun_run_id tuple is a
     no-op rather than a crash — fast-track + LLM both call this, and we don't
     want duplicate writes when the same instrument is re-processed.
+
+    ``news_cutoff_at`` / ``instrument_tier`` / ``propensity_source`` are
+    populated by the backfill path (plan §3.2). Live call sites that don't
+    pass them get DB defaults: ``propensity_source='unknown'``, others NULL.
     """
-    stmt = pg_insert(LLMDecisionLog).values(
-        run_date=run_date,
-        as_of=as_of,
-        dryrun_run_id=dryrun_run_id,
-        instrument_id=instrument_id,
-        phase=phase,
-        prompt_version=prompt_version,
-        model_id=model_id,
-        decision_label=decision_label,
-        directional_conviction=directional_conviction,
-        thesis_durability=thesis_durability,
-        catalyst_specificity=catalyst_specificity,
-        risk_flag=risk_flag,
-        raw_confidence=raw_confidence,
-        raw_response=raw_response,
-    ).on_conflict_do_nothing(
+    values: dict = {
+        "run_date": run_date,
+        "as_of": as_of,
+        "dryrun_run_id": dryrun_run_id,
+        "instrument_id": instrument_id,
+        "phase": phase,
+        "prompt_version": prompt_version,
+        "model_id": model_id,
+        "decision_label": decision_label,
+        "directional_conviction": directional_conviction,
+        "thesis_durability": thesis_durability,
+        "catalyst_specificity": catalyst_specificity,
+        "risk_flag": risk_flag,
+        "raw_confidence": raw_confidence,
+        "raw_response": raw_response,
+    }
+    if news_cutoff_at is not None:
+        values["news_cutoff_at"] = news_cutoff_at
+    if instrument_tier is not None:
+        values["instrument_tier"] = instrument_tier
+    if propensity_source is not None:
+        values["propensity_source"] = propensity_source
+    if bandit_arm_propensity is not None:
+        values["bandit_arm_propensity"] = bandit_arm_propensity
+
+    stmt = pg_insert(LLMDecisionLog).values(**values).on_conflict_do_nothing(
         index_elements=["run_date", "instrument_id", "phase", "prompt_version", "dryrun_run_id"],
     )
     await session.execute(stmt)
@@ -816,19 +888,36 @@ async def run_phase3(
 
     results: list[ThesisResult] = []
 
+    # News cutoff derived from as_of: when replaying a historical date we
+    # must not let signals created after as_of leak into the prompt
+    # (backfill plan §3.2). When as_of is None (live), no cutoff is
+    # applied — the existing "last lookback_hours" window stands.
+    news_cutoff = as_of  # None in live mode → callees default to now()
+    # Tier-snapshot module imported here to avoid a top-level cycle.
+    from src.fno.tier_manager import get_tier_label
+
     for cand in candidates:
         inst_id = str(cand.instrument_id)
         ref_id = uuid.uuid4()
         try:
             async with session_scope() as session:
                 instrument = await _get_instrument(session, inst_id)
-                headlines = await _get_headlines(session, inst_id, lookback)
+                headlines = await _get_headlines(
+                    session, inst_id, lookback, news_cutoff=news_cutoff
+                )
                 underlying_ltp = await _get_underlying_ltp(session, inst_id)
                 iv_snap = await _get_iv_snapshot(session, inst_id)
                 pcr = await _get_chain_pcr(session, inst_id)
+                # When backfilling, anchor the news-count window on as_of
+                # rather than cand.created_at — cand.created_at reflects
+                # when Phase 2 RAN, which for a historical replay is
+                # actually today (the replay moment), not the historical
+                # date being replayed. as_of carries the correct anchor.
                 bullish_count, bearish_count = await _get_news_counts(
-                    session, inst_id, lookback, anchor=cand.created_at
+                    session, inst_id, lookback,
+                    anchor=as_of if as_of is not None else cand.created_at,
                 )
+                tier_label = await get_tier_label(inst_id, session=session)
 
             # Vol surface read is outside the session block — it opens its own session.
             from src.fno.vol_surface import get_latest_surface
@@ -1069,10 +1158,12 @@ async def run_phase3(
                 logger.debug(f"fno.thesis: ML shadow failed: {ml_exc!r}")
 
             if _fast_tracked:
-                # Even fast-track names get a v10 shadow score when the mode
-                # demands it — calibration needs to see the model's view on
-                # extreme-conviction setups as well as borderline ones.
-                if _settings.laabh_llm_mode in ("shadow", "feature"):
+                # Even fast-track names get a v10 shadow score — calibration
+                # needs to see the model's view on extreme-conviction setups
+                # as well as borderline ones. Always log v10 when enabled,
+                # independent of laabh_llm_mode (which only governs whether
+                # v10 features drive the bandit).
+                if _settings.laabh_llm_v10_logging_enabled:
                     asyncio.create_task(_log_v10_shadow(
                         prompt=prompt,
                         model=model,
@@ -1080,6 +1171,13 @@ async def run_phase3(
                         as_of=as_of,
                         dryrun_run_id=dryrun_run_id,
                         instrument_id=inst_id,
+                        news_cutoff_at=news_cutoff,
+                        instrument_tier=tier_label,
+                        # 'live' for the live caller (no dryrun_run_id);
+                        # backfill drives v10 through a different path
+                        # (scripts/backfill_llm_features.py) that sets
+                        # propensity_source='imputed' explicitly.
+                        propensity_source="live" if dryrun_run_id is None else "imputed",
                     ))
                 continue   # audit log + candidate already written above
 
@@ -1090,8 +1188,10 @@ async def run_phase3(
             # Fire-and-forget v10 shadow call. Runs in parallel with the v9
             # write block below; bounded timeout (30s) and exception
             # swallow inside the helper so a v10 failure cannot affect the
-            # v9 production path.
-            if _settings.laabh_llm_mode in ("shadow", "feature"):
+            # v9 production path. Always fires when v10 logging is on —
+            # laabh_llm_mode controls bandit semantics, not whether v10 is
+            # logged for calibration.
+            if _settings.laabh_llm_v10_logging_enabled:
                 asyncio.create_task(_log_v10_shadow(
                     prompt=prompt,
                     model=model,
@@ -1099,6 +1199,9 @@ async def run_phase3(
                     as_of=as_of,
                     dryrun_run_id=dryrun_run_id,
                     instrument_id=inst_id,
+                    news_cutoff_at=news_cutoff,
+                    instrument_tier=tier_label,
+                    propensity_source="live" if dryrun_run_id is None else "imputed",
                 ))
 
             # Always persist the raw LLM call to the audit log first — even
@@ -1193,3 +1296,211 @@ async def run_phase3(
     proceed_count = sum(1 for r in results if r.decision == "PROCEED")
     logger.info(f"fno.thesis: Phase 3 complete — {proceed_count}/{len(results)} PROCEED")
     return results
+
+
+# ---------------------------------------------------------------------------
+# v10 backfill entry point (plan §3.2 Phase B)
+# ---------------------------------------------------------------------------
+
+
+async def run_v10_backfill_one_candidate(
+    *,
+    candidate_id: str,
+    run_date: date,
+    as_of: datetime,
+    dryrun_run_id: uuid.UUID,
+    news_cutoff: datetime,
+    bandit_arm_propensity: float | None,
+    propensity_source: str = "imputed",
+    market_regime=None,
+) -> dict:
+    """Backfill one v10 row into ``llm_decision_log`` for a single Phase-2
+    candidate on a historical run_date.
+
+    Differs from :func:`run_phase3` in three ways:
+      1. **v10 only** — does NOT call v9 (``_call_claude``) and does NOT
+         upsert into ``fno_candidates`` phase=3. The backfill is purely
+         for calibration data; we do not want to pollute the live
+         decisioning surface with replayed historical decisions.
+      2. **Awaited, not fire-and-forget** — the caller can rate-limit and
+         track cumulative cost across candidates. Returns
+         ``{'tokens_in', 'tokens_out', 'latency_ms', 'wrote_row'}``.
+      3. **Idempotent skip** — if an llm_decision_log row already exists
+         for ``(run_date, instrument_id, 'fno_thesis', 'v10_continuous',
+         dryrun_run_id)`` the function returns immediately without an
+         LLM call. This is the per-candidate resume semantics the plan
+         calls for in §3.2.
+
+    Plan reference: backfill_plan.md §3.2 Phase B.
+    """
+    cfg = _settings
+    model = cfg.fno_phase3_llm_model
+    temperature = cfg.fno_phase3_llm_temperature
+    lookback = cfg.fno_phase2_news_lookback_hours
+
+    # Single session covers: resume check + Phase 2 candidate lookup +
+    # all prompt-context fetches. Reducing the round-trip count from
+    # three sessions to one is the main optimisation for the 1500-row
+    # backfill. Vol surface uses its own session intentionally (it does
+    # internal session_scope management — see get_latest_surface).
+    from src.fno.tier_manager import get_tier_label
+
+    async with session_scope() as session:
+        existing_row = (await session.execute(
+            select(LLMDecisionLog.id).where(
+                LLMDecisionLog.run_date == run_date,
+                LLMDecisionLog.instrument_id == candidate_id,
+                LLMDecisionLog.phase == "fno_thesis",
+                LLMDecisionLog.prompt_version == FNO_THESIS_PROMPT_VERSION_V10,
+                LLMDecisionLog.dryrun_run_id == dryrun_run_id,
+            )
+        )).scalar_one_or_none()
+        if existing_row is not None:
+            return {"tokens_in": 0, "tokens_out": 0, "latency_ms": 0, "wrote_row": False}
+
+        cand = (await session.execute(
+            select(FNOCandidate).where(
+                FNOCandidate.run_date == run_date,
+                FNOCandidate.instrument_id == candidate_id,
+                FNOCandidate.phase == 2,
+            )
+        )).scalar_one_or_none()
+        if cand is None:
+            return {"tokens_in": 0, "tokens_out": 0, "latency_ms": 0, "wrote_row": False}
+
+        instrument = await _get_instrument(session, candidate_id)
+        if instrument is None:
+            return {"tokens_in": 0, "tokens_out": 0, "latency_ms": 0, "wrote_row": False}
+
+        headlines = await _get_headlines(
+            session, candidate_id, lookback, news_cutoff=news_cutoff
+        )
+        underlying_ltp = await _get_underlying_ltp(session, candidate_id)
+        iv_snap = await _get_iv_snapshot(session, candidate_id)
+        pcr = await _get_chain_pcr(session, candidate_id)
+        bullish_count, bearish_count = await _get_news_counts(
+            session, candidate_id, lookback, anchor=as_of,
+        )
+        fii_net, dii_net = await get_latest_fii_dii(session)
+        tier_label = await get_tier_label(candidate_id, session=session)
+
+    if underlying_ltp is None or underlying_ltp <= 0:
+        logger.warning(
+            f"v10 backfill: {instrument.symbol} {run_date} skipped — "
+            "no usable underlying LTP at historical cutoff"
+        )
+        return {"tokens_in": 0, "tokens_out": 0, "latency_ms": 0, "wrote_row": False}
+
+    iv_rank = iv_snap.iv_rank_52w
+    if iv_rank is not None:
+        iv_regime = "high" if iv_rank > 70 else ("low" if iv_rank < 30 else "neutral")
+    else:
+        iv_regime = "unknown"
+    oi_structure = classify_oi_structure(pcr)
+    days_to_expiry = (next_weekly_expiry(instrument.symbol, run_date) - run_date).days
+    from src.collectors.macro_collector import get_macro_drivers
+    macro_drivers = get_macro_drivers(instrument.sector)
+
+    # Vol surface — same call run_phase3 uses; opens its own session.
+    from src.fno.vol_surface import get_latest_surface
+    vol_surface = await get_latest_surface(candidate_id, run_date)
+    vol_surface_block = (
+        vol_surface.as_prompt_block()
+        if vol_surface is not None
+        else "(surface unavailable — pre-market computation not yet run)"
+    )
+
+    market_regime_block = (
+        market_regime.as_prompt_block() if market_regime is not None
+        else "(regime unavailable)"
+    )
+
+    fii_dii_score = (
+        float(cand.fii_dii_score) if cand.fii_dii_score is not None else None
+    )
+
+    prompt = build_user_prompt(
+        symbol=instrument.symbol,
+        sector=instrument.sector,
+        underlying_price=underlying_ltp,
+        iv_rank=iv_rank,
+        iv_regime=iv_regime,
+        oi_structure=oi_structure,
+        days_to_expiry=days_to_expiry,
+        news_score=float(cand.news_score or 5),
+        sentiment_score=float(cand.sentiment_score or 5),
+        fii_dii_score=fii_dii_score,
+        macro_align_score=float(cand.macro_align_score or 5),
+        convergence_score=float(cand.convergence_score or 5),
+        composite_score=float(cand.composite_score or 5),
+        bullish_count=bullish_count,
+        bearish_count=bearish_count,
+        lookback_hours=lookback,
+        fii_net_cr=fii_net,
+        dii_net_cr=dii_net,
+        macro_drivers=macro_drivers,
+        headlines=headlines,
+        vrp=iv_snap.vrp,
+        vrp_regime=iv_snap.vrp_regime,
+        rv_20d=iv_snap.rv_20d,
+        vol_surface_block=vol_surface_block,
+        market_regime_block=market_regime_block,
+    )
+
+    # Call Claude. Single retry on transient failure.
+    raw_response: str | None = None
+    tokens_in = tokens_out = latency_ms = 0
+    for attempt in range(2):
+        try:
+            raw_response, tokens_in, tokens_out, latency_ms = await asyncio.to_thread(
+                _call_claude_v10, prompt, model, temperature
+            )
+            break
+        except Exception as exc:
+            if attempt == 0:
+                logger.debug(f"v10 backfill: {instrument.symbol} retry after {exc!r}")
+                continue
+            raise
+
+    if raw_response is None:
+        raise RuntimeError("v10 backfill: Claude returned no response after retries")
+
+    parsed = parse_llm_features(raw_response)
+
+    ref_id = uuid.uuid4()
+    async with session_scope() as session:
+        await _write_audit_log(
+            session, ref_id, model, temperature,
+            prompt, raw_response,
+            (parsed.raw if parsed is not None else None),
+            tokens_in, tokens_out, latency_ms,
+            caller=f"{_CALLER}.v10.backfill",
+        )
+        await _write_llm_decision_log(
+            session,
+            run_date=run_date,
+            as_of=as_of,
+            dryrun_run_id=dryrun_run_id,
+            instrument_id=candidate_id,
+            phase="fno_thesis",
+            prompt_version=FNO_THESIS_PROMPT_VERSION_V10,
+            model_id=model,
+            decision_label=None,
+            raw_response=(parsed.raw if parsed is not None else {"raw_text": raw_response}),
+            directional_conviction=(parsed.directional_conviction if parsed else None),
+            thesis_durability=(parsed.thesis_durability if parsed else None),
+            catalyst_specificity=(parsed.catalyst_specificity if parsed else None),
+            risk_flag=(parsed.risk_flag if parsed else None),
+            raw_confidence=(parsed.raw_confidence if parsed else None),
+            news_cutoff_at=news_cutoff,
+            instrument_tier=tier_label,
+            propensity_source=propensity_source,
+            bandit_arm_propensity=bandit_arm_propensity,
+        )
+
+    return {
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "latency_ms": latency_ms,
+        "wrote_row": True,
+    }

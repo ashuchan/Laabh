@@ -9,6 +9,7 @@ Writes to fno_collection_tiers (upsert — idempotent within the same day).
 """
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
 from loguru import logger
@@ -26,6 +27,46 @@ _INDEX_SYMBOLS = frozenset(
 )
 
 _settings = get_settings()
+
+
+async def get_tier_label(
+    instrument_id: str | uuid.UUID,
+    *,
+    session=None,
+) -> str | None:
+    """Return ``'T1'`` | ``'T2'`` for an instrument, or ``None`` when the
+    instrument has no row in ``fno_collection_tiers`` yet.
+
+    Used by Phase 1/3 to snapshot the instrument's tier onto downstream
+    rows (``fno_candidates.instrument_tier`` and
+    ``llm_decision_log.instrument_tier``) so calibration can stratify fits
+    per tier without a runtime join.
+
+    Indices in ``_INDEX_SYMBOLS`` are always Tier 1 in ``refresh()``, so
+    they surface as ``'T1'`` here — the plan reserves a separate ``'index'``
+    label for future use; we'll add it when calibration needs to split
+    indices from equity T1.
+
+    ``session`` is optional — when passed, the function reads from the
+    caller's session to avoid opening a second connection. When omitted,
+    a transient session is opened for the lookup.
+    """
+    iid = str(instrument_id) if isinstance(instrument_id, uuid.UUID) else str(instrument_id)
+
+    async def _lookup(s) -> str | None:
+        row = (await s.execute(
+            select(FNOCollectionTier.tier).where(
+                FNOCollectionTier.instrument_id == iid,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            return None
+        return "T1" if int(row) == 1 else "T2"
+
+    if session is not None:
+        return await _lookup(session)
+    async with session_scope() as s:
+        return await _lookup(s)
 
 
 async def refresh() -> dict[str, int]:

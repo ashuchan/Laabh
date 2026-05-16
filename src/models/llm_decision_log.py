@@ -85,6 +85,20 @@ class LLMDecisionLog(Base):
     bandit_arm_propensity: Mapped[float | None] = mapped_column(Numeric(10, 6))
     outcome_attributed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Provenance of bandit_arm_propensity (migration 0015):
+    #   'live'     — real bandit decision, propensity preserved as-is.
+    #   'imputed'  — backfill row with 1/n_arms heuristic; calibration code
+    #                applies a 0.3× weight multiplier (matches the
+    #                counterfactual-row hygiene).
+    #   'unknown'  — legacy rows pre-dating the column.
+    propensity_source: Mapped[str] = mapped_column(Text, server_default="unknown")
+    # Audit trail of the point-in-time news cutoff honored when the prompt
+    # was built. NULL for live rows (no cutoff); ist(D, 9, 0) for backfill.
+    news_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Tier snapshotted at decision time so the calibration fit can stratify
+    # without rejoining to fno_collection_tier on every read.
+    instrument_tier: Mapped[str | None] = mapped_column(Text)
+
     # Full LLM payload (parsed JSON or {'raw_text': ...} fallback).
     raw_response: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
@@ -110,6 +124,11 @@ class LLMCalibrationModel(Base):
     params: Mapped[dict] = mapped_column(JSONB, nullable=False)
     cv_ece: Mapped[float | None] = mapped_column(Numeric(8, 6))
     cv_residual_var: Mapped[float | None] = mapped_column(Numeric(10, 6))
+    # Holdout metrics — true out-of-sample on a reserved tail window. Populated
+    # only when fit is invoked with a holdout configured (backfill scripts);
+    # NULL for the weekly live-scope fit (no holdout — every row is precious).
+    holdout_ece: Mapped[float | None] = mapped_column(Numeric(8, 6))
+    holdout_residual_var: Mapped[float | None] = mapped_column(Numeric(10, 6))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default="false")
 
 
